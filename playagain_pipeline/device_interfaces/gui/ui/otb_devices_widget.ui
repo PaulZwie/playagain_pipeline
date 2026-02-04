@@ -1,0 +1,77 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<ui version="4.0">
+ <class>OTBDeviceWidgetForm</class>
+ <widget class="QWidget" name="OTBDeviceWidgetForm">
+  <property name="geometry">
+   <rect>
+    <x>0</x>
+    <y>0</y>
+    <width>400</width>
+    <height>300</height>
+   </rect>
+  </property>
+  <property name="windowTitle">
+   <string>Form</string>
+  </property>
+  <layout class="QGridLayout" name="gridLayout">
+   <item row="0" column="1">
+    <widget class="QComboBox" name="deviceSelectionComboBox">
+     <item>
+      <property name="text">
+       <string>Quattrocento Light</string>
+      </property>
+     </item>
+     <item>
+      <property name="text">
+       <string>Muovi</string>
+      </property>
+     </item>
+     <item>
+      <property name="text">
+       <string>Muovi Plus</string>
+      </property>
+     </item>
+    </widget>
+   </item>
+   <item row="0" column="0">
+    <widget class="QLabel" name="label">
+     <property name="text">
+      <string>Device</string>
+     </property>
+    </widget>
+   </item>
+   <item row="1" column="0" colspan="2">
+    <widget class="QStackedWidget" name="deviceStackedWidget">
+     <property name="currentIndex">
+      <number>2</number>
+     </property>
+     <widget class="QuattrocentoLightWidget" name="quattrocentoLightWidget"/>
+     <widget class="MuoviWidget" name="muoviWidget"/>
+     <widget class="MuoviPlusWidget" name="muoviPlusWidget"/>
+    </widget>
+   </item>
+  </layout>
+ </widget>
+ <customwidgets>
+  <customwidget>
+   <class>QuattrocentoLightWidget</class>
+   <extends>QWidget</extends>
+   <header>device_interfaces.gui.template_widgets.quattrocento</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>MuoviWidget</class>
+   <extends>QWidget</extends>
+   <header>device_interfaces.gui.template_widgets.muovi</header>
+   <container>1</container>
+  </customwidget>
+  <customwidget>
+   <class>MuoviPlusWidget</class>
+   <extends>QWidget</extends>
+   <header>device_interfaces.gui.template_widgets.muovi_plus</header>
+   <container>1</container>
+  </customwidget>
+ </customwidgets>
+ <resources/>
+ <connections/>
+</ui>
