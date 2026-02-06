@@ -179,9 +179,9 @@ class DataManager:
         X = np.array(windows)
         y = np.array(labels)
 
-        # Get gesture names from first session
+        # Get gesture names from first session (use display_name for nicer UI)
         gesture_set = sessions[0].gesture_set
-        label_names = {g.label_id: g.name for g in gesture_set.gestures}
+        label_names = {g.label_id: g.display_name for g in gesture_set.gestures}
 
         metadata = {
             "name": name,
@@ -286,3 +286,4 @@ class DataManager:
             stratify=stratify_param,
             random_state=random_state
         )
+

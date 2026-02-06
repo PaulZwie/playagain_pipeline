@@ -33,6 +33,7 @@ class Gesture:
         description: Detailed description of how to perform the gesture
         category: Category of the gesture for organization
         image_path: Optional path to an image showing the gesture
+        emoji: Optional emoji for visual representation (e.g., "🤛🏻" for fist)
         label_id: Numeric label for ML classification (auto-assigned if not provided)
         duration_hint: Suggested duration for holding the gesture (seconds)
         metadata: Additional custom metadata for the gesture
@@ -42,6 +43,7 @@ class Gesture:
     description: str = ""
     category: GestureCategory = GestureCategory.CUSTOM
     image_path: Optional[str] = None
+    emoji: Optional[str] = None
     label_id: Optional[int] = None
     duration_hint: float = 5.0
     metadata: Dict[str, Any] = field(default_factory=dict)
@@ -59,6 +61,7 @@ class Gesture:
             "description": self.description,
             "category": self.category.name,
             "image_path": self.image_path,
+            "emoji": self.emoji,
             "label_id": self.label_id,
             "duration_hint": self.duration_hint,
             "metadata": self.metadata
@@ -189,16 +192,34 @@ def format_pause_prompt(next_gesture: Optional[Gesture] = None) -> str:
 
 # Pre-defined gesture sets
 def create_default_gesture_set() -> GestureSet:
-    """Create a default gesture set with common hand gestures."""
+    """
+    Create a default gesture set with common hand gestures.
+
+    Includes:
+    - Rest: Neutral/relaxed baseline state
+    - Fist: Grip/hand closure (🤛🏻)
+    - Index-Thumb Pinch: Precision grip (👌🏻)
+    - Three Fingers-Thumb: Tripod grip (🤌🏻)
+    """
     gesture_set = GestureSet(name="default")
 
+    # Rest (baseline/neutral) - Label 0
+    gesture_set.add_gesture(Gesture(
+        name="rest",
+        display_name="Rest",
+        description="Relax your hand completely in a neutral position.",
+        category=GestureCategory.REST,
+        emoji="🖐🏻",
+        duration_hint=2.0
+    ))
 
-    # Fist
+    # Fist - Label 1
     gesture_set.add_gesture(Gesture(
         name="fist",
         display_name="Fist",
         description="Close your hand into a tight fist with thumb over fingers.",
         category=GestureCategory.GRIP,
+        emoji="🤛🏻",
         duration_hint=3.0
     ))
 
@@ -208,6 +229,7 @@ def create_default_gesture_set() -> GestureSet:
         display_name="Index-Thumb Pinch",
         description="Touch your index finger tip to your thumb tip, keeping other fingers extended.",
         category=GestureCategory.FINGER,
+        emoji="👌🏻",
         duration_hint=3.0
     ))
 
@@ -217,6 +239,7 @@ def create_default_gesture_set() -> GestureSet:
         display_name="Three Fingers-Thumb",
         description="Touch index, middle, and ring finger tips to your thumb tip.",
         category=GestureCategory.FINGER,
+        emoji="🤌🏻",
         duration_hint=3.0
     ))
 

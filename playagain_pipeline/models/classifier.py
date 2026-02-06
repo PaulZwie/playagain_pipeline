@@ -5,14 +5,21 @@ This module provides a modular framework for training and using
 different ML models for EMG gesture recognition.
 """
 
+import json
+import pickle
+import numpy as np
+
 from abc import ABC, abstractmethod
 from typing import Optional, Dict, Any, List, Tuple
 from pathlib import Path
 from dataclasses import dataclass, field
-import json
-import pickle
 from datetime import datetime
-import numpy as np
+from catboost import CatBoostClassifier as CatBoostWrapper
+from sklearn.preprocessing import StandardScaler
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader, TensorDataset
 
 
 @dataclass
@@ -292,9 +299,13 @@ class SVMClassifier(BaseClassifier):
         """Train the SVM model."""
         from sklearn.svm import SVC
         from sklearn.preprocessing import StandardScaler
+        import time
+
+        start_time = time.time()
 
         # Extract features
         X_train_features = self.extract_features(X_train)
+        feature_count = X_train_features.shape[1]
 
         # Normalize features
         self._scaler = StandardScaler()
@@ -316,6 +327,7 @@ class SVMClassifier(BaseClassifier):
             val_pred = self._model.predict(X_val_scaled)
             val_acc = np.mean(val_pred == y_val)
 
+        training_time = time.time() - start_time
         self._is_trained = True
 
         # Create metadata
@@ -334,7 +346,9 @@ class SVMClassifier(BaseClassifier):
 
         return {
             "training_accuracy": train_acc,
-            "validation_accuracy": val_acc
+            "validation_accuracy": val_acc,
+            "feature_count": feature_count,
+            "training_time": training_time
         }
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -398,9 +412,13 @@ class RandomForestClassifier(BaseClassifier):
     ) -> Dict[str, Any]:
         """Train the Random Forest model."""
         from sklearn.ensemble import RandomForestClassifier as RFClassifier
+        import time
+
+        start_time = time.time()
 
         # Extract features
         X_train_features = self.extract_features(X_train)
+        feature_count = X_train_features.shape[1]
 
         # Create and train model
         self._model = RFClassifier(**self.hyperparameters)
@@ -417,6 +435,7 @@ class RandomForestClassifier(BaseClassifier):
             val_pred = self._model.predict(X_val_features)
             val_acc = np.mean(val_pred == y_val)
 
+        training_time = time.time() - start_time
         self._is_trained = True
 
         # Create metadata
@@ -436,6 +455,8 @@ class RandomForestClassifier(BaseClassifier):
         return {
             "training_accuracy": train_acc,
             "validation_accuracy": val_acc,
+            "feature_count": feature_count,
+            "training_time": training_time,
             "feature_importances": self._model.feature_importances_.tolist()
         }
 
@@ -484,9 +505,13 @@ class LDAClassifier(BaseClassifier):
         """Train the LDA model."""
         from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
         from sklearn.preprocessing import StandardScaler
+        import time
+
+        start_time = time.time()
 
         # Extract features
         X_train_features = self.extract_features(X_train)
+        feature_count = X_train_features.shape[1]
 
         # Normalize features
         self._scaler = StandardScaler()
@@ -508,6 +533,7 @@ class LDAClassifier(BaseClassifier):
             val_pred = self._model.predict(X_val_scaled)
             val_acc = np.mean(val_pred == y_val)
 
+        training_time = time.time() - start_time
         self._is_trained = True
 
         # Create metadata
@@ -526,7 +552,9 @@ class LDAClassifier(BaseClassifier):
 
         return {
             "training_accuracy": train_acc,
-            "validation_accuracy": val_acc
+            "validation_accuracy": val_acc,
+            "feature_count": feature_count,
+            "training_time": training_time
         }
 
     def predict(self, X: np.ndarray) -> np.ndarray:
@@ -560,6 +588,428 @@ class LDAClassifier(BaseClassifier):
             self._scaler = pickle.load(f)
 
 
+class MLPClassifier(BaseClassifier):
+    """
+    Multi-Layer Perceptron (Neural Network) classifier.
+    Supports advanced training options like epochs, early stopping, and various optimizers.
+    """
+
+    def __init__(self, name: str = "mlp_classifier", **kwargs):
+        super().__init__(name)
+        self.hyperparameters = {
+            "hidden_layers": kwargs.get("hidden_layers", (128, 64)),
+            "activation": kwargs.get("activation", "relu"),
+            "dropout": kwargs.get("dropout", 0.2),
+            "optimizer": kwargs.get("optimizer", "adam"),  # adam, rmsprop, sgd
+            "learning_rate": kwargs.get("learning_rate", 0.001),
+            "batch_size": kwargs.get("batch_size", 32),
+            "epochs": kwargs.get("epochs", 100),
+            "early_stopping": kwargs.get("early_stopping", True),
+            "patience": kwargs.get("patience", 10),
+            "device": kwargs.get("device", "cpu")  # "cpu" or "cuda"
+        }
+        self._feature_extractor = EMGFeatureExtractor()
+        self._scaler = None
+        self._model = None
+        self._input_dim = 0
+        self._output_dim = 0
+
+    def extract_features(self, X: np.ndarray) -> np.ndarray:
+        """Extract features from raw EMG."""
+        return self._feature_extractor.extract_all_features(X)
+
+    def _build_model(self, input_dim: int, output_dim: int):
+        """Build PyTorch model architecture."""
+        layers = []
+        in_dim = input_dim
+
+        # Hidden layers
+        for hidden_dim in self.hyperparameters["hidden_layers"]:
+            layers.append(nn.Linear(in_dim, hidden_dim))
+
+            if self.hyperparameters["activation"] == "relu":
+                layers.append(nn.ReLU())
+            elif self.hyperparameters["activation"] == "tanh":
+                layers.append(nn.Tanh())
+
+            if self.hyperparameters["dropout"] > 0:
+                layers.append(nn.Dropout(self.hyperparameters["dropout"]))
+
+            in_dim = hidden_dim
+
+        # Output layer
+        layers.append(nn.Linear(in_dim, output_dim))
+
+        return nn.Sequential(*layers)
+
+    def train(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: Optional[np.ndarray] = None,
+        y_val: Optional[np.ndarray] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Train the MLP model."""
+        import time
+
+        start_time = time.time()
+
+        # Callback for progress reporting
+        callback = kwargs.get("callback", None)
+
+        # Extract features
+        X_train_features = self.extract_features(X_train)
+        feature_count = X_train_features.shape[1]
+
+        # Normalize features
+        self._scaler = StandardScaler()
+        X_train_scaled = self._scaler.fit_transform(X_train_features)
+
+        # Prepare validation data
+        if X_val is not None:
+            X_val_features = self.extract_features(X_val)
+            X_val_scaled = self._scaler.transform(X_val_features)
+        else:
+            X_val_scaled = None
+
+        # Convert to PyTorch tensors
+        device = torch.device(self.hyperparameters["device"] if torch.cuda.is_available() else "cpu")
+
+        X_train_tensor = torch.FloatTensor(X_train_scaled).to(device)
+        y_train_tensor = torch.LongTensor(y_train).to(device)
+
+        X_val_tensor = None
+        y_val_tensor = None
+
+        if X_val_scaled is not None:
+            X_val_tensor = torch.FloatTensor(X_val_scaled).to(device)
+            y_val_tensor = torch.LongTensor(y_val).to(device)
+
+        # Build model
+        self._input_dim = X_train_scaled.shape[1]
+        self._output_dim = len(np.unique(y_train))
+        self._model = self._build_model(self._input_dim, self._output_dim).to(device)
+
+        # Setup optimizer
+        opt_name = self.hyperparameters["optimizer"].lower()
+        lr = self.hyperparameters["learning_rate"]
+
+        if opt_name == "adam":
+            optimizer = optim.Adam(self._model.parameters(), lr=lr)
+        elif opt_name == "rmsprop":
+            optimizer = optim.RMSprop(self._model.parameters(), lr=lr)
+        else:
+            optimizer = optim.SGD(self._model.parameters(), lr=lr, momentum=0.9)
+
+        criterion = nn.CrossEntropyLoss()
+
+        # Training loop
+        batch_size = self.hyperparameters["batch_size"]
+        epochs = self.hyperparameters["epochs"]
+        dataset = TensorDataset(X_train_tensor, y_train_tensor)
+        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+
+        best_val_loss = float('inf')
+        patience_counter = 0
+        history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+
+        for epoch in range(epochs):
+            self._model.train()
+            train_loss = 0.0
+            correct = 0
+            total = 0
+
+            for inputs, targets in dataloader:
+                optimizer.zero_grad()
+                outputs = self._model(inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+
+                train_loss += loss.item() * inputs.size(0)
+                _, predicted = outputs.max(1)
+                total += targets.size(0)
+                correct += predicted.eq(targets).sum().item()
+
+            train_loss /= len(dataloader.dataset)
+            train_acc = correct / total
+
+            # Validation
+            val_loss = 0.0
+            val_acc = 0.0
+
+            if X_val_scaled is not None:
+                self._model.eval()
+                with torch.no_grad():
+                    outputs = self._model(X_val_tensor)
+                    loss = criterion(outputs, y_val_tensor)
+                    val_loss = loss.item()
+                    _, predicted = outputs.max(1)
+                    val_acc = predicted.eq(y_val_tensor).sum().item() / y_val_tensor.size(0)
+
+            # Store history
+            history["train_loss"].append(train_loss)
+            history["val_loss"].append(val_loss)
+            history["train_acc"].append(train_acc)
+            history["val_acc"].append(val_acc)
+
+            # Report progress
+            if callback:
+                callback(epoch + 1, train_loss, val_loss)
+
+            # Early stopping
+            if self.hyperparameters["early_stopping"] and X_val_scaled is not None:
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                    # Save best model state
+                    # self._best_state = self._model.state_dict()
+                else:
+                    patience_counter += 1
+                    if patience_counter >= self.hyperparameters["patience"]:
+                        print(f"Early stopping at epoch {epoch}")
+                        break
+
+        training_time = time.time() - start_time
+        self._is_trained = True
+
+        # Create metadata
+        self.metadata = ModelMetadata(
+            name=self.name,
+            model_type="MLP",
+            created_at=datetime.now(),
+            num_classes=self._output_dim,
+            num_channels=X_train.shape[2],
+            window_size_ms=kwargs.get("window_size_ms", 200),
+            sampling_rate=kwargs.get("sampling_rate", 2000),
+            training_accuracy=history["train_acc"][-1],
+            validation_accuracy=history["val_acc"][-1] if history["val_acc"] else 0.0,
+            hyperparameters=self.hyperparameters,
+            training_history=history
+        )
+
+        return {
+            "training_accuracy": history["train_acc"][-1],
+            "validation_accuracy": history["val_acc"][-1] if history["val_acc"] else 0.0,
+            "feature_count": feature_count,
+            "training_time": training_time,
+            "epochs_trained": len(history["train_loss"])
+        }
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Make predictions."""
+        if not self._is_trained:
+            raise ValueError("Model not trained")
+
+        X_features = self.extract_features(X)
+        X_scaled = self._scaler.transform(X_features)
+
+        device = torch.device(self.hyperparameters["device"] if torch.cuda.is_available() else "cpu")
+        X_tensor = torch.FloatTensor(X_scaled).to(device)
+
+        self._model.eval()
+        with torch.no_grad():
+            outputs = self._model(X_tensor)
+            _, predicted = outputs.max(1)
+
+        return predicted.cpu().numpy()
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Get prediction probabilities."""
+        if not self._is_trained:
+            raise ValueError("Model not trained")
+
+        X_features = self.extract_features(X)
+        X_scaled = self._scaler.transform(X_features)
+
+        device = torch.device(self.hyperparameters["device"] if torch.cuda.is_available() else "cpu")
+        X_tensor = torch.FloatTensor(X_scaled).to(device)
+
+        self._model.eval()
+        with torch.no_grad():
+            outputs = self._model(X_tensor)
+            probs = torch.softmax(outputs, dim=1)
+
+        return probs.cpu().numpy()
+
+    def save(self, path: Path) -> None:
+        """Save model and scaler."""
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+
+        # Save metadata
+        if self.metadata:
+            with open(path / "metadata.json", 'w') as f:
+                json.dump(self.metadata.to_dict(), f, indent=2)
+
+        # Save pytorch model
+        torch.save(self._model.state_dict(), path / "model.pt")
+
+        # Save scaler
+        with open(path / "scaler.pkl", 'wb') as f:
+            pickle.dump(self._scaler, f)
+
+        # Save params to reconstruct model structure
+        with open(path / "params.json", 'w') as f:
+            json.dump({
+                "input_dim": self._input_dim,
+                "output_dim": self._output_dim,
+                "hyperparameters": self.hyperparameters
+            }, f)
+
+    def load(self, path: Path) -> None:
+        """Load model and scaler."""
+        path = Path(path)
+
+        # Load metadata
+        with open(path / "metadata.json", 'r') as f:
+            self.metadata = ModelMetadata.from_dict(json.load(f))
+
+        # Load params
+        with open(path / "params.json", 'r') as f:
+            params = json.load(f)
+            self._input_dim = params["input_dim"]
+            self._output_dim = params["output_dim"]
+            self.hyperparameters = params["hyperparameters"]
+
+        # Load scaler
+        with open(path / "scaler.pkl", 'rb') as f:
+            self._scaler = pickle.load(f)
+
+        # Rebuild and load model
+        self._model = self._build_model(self._input_dim, self._output_dim)
+
+        device = torch.device(self.hyperparameters["device"] if torch.cuda.is_available() else "cpu")
+        self._model.load_state_dict(torch.load(path / "model.pt", map_location=device))
+        self._model.to(device)
+
+        self._is_trained = True
+
+
+class CatBoostClassifier(BaseClassifier):
+    """
+    CatBoost classifier for gesture recognition.
+    """
+
+    def __init__(self, name: str = "catboost_classifier", **kwargs):
+        super().__init__(name)
+        # Default hyperparameters optimized for multi-class classification
+        self.hyperparameters = {
+            "iterations": kwargs.get("iterations", 1000),
+            "learning_rate": kwargs.get("learning_rate", 0.03),
+            "depth": kwargs.get("depth", 6),
+            "l2_leaf_reg": kwargs.get("l2_leaf_reg", 3),
+            "loss_function": kwargs.get("loss_function", "MultiClass"),
+            "verbose": kwargs.get("verbose", False),
+            "task_type": kwargs.get("task_type", "CPU"),  # Use "GPU" if available
+            "early_stopping_rounds": kwargs.get("early_stopping_rounds", 50)
+        }
+        self._feature_extractor = EMGFeatureExtractor()
+        # Note: CatBoost is generally scale-invariant, but we maintain the scaler
+        # to ensure strict API consistency with the SVM implementation.
+        self._scaler = None
+
+    def extract_features(self, X: np.ndarray) -> np.ndarray:
+        """Extract features from raw EMG."""
+        return self._feature_extractor.extract_all_features(X)
+
+    def train(
+            self,
+            X_train: np.ndarray,
+            y_train: np.ndarray,
+            X_val: Optional[np.ndarray] = None,
+            y_val: Optional[np.ndarray] = None,
+            **kwargs
+    ) -> Dict[str, Any]:
+        """Train the CatBoost model."""
+        import time
+
+        start_time = time.time()
+
+        # Extract features
+        X_train_features = self.extract_features(X_train)
+        feature_count = X_train_features.shape[1]
+
+        # Normalize features
+        self._scaler = StandardScaler()
+        X_train_scaled = self._scaler.fit_transform(X_train_features)
+
+        # Prepare validation set if available (Crucial for CatBoost early stopping)
+        eval_set = None
+        X_val_scaled = None
+        if X_val is not None and y_val is not None:
+            X_val_features = self.extract_features(X_val)
+            X_val_scaled = self._scaler.transform(X_val_features)
+            eval_set = (X_val_scaled, y_val)
+
+        # Create model
+        self._model = CatBoostWrapper(**self.hyperparameters)
+
+        # Fit model
+        self._model.fit(
+            X_train_scaled,
+            y_train,
+            eval_set=eval_set,
+            verbose=self.hyperparameters.get("verbose", False)
+        )
+
+        # Compute training accuracy
+        # Note: CatBoost predict returns a column vector, so we flatten it
+        train_pred = self._model.predict(X_train_scaled).flatten()
+        train_acc = np.mean(train_pred == y_train)
+
+        # Compute validation accuracy if provided
+        val_acc = 0.0
+        if eval_set is not None:
+            # We already computed X_val_scaled in the eval_set block
+            val_pred = self._model.predict(X_val_scaled).flatten()
+            val_acc = np.mean(val_pred == y_val)
+
+        training_time = time.time() - start_time
+        self._is_trained = True
+
+        # Create metadata
+        self.metadata = ModelMetadata(
+            name=self.name,
+            model_type="CatBoost",
+            created_at=datetime.now(),
+            num_classes=len(np.unique(y_train)),
+            num_channels=X_train.shape[2],
+            window_size_ms=kwargs.get("window_size_ms", 200),
+            sampling_rate=kwargs.get("sampling_rate", 2000),
+            training_accuracy=train_acc,
+            validation_accuracy=val_acc,
+            hyperparameters=self.hyperparameters
+        )
+
+        return {
+            "training_accuracy": train_acc,
+            "validation_accuracy": val_acc,
+            "feature_count": feature_count,
+            "training_time": training_time
+        }
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Make predictions."""
+        if not self._is_trained:
+            raise ValueError("Model not trained")
+
+        X_features = self.extract_features(X)
+        X_scaled = self._scaler.transform(X_features)
+        # Flatten is required because CatBoost returns (N, 1) rather than (N,)
+        return self._model.predict(X_scaled).flatten()
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Get prediction probabilities."""
+        if not self._is_trained:
+            raise ValueError("Model not trained")
+
+        X_features = self.extract_features(X)
+        X_scaled = self._scaler.transform(X_features)
+        return self._model.predict_proba(X_scaled)
+
+
 class ModelManager:
     """
     Manages training, loading, and using gesture classification models.
@@ -568,7 +1018,9 @@ class ModelManager:
     AVAILABLE_MODELS = {
         "svm": SVMClassifier,
         "random_forest": RandomForestClassifier,
-        "lda": LDAClassifier
+        "lda": LDAClassifier,
+        "catboost": CatBoostClassifier,
+        "mlp": MLPClassifier
     }
 
     def __init__(self, models_dir: Path):

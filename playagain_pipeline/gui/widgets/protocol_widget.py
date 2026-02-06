@@ -34,11 +34,11 @@ class GestureDisplayWidget(QWidget):
     def _setup_ui(self):
         """Setup the user interface."""
         layout = QVBoxLayout(self)
-        layout.setAlignment(Qt.AlignCenter)
+        layout.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
         # Phase indicator
         self.phase_label = QLabel("READY")
-        self.phase_label.setAlignment(Qt.AlignCenter)
+        self.phase_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         phase_font = QFont()
         phase_font.setPointSize(24)
         phase_font.setBold(True)
@@ -47,23 +47,25 @@ class GestureDisplayWidget(QWidget):
 
         # Gesture name
         self.gesture_label = QLabel("")
-        self.gesture_label.setAlignment(Qt.AlignCenter)
+        self.gesture_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         gesture_font = QFont()
         gesture_font.setPointSize(36)
         gesture_font.setBold(True)
         self.gesture_label.setFont(gesture_font)
         layout.addWidget(self.gesture_label)
 
-        # Image placeholder
-        self.image_label = QLabel()
-        self.image_label.setAlignment(Qt.AlignCenter)
-        self.image_label.setMinimumSize(200, 200)
-        self.image_label.setStyleSheet("background-color: #f0f0f0; border-radius: 10px;")
-        layout.addWidget(self.image_label)
+        # Emoji display
+        self.emoji_label = QLabel()
+        self.emoji_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        emoji_font = QFont()
+        emoji_font.setPointSize(96)  # Large emoji
+        self.emoji_label.setFont(emoji_font)
+        self.emoji_label.setMinimumSize(200, 200)
+        layout.addWidget(self.emoji_label)
 
         # Description
         self.description_label = QLabel("")
-        self.description_label.setAlignment(Qt.AlignCenter)
+        self.description_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self.description_label.setWordWrap(True)
         desc_font = QFont()
         desc_font.setPointSize(14)
@@ -101,22 +103,28 @@ class GestureDisplayWidget(QWidget):
             self.gesture_label.setText("")
             self.description_label.setText("")
 
-        # Load image if available
-        if step.gesture and step.gesture.image_path:
+        # Display emoji or image
+        if step.gesture and step.gesture.emoji:
+            # Show emoji
+            self.emoji_label.setText(step.gesture.emoji)
+            self.emoji_label.setStyleSheet("")
+        elif step.gesture and step.gesture.image_path:
+            # Load image if available
             pixmap = QPixmap(step.gesture.image_path)
             if not pixmap.isNull():
-                self.image_label.setPixmap(
-                    pixmap.scaled(200, 200, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-                )
+                scaled_pixmap = pixmap.scaled(200, 200, Qt.AspectRatioMode.KeepAspectRatio, Qt.TransformationMode.SmoothTransformation)
+                # Convert pixmap to text label (not ideal but works)
+                self.emoji_label.setPixmap(scaled_pixmap)
+                self.emoji_label.setText("")
             else:
-                self._set_placeholder_image(step.gesture.display_name)
+                self._set_placeholder_emoji(step.gesture.display_name)
         else:
-            self._set_placeholder_image("")
+            self._set_placeholder_emoji("")
 
-    def _set_placeholder_image(self, text: str):
-        """Set a placeholder for the gesture image."""
-        self.image_label.setText(text[:2].upper() if text else "")
-        self.image_label.setStyleSheet(
+    def _set_placeholder_emoji(self, text: str):
+        """Set a placeholder for the gesture visualization."""
+        self.emoji_label.setText(text[:2].upper() if text else "")
+        self.emoji_label.setStyleSheet(
             "background-color: #e0e0e0; border-radius: 10px; "
             "font-size: 48px; font-weight: bold; color: #666;"
         )
@@ -127,7 +135,7 @@ class GestureDisplayWidget(QWidget):
         self.phase_label.setStyleSheet("")
         self.gesture_label.setText("")
         self.description_label.setText("")
-        self._set_placeholder_image("")
+        self._set_placeholder_emoji("")
 
 
 class ProtocolProgressWidget(QWidget):
@@ -280,7 +288,7 @@ class ProtocolWidget(QWidget):
 
         # Separator
         line = QFrame()
-        line.setFrameShape(QFrame.HLine)
+        line.setFrameShape(QFrame.Shape.HLine)
         layout.addWidget(line)
 
         # Progress display

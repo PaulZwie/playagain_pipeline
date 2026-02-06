@@ -5,12 +5,12 @@ This module provides a unified interface for different EMG devices,
 including real hardware and synthetic data generators.
 """
 
-from abc import ABC, abstractmethod
+from abc import abstractmethod
 from typing import Optional, Dict, Any, Callable
 from enum import Enum, auto
 from dataclasses import dataclass
 import numpy as np
-from PySide6.QtCore import QObject, Signal, QTimer
+from PySide6.QtCore import QObject, Signal, QTimer, QMutex, QMutexLocker
 
 # Try to import device_interfaces for real device support
 try:
@@ -66,6 +66,7 @@ class BaseEMGDevice(QObject):
     data_ready = Signal(np.ndarray)  # Emitted when new data is available
     connected = Signal(bool)          # Emitted when connection status changes
     error = Signal(str)               # Emitted on errors
+    ground_truth_changed = Signal(str)  # Emitted when ground truth gesture changes (for session replay)
 
     def __init__(self, config: DeviceConfig, parent: Optional[QObject] = None):
         super().__init__(parent)
@@ -90,7 +91,7 @@ class BaseEMGDevice(QObject):
         return self.config.sampling_rate
 
     @abstractmethod
-    def connect(self) -> bool:
+    def connect_device(self) -> bool:
         """Connect to the device. Returns True on success."""
         pass
 
@@ -207,7 +208,7 @@ if DEVICE_INTERFACES_AVAILABLE:
             }
             self._muovi.configure_device(params)
 
-        def connect(self) -> bool:
+        def connect_device(self) -> bool:
             """Connect to the Muovi device."""
             try:
                 if not self._muovi.is_connected:
@@ -349,7 +350,7 @@ else:
             }
             self._muovi.configure_device(params)
 
-        def connect(self) -> bool:
+        def connect_device(self) -> bool:
             try:
                 if not self._muovi.is_connected:
                     self._muovi.toggle_connection(
@@ -392,6 +393,8 @@ class SyntheticEMGDevice(BaseEMGDevice):
 
     Generates realistic synthetic EMG signals with configurable patterns,
     or replays existing session data in a loop.
+
+    Thread-safe implementation with ground truth signaling for session replay.
     """
 
     def __init__(
@@ -413,6 +416,9 @@ class SyntheticEMGDevice(BaseEMGDevice):
         )
         super().__init__(config, parent)
 
+        # Thread safety
+        self._data_mutex = QMutex()
+
         # Timer for data generation
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._generate_data)
@@ -424,6 +430,10 @@ class SyntheticEMGDevice(BaseEMGDevice):
         self._session_subject_id = session_subject_id
         self._session_id = session_id
         self._data_dir = data_dir or "gesture_pipeline_data"
+
+        # Session trial info for ground truth
+        self._session_trials = []  # List of (start_sample, end_sample, label_name)
+        self._current_ground_truth = "Unknown"
 
         if use_session_data:
             self._load_session_data()
@@ -489,7 +499,7 @@ class SyntheticEMGDevice(BaseEMGDevice):
         """Set signal amplitude."""
         self._signal_amplitude = amplitude
 
-    def connect(self) -> bool:
+    def connect_device(self) -> bool:
         """Simulate connection."""
         self._is_connected = True
         self.connected.emit(True)
@@ -523,77 +533,92 @@ class SyntheticEMGDevice(BaseEMGDevice):
         self._timer.stop()
         self._is_streaming = False
 
+    def _get_ground_truth_for_sample(self, sample_index: int) -> str:
+        """Get the ground truth gesture label for a given sample index."""
+        for start, end, label in self._session_trials:
+            if start <= sample_index < end:
+                return label
+        return "Unknown"
+
     def _generate_data(self) -> None:
         """Generate and emit synthetic EMG data or replay session data."""
         samples = self.config.samples_per_frame
 
-        if self._use_session_data and self._session_data is not None:
-            # Replay session data in a loop
-            if self._session_index + samples > len(self._session_data):
-                # Loop back to beginning
-                self._session_index = 0
+        with QMutexLocker(self._data_mutex):
+            if self._use_session_data and self._session_data is not None:
+                # Replay session data in a loop
+                if self._session_index + samples > len(self._session_data):
+                    # Loop back to beginning
+                    self._session_index = 0
 
-            data = self._session_data[self._session_index:self._session_index + samples]
-            self._session_index += samples
+                data = self._session_data[self._session_index:self._session_index + samples]
+                current_idx = self._session_index
+                self._session_index += samples
 
-            # If we don't have enough samples at the end, wrap around
-            if data.shape[0] < samples:
-                remaining = samples - data.shape[0]
-                data = np.vstack([data, self._session_data[:remaining]])
-                self._session_index = remaining
-        else:
-            # Original synthetic generation
-            channels = self.config.num_channels
+                # If we don't have enough samples at the end, wrap around
+                if data.shape[0] < samples:
+                    remaining = samples - data.shape[0]
+                    data = np.vstack([data, self._session_data[:remaining]])
+                    self._session_index = remaining
 
-            # Time vector for this frame
-            dt = 1.0 / self.config.sampling_rate
-            t = np.linspace(
-                self._current_time,
-                self._current_time + samples * dt,
-                samples,
-                endpoint=False
-            )
-            self._current_time += samples * dt
-
-            # Generate base EMG signal
-            data = np.zeros((samples, channels))
-
-            for ch in range(channels):
-                # EMG-like signal (multiple frequency components)
-                freq = self._channel_frequencies[ch]
-                phase = self._channel_phases[ch]
-                amp = self._channel_amplitudes[ch]
-
-                # Carrier signal
-                carrier = amp * np.sin(2 * np.pi * freq * t + phase)
-
-                # Add harmonics
-                carrier += 0.3 * amp * np.sin(2 * np.pi * 2 * freq * t + phase)
-                carrier += 0.1 * amp * np.sin(2 * np.pi * 3 * freq * t + phase)
-
-                # Add noise
-                noise = np.random.randn(samples) * self._noise_level
-
-                data[:, ch] = carrier + noise
-
-            # Apply gesture modulation
-            if self._active_gesture and self._active_gesture in self._gesture_patterns:
-                pattern = self._gesture_patterns[self._active_gesture]
-                data = data * pattern * self._signal_amplitude
+                # Emit ground truth if it changed
+                new_ground_truth = self._get_ground_truth_for_sample(current_idx)
+                if new_ground_truth != self._current_ground_truth:
+                    self._current_ground_truth = new_ground_truth
+                    self.ground_truth_changed.emit(new_ground_truth)
             else:
-                # Rest pattern
-                data = data * self._gesture_patterns["rest"] * self._signal_amplitude
+                # Original synthetic generation
+                channels = self.config.num_channels
 
-            # Add some random burst noise (EMG artifact simulation)
-            if np.random.random() < 0.01:  # 1% chance per frame
-                burst_ch = np.random.randint(0, channels)
-                burst_amp = np.random.uniform(2, 5)
+                # Time vector for this frame
+                dt = 1.0 / self.config.sampling_rate
+                t = np.linspace(
+                    self._current_time,
+                    self._current_time + samples * dt,
+                    samples,
+                    endpoint=False
+                )
+                self._current_time += samples * dt
+
+                # Generate base EMG signal
+                data = np.zeros((samples, channels))
+
+                for ch in range(channels):
+                    # EMG-like signal (multiple frequency components)
+                    freq = self._channel_frequencies[ch]
+                    phase = self._channel_phases[ch]
+                    amp = self._channel_amplitudes[ch]
+
+                    # Carrier signal
+                    carrier = amp * np.sin(2 * np.pi * freq * t + phase)
+
+                    # Add harmonics
+                    carrier += 0.3 * amp * np.sin(2 * np.pi * 2 * freq * t + phase)
+                    carrier += 0.1 * amp * np.sin(2 * np.pi * 3 * freq * t + phase)
+
+                    # Add noise
+                    noise = np.random.randn(samples) * self._noise_level
+
+                    data[:, ch] = carrier + noise
+
+                # Apply gesture modulation
+                if self._active_gesture and self._active_gesture in self._gesture_patterns:
+                    pattern = self._gesture_patterns[self._active_gesture]
+                    data = data * pattern * self._signal_amplitude
+                else:
+                    # Rest pattern
+                    data = data * self._gesture_patterns["rest"] * self._signal_amplitude
+
+                # Add some random burst noise (EMG artifact simulation)
+                if np.random.random() < 0.01:  # 1% chance per frame
+                    burst_ch = np.random.randint(0, channels)
+                    burst_amp = np.random.uniform(2, 5)
                 data[:, burst_ch] *= burst_amp
 
         self.data_ready.emit(data)
 
     def _load_session_data(self) -> None:
-        """Load session data for replay."""
+        """Load session data for replay, including trial info for ground truth."""
         if not self._session_subject_id or not self._session_id:
             # Auto-select first available session if not specified
             from pathlib import Path
@@ -614,13 +639,46 @@ class SyntheticEMGDevice(BaseEMGDevice):
 
         # Load session data
         from pathlib import Path
-        session_path = Path(self._data_dir) / "sessions" / self._session_subject_id / self._session_id / "data.npy"
+        import json
+        session_path = Path(self._data_dir) / "sessions" / self._session_subject_id / self._session_id
+        data_path = session_path / "data.npy"
 
-        if not session_path.exists():
-            raise FileNotFoundError(f"Session data not found: {session_path}")
+        if not data_path.exists():
+            raise FileNotFoundError(f"Session data not found: {data_path}")
 
-        self._session_data = np.load(session_path)
+        self._session_data = np.load(data_path)
         self._session_index = 0
+
+        # Load trial info for ground truth labels
+        self._session_trials = []
+        metadata_path = session_path / "metadata.json"
+        if metadata_path.exists():
+            try:
+                with open(metadata_path, 'r') as f:
+                    metadata = json.load(f)
+
+                # Load gesture set to map labels to names
+                gesture_names = {}
+                gesture_set_path = session_path / "gesture_set.json"
+                if gesture_set_path.exists():
+                    with open(gesture_set_path, 'r') as f:
+                        gesture_data = json.load(f)
+                        for g in gesture_data.get("gestures", []):
+                            gesture_names[g.get("label_id")] = g.get("display_name", g.get("name", "Unknown"))
+
+                # Extract trials
+                trials_path = session_path / "trials.json"
+                if trials_path.exists():
+                    with open(trials_path, 'r') as f:
+                        trials = json.load(f)
+                        for trial in trials:
+                            start = trial.get("start_sample", 0)
+                            end = trial.get("end_sample", 0)
+                            label_id = trial.get("gesture_label", 0)
+                            label_name = gesture_names.get(label_id, f"Class {label_id}")
+                            self._session_trials.append((start, end, label_name))
+            except Exception as e:
+                print(f"Warning: Could not load trial info for ground truth: {e}")
 
         # Validate session data matches device configuration
         if self._session_data.shape[1] != self.config.num_channels:
@@ -717,7 +775,7 @@ class DeviceManager:
         if self._device is None:
             return False
 
-        if not self._device.connect():
+        if not self._device.connect_device():
             return False
 
         return self._device.start_streaming()

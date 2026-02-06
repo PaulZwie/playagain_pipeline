@@ -158,26 +158,28 @@ class RecordingProtocol:
                     is_recording=True
                 ))
 
-                # Rest phase (8s) - show next gesture
-                next_i = (i + 1) % len(gestures)
-                if next_i == 0 and rep + 1 < self.config.repetitions_per_gesture:
-                    next_gesture = gestures[0]  # Next repetition starts with first
-                else:
-                    next_gesture = gestures[next_i]
+                # Check if there's a next gesture (not last gesture of last repetition)
+                is_last_gesture = (i == len(gestures) - 1) and (rep == self.config.repetitions_per_gesture - 1)
 
-                self._steps.append(ProtocolStep(
-                    phase=ProtocolPhase.REST,
-                    gesture=None,
-                    duration=8.0,
-                    message=f"Rest - Next: {next_gesture.display_name}",
-                    trial_index=rep * len(gestures) + i,
-                    repetition_index=rep,
-                    is_recording=False
-                ))
+                if not is_last_gesture:
+                    # Determine next gesture
+                    next_i = (i + 1) % len(gestures)
+                    if next_i == 0 and rep + 1 < self.config.repetitions_per_gesture:
+                        next_gesture = gestures[0]  # Next repetition starts with first
+                    else:
+                        next_gesture = gestures[next_i]
 
-        # Remove the last REST if it's after the last gesture
-        if self._steps and self._steps[-1].phase == ProtocolPhase.REST:
-            self._steps.pop()
+                    # Pause phase (3s) - show next gesture
+                    self._steps.append(ProtocolStep(
+                        phase=ProtocolPhase.REST,
+                        gesture=next_gesture,  # Pass next gesture for visualization
+                        duration=3.0,
+                        message=f"Pause. Next: {next_gesture.display_name}",
+                        trial_index=rep * len(gestures) + i,
+                        repetition_index=rep,
+                        is_recording=False
+                    ))
+
 
         # Final completion
         self._steps.append(ProtocolStep(

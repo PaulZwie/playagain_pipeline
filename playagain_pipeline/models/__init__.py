@@ -10,6 +10,14 @@ from playagain_pipeline.models.classifier import (
     ModelManager
 )
 
+from playagain_pipeline.models.feature_pipeline import (
+    FeaturePipeline,
+    BaseFeatureExtractor,
+    FeatureConfig,
+    register_feature,
+    get_registered_features
+)
+
 __all__ = [
     "ModelMetadata",
     "BaseClassifier",
@@ -17,5 +25,10 @@ __all__ = [
     "SVMClassifier",
     "RandomForestClassifier",
     "LDAClassifier",
-    "ModelManager"
+    "ModelManager",
+    "FeaturePipeline",
+    "BaseFeatureExtractor",
+    "FeatureConfig",
+    "register_feature",
+    "get_registered_features"
 ]

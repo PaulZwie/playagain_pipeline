@@ -15,6 +15,8 @@ from pathlib import Path
 from playagain_pipeline.core.data_manager import DataManager
 from scipy import signal
 from sklearn.preprocessing import StandardScaler
+import json
+from typing import List, Dict, Any
 
 
 def bandpass_filter(data: np.ndarray, low_freq: float = 20, high_freq: float = 500, fs: float = 2000) -> np.ndarray:
@@ -56,6 +58,125 @@ def extract_rms_features(data: np.ndarray, window_size: int = 50) -> np.ndarray:
         rms_features.append(rms)
 
     return np.array(rms_features)
+
+
+def add_rest_periods_to_session(session_dir: Path) -> Dict[str, Any]:
+    """
+    Update a session's metadata to include rest periods between gesture trials.
+
+    Rest periods are automatically inserted between the end of one gesture trial
+    and the start of the next gesture trial.
+
+    Args:
+        session_dir: Path to the session directory containing metadata.json
+
+    Returns:
+        Updated metadata dictionary with rest periods added
+    """
+    metadata_path = session_dir / "metadata.json"
+
+    if not metadata_path.exists():
+        raise FileNotFoundError(f"No metadata.json found in {session_dir}")
+
+    with open(metadata_path, 'r') as f:
+        data = json.load(f)
+
+    original_trials = data["trials"]
+    new_trials = []
+    trial_id = 0
+
+    # Add rest trials between gesture trials
+    for i, trial in enumerate(original_trials):
+        # Insert rest period before this gesture if not the first trial
+        if i > 0:
+            prev_trial = original_trials[i - 1]
+            rest_start_sample = prev_trial["end_sample"]
+            rest_end_sample = trial["start_sample"]
+            rest_start_time = prev_trial["end_time"]
+            rest_end_time = trial["start_time"]
+
+            # Only add if there's a gap
+            if rest_end_sample > rest_start_sample:
+                new_trials.append({
+                    "trial_id": trial_id,
+                    "gesture_name": "rest",
+                    "gesture_label": 0,  # Rest is label 0
+                    "start_sample": rest_start_sample,
+                    "end_sample": rest_end_sample,
+                    "start_time": rest_start_time,
+                    "end_time": rest_end_time,
+                    "is_valid": True,
+                    "notes": "Rest period (auto-generated)"
+                })
+                trial_id += 1
+
+        # Update gesture trial ID and adjust gesture label (shift by 1 since rest is 0)
+        updated_trial = trial.copy()
+        updated_trial["trial_id"] = trial_id
+        # Shift gesture labels: rest=0, fist=1, index_thumb=2, three_finger_thumb=3
+        if updated_trial["gesture_name"] == "fist":
+            updated_trial["gesture_label"] = 1
+        elif updated_trial["gesture_name"] == "index_thumb":
+            updated_trial["gesture_label"] = 2
+        elif updated_trial["gesture_name"] == "three_finger_thumb":
+            updated_trial["gesture_label"] = 3
+
+        new_trials.append(updated_trial)
+        trial_id += 1
+
+    # Update metadata
+    data["trials"] = new_trials
+    notes = data["metadata"].get("notes", "")
+    if "[Rest periods added]" not in notes:
+        data["metadata"]["notes"] = (notes + " [Rest periods added]").strip()
+
+    # Save updated metadata
+    with open(metadata_path, 'w') as f:
+        json.dump(data, f, indent=2)
+
+    return data
+
+
+def update_all_sessions_with_rest(sessions_root: Path) -> None:
+    """
+    Update all sessions in a sessions directory to include rest periods.
+
+    Args:
+        sessions_root: Path to root sessions directory (e.g., gesture_pipeline/data/sessions)
+    """
+    sessions_root = Path(sessions_root)
+
+    if not sessions_root.exists():
+        raise FileNotFoundError(f"Sessions directory not found: {sessions_root}")
+
+    updated_count = 0
+    error_count = 0
+
+    # Iterate through all subject directories
+    for subject_dir in sessions_root.iterdir():
+        if not subject_dir.is_dir():
+            continue
+
+        print(f"\nProcessing subject: {subject_dir.name}")
+
+        # Iterate through all session directories
+        for session_dir in subject_dir.iterdir():
+            if not session_dir.is_dir():
+                continue
+
+            try:
+                updated_data = add_rest_periods_to_session(session_dir)
+                num_rest_trials = sum(1 for t in updated_data["trials"] if t["gesture_name"] == "rest")
+                num_gesture_trials = len(updated_data["trials"]) - num_rest_trials
+                print(f"  ✓ {session_dir.name}: {num_gesture_trials} gestures + {num_rest_trials} rest periods")
+                updated_count += 1
+            except Exception as e:
+                print(f"  ✗ {session_dir.name}: Error - {e}")
+                error_count += 1
+
+    print(f"\n{'='*60}")
+    print(f"Summary: {updated_count} sessions updated, {error_count} errors")
+    print(f"{'='*60}")
 
 
 def main():
