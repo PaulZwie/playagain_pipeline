@@ -194,12 +194,6 @@ def format_pause_prompt(next_gesture: Optional[Gesture] = None) -> str:
 def create_default_gesture_set() -> GestureSet:
     """
     Create a default gesture set with common hand gestures.
-
-    Includes:
-    - Rest: Neutral/relaxed baseline state
-    - Fist: Grip/hand closure (🤛🏻)
-    - Index-Thumb Pinch: Precision grip (👌🏻)
-    - Three Fingers-Thumb: Tripod grip (🤌🏻)
     """
     gesture_set = GestureSet(name="default")
 
@@ -225,8 +219,8 @@ def create_default_gesture_set() -> GestureSet:
 
     # Index finger to thumb (pinch)
     gesture_set.add_gesture(Gesture(
-        name="index_thumb",
-        display_name="Index-Thumb Pinch",
+        name="pinch",
+        display_name="Pinch",
         description="Touch your index finger tip to your thumb tip, keeping other fingers extended.",
         category=GestureCategory.FINGER,
         emoji="👌🏻",
@@ -235,8 +229,8 @@ def create_default_gesture_set() -> GestureSet:
 
     # Three fingers to thumb (tripod)
     gesture_set.add_gesture(Gesture(
-        name="three_finger_thumb",
-        display_name="Three Fingers-Thumb",
+        name="tripod",
+        display_name="Tripod",
         description="Touch index, middle, and ring finger tips to your thumb tip.",
         category=GestureCategory.FINGER,
         emoji="🤌🏻",

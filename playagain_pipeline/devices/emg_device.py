@@ -626,7 +626,7 @@ class SyntheticEMGDevice(BaseEMGDevice):
             sessions_dir = data_dir / "sessions"
 
             if sessions_dir.exists():
-                subjects = [d for d in sessions_dir.iterdir() if d.is_dir()]
+                subjects = [d for d in sessions_dir.iterdir() if d.is_dir() and not d.name.startswith('.')]
                 if subjects:
                     subject_dir = subjects[0]
                     sessions = [d for d in subject_dir.iterdir() if d.is_dir()]
@@ -651,41 +651,47 @@ class SyntheticEMGDevice(BaseEMGDevice):
 
         # Load trial info for ground truth labels
         self._session_trials = []
+
+        # Load gesture set to map labels to names
+        gesture_names = {}
+        gesture_set_path = session_path / "gesture_set.json"
+        if gesture_set_path.exists():
+            try:
+                with open(gesture_set_path, 'r') as f:
+                    gesture_data = json.load(f)
+                    for g in gesture_data.get("gestures", []):
+                        gesture_names[g.get("label_id")] = g.get("display_name", g.get("name", "Unknown"))
+            except Exception as e:
+                print(f"Warning: Could not load gesture set: {e}")
+
+        # Load trials from metadata.json (trials are embedded in metadata)
         metadata_path = session_path / "metadata.json"
         if metadata_path.exists():
             try:
                 with open(metadata_path, 'r') as f:
                     metadata = json.load(f)
 
-                # Load gesture set to map labels to names
-                gesture_names = {}
-                gesture_set_path = session_path / "gesture_set.json"
-                if gesture_set_path.exists():
-                    with open(gesture_set_path, 'r') as f:
-                        gesture_data = json.load(f)
-                        for g in gesture_data.get("gestures", []):
-                            gesture_names[g.get("label_id")] = g.get("display_name", g.get("name", "Unknown"))
+                # Trials are stored directly in the metadata file
+                trials = metadata.get("trials", [])
+                for trial in trials:
+                    start = trial.get("start_sample", 0)
+                    end = trial.get("end_sample", 0)
+                    # Try gesture_name first, then fall back to label lookup
+                    label_name = trial.get("gesture_name")
+                    if not label_name:
+                        label_id = trial.get("gesture_label", 0)
+                        label_name = gesture_names.get(label_id, f"Class {label_id}")
+                    self._session_trials.append((start, end, label_name))
 
-                # Extract trials
-                trials_path = session_path / "trials.json"
-                if trials_path.exists():
-                    with open(trials_path, 'r') as f:
-                        trials = json.load(f)
-                        for trial in trials:
-                            start = trial.get("start_sample", 0)
-                            end = trial.get("end_sample", 0)
-                            label_id = trial.get("gesture_label", 0)
-                            label_name = gesture_names.get(label_id, f"Class {label_id}")
-                            self._session_trials.append((start, end, label_name))
+                print(f"Loaded {len(self._session_trials)} trials for ground truth")
             except Exception as e:
                 print(f"Warning: Could not load trial info for ground truth: {e}")
 
         # Validate session data matches device configuration
         if self._session_data.shape[1] != self.config.num_channels:
-            raise ValueError(
-                f"Session has {self._session_data.shape[1]} channels, "
-                f"but device is configured for {self.config.num_channels} channels"
-            )
+            # Update config to match session data
+            print(f"Note: Adjusting channel count from {self.config.num_channels} to {self._session_data.shape[1]} to match session data")
+            self.config.num_channels = self._session_data.shape[1]
 
 
 class DeviceManager:

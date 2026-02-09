@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, Q
                                QGridLayout, QApplication, QMenuBar, QMenu, QDialog, QListWidgetItem)
 
 from playagain_pipeline.calibration.calibrator import AutoCalibrator
+from playagain_pipeline.config.config import get_default_config, PipelineConfig
 from playagain_pipeline.core.data_manager import DataManager
 from playagain_pipeline.core.gesture import (create_default_gesture_set)
 from playagain_pipeline.core.session import RecordingSession
@@ -69,6 +70,9 @@ class MainWindow(QMainWindow):
         # Plot window
         self._plot_window: Optional[EMGPlotWindow] = None
 
+        # Ground truth label for session replay
+        self._current_ground_truth_label: Optional[str] = None
+
         # Setup UI
         self._setup_ui()
         self._setup_connections()
@@ -77,6 +81,17 @@ class MainWindow(QMainWindow):
         self._status_timer = QTimer(self)
         self._status_timer.timeout.connect(self._update_status)
         self._status_timer.start(1000)
+
+        # Load configuration
+        self.config = get_default_config()
+        # Try to load from file if exists
+        config_path = self._pipeline_dir / "config.json"
+        if config_path.exists():
+            try:
+                self.config = PipelineConfig.load(config_path)
+                self._log("Loaded configuration from file")
+            except Exception as e:
+                self._log(f"Failed to load config, using defaults: {e}")
 
         self._log("Application started")
 
@@ -303,6 +318,21 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
+        # Information about calibration
+        info_group = QGroupBox("About Calibration")
+        info_layout = QVBoxLayout(info_group)
+
+        info_label = QLabel(
+            "Calibration determines the electrode bracelet orientation by analyzing\n"
+            "EMG patterns from individual finger movements.\n\n"
+            "Single finger gestures produce distinct, localized muscle activation\n"
+            "patterns that help accurately detect electrode positioning."
+        )
+        info_label.setWordWrap(True)
+        info_label.setStyleSheet("color: #555; font-size: 11px;")
+        info_layout.addWidget(info_label)
+        layout.addWidget(info_group)
+
         # Calibration status
         status_group = QGroupBox("Calibration Status")
         status_layout = QFormLayout(status_group)
@@ -319,11 +349,20 @@ class MainWindow(QMainWindow):
         layout.addWidget(status_group)
 
         # Calibration controls
-        control_group = QGroupBox("Calibration")
+        control_group = QGroupBox("Calibration Actions")
         control_layout = QVBoxLayout(control_group)
+
+        # Info about gestures used
+        gesture_info = QLabel(
+            "Gestures used: Rest, Index/Middle/Ring/Pinky/Thumb flex,\n"
+            "Index extend, Wrist flex"
+        )
+        gesture_info.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
+        control_layout.addWidget(gesture_info)
 
         self.start_cal_btn = QPushButton("Start Calibration")
         self.start_cal_btn.clicked.connect(self._on_start_calibration)
+        self.start_cal_btn.setMinimumHeight(40)
         control_layout.addWidget(self.start_cal_btn)
 
         self.save_ref_btn = QPushButton("Save as Reference")
@@ -367,7 +406,7 @@ class MainWindow(QMainWindow):
         model_layout = QFormLayout(model_group)
 
         self.model_type_combo = QComboBox()
-        self.model_type_combo.addItems(["SVM", "Random Forest", "LDA", "CatBoost", "MLP"])
+        self.model_type_combo.addItems(["SVM", "Random Forest", "LDA", "CatBoost", "MLP", "CNN", "InceptionAttn"])
         model_layout.addRow("Model Type:", self.model_type_combo)
 
         train_btn_layout = QHBoxLayout()
@@ -515,9 +554,14 @@ class MainWindow(QMainWindow):
             num_channels = device.num_channels if device else 32
             sampling_rate = device.sampling_rate if device else 2000
 
-            self._plot_window = EMGPlotWindow(num_channels=num_channels, sampling_rate=sampling_rate, parent=self)
+            self._plot_window = EMGPlotWindow(num_channels=num_channels, sampling_rate=sampling_rate, parent=None)
             self._plot_window.closed.connect(self._on_plot_window_closed)
             self._plot_window.show()
+
+            # If we have a current ground truth (session replay), set it
+            if hasattr(self, '_current_ground_truth_label') and self._current_ground_truth_label:
+                self._plot_window.set_ground_truth(self._current_ground_truth_label)
+
             self._log("Opened plot window")
         else:
             self._plot_window.raise_()
@@ -653,22 +697,32 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_advanced_training(self):
         """Open advanced training dialog."""
-        selected = self.dataset_list.currentItem()
-        if not selected:
-            QMessageBox.warning(self, "Warning", "Please select a dataset first (in Training tab)")
-            self.mode_tabs.setCurrentIndex(2)  # Switch to training tab
-            return
-
         try:
-            dataset_name = selected.text()
-            self._log(f"Loading dataset '{dataset_name}' for advanced training...")
-            dataset = self.data_manager.load_dataset(dataset_name)
+            # Get list of available datasets
+            available_datasets = self.data_manager.list_datasets()
+            if not available_datasets:
+                QMessageBox.warning(self, "Warning", "No datasets available. Please create a dataset first.")
+                self.mode_tabs.setCurrentIndex(2)  # Switch to training tab
+                return
 
             from playagain_pipeline.gui.widgets.training_dialog import TrainingProgressDialog
 
-            model_type_str = self.model_type_combo.currentText().lower().replace(" ", "_")
+            # Get available model types
+            available_models = ["SVM", "CatBoost", "Random Forest", "LDA", "MLP", "CNN", "InceptionAttn"]
 
-            dialog = TrainingProgressDialog(model_type_str, dataset, self)
+            # Create dialog without pre-selected dataset/model to enable selection
+            dialog = TrainingProgressDialog(
+                model_type=None,
+                dataset=None,
+                config=self.config,
+                parent=self,
+                available_datasets=available_datasets,
+                available_models=available_models
+            )
+
+            # Switch to Training tab
+            self.mode_tabs.setCurrentIndex(2)
+
             if dialog.exec():
                 # Get trained model and save it
                 model = dialog.get_trained_model()
@@ -755,8 +809,15 @@ class MainWindow(QMainWindow):
             device.error.connect(self._on_device_error)
 
             # Connect ground truth signal for session replay visualization
+            # This signal is emitted by SyntheticEMGDevice when replaying session data
             if hasattr(device, 'ground_truth_changed'):
+                # Disconnect any previous connection to avoid duplicates
+                try:
+                    device.ground_truth_changed.disconnect(self._on_ground_truth_changed)
+                except (TypeError, RuntimeError):
+                    pass  # Not connected yet
                 device.ground_truth_changed.connect(self._on_ground_truth_changed)
+                self._log("Ground truth signal connected for session replay")
 
             # 4. Initiate connection based on device architecture
             if device_type in (DeviceType.MUOVI, DeviceType.MUOVI_PLUS):
@@ -814,6 +875,9 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_ground_truth_changed(self, label: str):
         """Handle ground truth label change during session replay."""
+        # Store the current ground truth for when plot window opens
+        self._current_ground_truth_label = label
+
         # Forward to plot window if open
         if self._plot_window and self._plot_window.isVisible():
             self._plot_window.set_ground_truth(label)
@@ -883,7 +947,10 @@ class MainWindow(QMainWindow):
         self._current_protocol = RecordingProtocol(gesture_set, protocol_config)
 
         # Create session
-        session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+        # Format: YYYY-MM-DD_HH:MM:SS_Nrep
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H:%M:%S")
+        n_rep = protocol_config.repetitions_per_gesture
+        session_id = f"{timestamp}_{n_rep}rep"
 
         # Determine actual number of channels after exclusion
         excluded = self._get_excluded_channels()
@@ -1082,6 +1149,60 @@ class MainWindow(QMainWindow):
         name_edit = QLineEdit("my_dataset")
         params_layout.addRow("Dataset Name:", name_edit)
 
+        # Setup auto-naming logic
+        state = {"manual_edit": False}
+
+        def on_name_edited(text):
+            state["manual_edit"] = True
+        name_edit.textEdited.connect(on_name_edited)
+
+        def update_dataset_name():
+            if state["manual_edit"]:
+                return
+
+            new_name = "my_dataset"
+
+            if tabs.currentIndex() == 0:  # Subject tab
+                selected_items = subject_list.selectedItems()
+                if not selected_items:
+                    new_name = "dataset_no_subject"
+                elif len(selected_items) == 1:
+                    new_name = f"{selected_items[0].text()}"
+                else:
+                    new_name = f"{len(selected_items)}_subjects"
+            else:  # Session tab
+                selected_items = session_list.selectedItems()
+                if not selected_items:
+                    new_name = "dataset_no_session"
+                elif len(selected_items) == 1:
+                    # Item text is "subject / session_id", data is (subject, session_id)
+                    _, session_id = selected_items[0].data(Qt.ItemDataRole.UserRole)
+                    new_name = f"{session_id}"
+                else:
+                    # Try to create a meaningful name if few sessions
+                    if len(selected_items) <= 3:
+                        names = []
+                        for item in selected_items:
+                            _, session_id = item.data(Qt.ItemDataRole.UserRole)
+                            names.append(session_id)
+                        new_name = f"{'_'.join(names)}"
+                        # Truncate if too long
+                        if len(new_name) > 80:
+                            new_name = f"{len(selected_items)}_sessions"
+                    else:
+                        new_name = f"{len(selected_items)}_sessions"
+
+            if name_edit.text() != new_name:
+                name_edit.setText(new_name)
+
+        # Connect signals for auto-naming
+        subject_list.itemSelectionChanged.connect(update_dataset_name)
+        session_list.itemSelectionChanged.connect(update_dataset_name)
+        tabs.currentChanged.connect(update_dataset_name)
+
+        # Trigger initial update
+        update_dataset_name()
+
         # Window parameters
         window_size_spin = QSpinBox()
         window_size_spin.setRange(50, 1000)
@@ -1190,8 +1311,14 @@ class MainWindow(QMainWindow):
             # Create model
             model_type = self.model_type_combo.currentText().lower().replace(" ", "_")
             self._log(f"Creating {model_type} model...")
-            model = self.model_manager.create_model(model_type)
-            self._log(f"✓ Model created")
+
+            # Build model name: type_datasetname
+            safe_dataset_name = dataset_name.replace(":", "-").replace(" ", "_")
+            safe_dataset_name = safe_dataset_name.replace("/", "_").replace("\\\\", "_")
+            model_name = f"{model_type}_{safe_dataset_name}"
+
+            model = self.model_manager.create_model(model_type, name=model_name)
+            self._log(f"Model created: {model.name}")
 
             # Data splitting information
             from sklearn.model_selection import train_test_split
@@ -1209,7 +1336,7 @@ class MainWindow(QMainWindow):
             results = self.model_manager.train_model(model, dataset)
 
             # Log detailed results
-            self._log(f"✓ Training complete!")
+            self._log(f"Training complete!")
             self._log(f"  • Training accuracy: {results['training_accuracy']:.2%}")
             self._log(f"  • Validation accuracy: {results['validation_accuracy']:.2%}")
 
@@ -1223,7 +1350,7 @@ class MainWindow(QMainWindow):
             self._log(f"Model saved successfully")
 
         except Exception as e:
-            self._log(f"✗ Error training model: {e}")
+            self._log(f"Error training model: {e}")
 
     # Prediction handlers
     @Slot()

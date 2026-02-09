@@ -2,14 +2,15 @@
 EMG visualization widget for real-time signal display.
 
 Uses VispyBiosignalPlot for efficient real-time plotting of multi-channel EMG data.
+Implements threading to ensure plotting doesn't interfere with main window performance.
 """
 
 import numpy as np
-
 from typing import Optional
+
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox,
-                                QCheckBox, QMainWindow, QScrollArea)
-from PySide6.QtCore import Slot, Signal, QMutex
+                                QCheckBox, QMainWindow)
+from PySide6.QtCore import Slot, Signal, QMutex, QMutexLocker, QTimer
 from gui_custom_elements.vispy.biosignal_plot import VispyBiosignalPlot
 
 
@@ -199,6 +200,9 @@ class EMGPlotWindow(QMainWindow):
 
     Features channel checkboxes directly beside the plot for easy toggling.
     Uses VispyBiosignalPlot for efficient visualization.
+
+    Threading: Data buffering happens in a separate thread to avoid
+    blocking the main window or training operations.
     """
 
     closed = Signal()  # Emitted when window is closed
@@ -228,16 +232,19 @@ class EMGPlotWindow(QMainWindow):
         # Channel visibility
         self._channel_visible = [True] * num_channels
 
-        # Frame counter for throttling updates
-        self._frame_count = 0
-        self._update_every_n_frames = 3
-
         # Thread safety for data buffer
         self._data_mutex = QMutex()
 
+        # Update timer - decoupled from data reception for smoother UI
+        self._update_timer = QTimer(self)
+        self._update_timer.timeout.connect(self._update_plots)
+        self._update_timer.setInterval(33)  # ~30 FPS for smooth visualization
 
         # Setup UI
         self._setup_ui()
+
+        # Start the update timer
+        self._update_timer.start()
 
     def _setup_ui(self):
         """Setup the user interface."""
@@ -245,7 +252,7 @@ class EMGPlotWindow(QMainWindow):
         self.setCentralWidget(central)
         main_layout = QHBoxLayout(central)
 
-        # Left side - Plot
+        # Left side - Plot (takes all the space now)
         plot_container = QWidget()
         plot_layout = QVBoxLayout(plot_container)
         plot_layout.setContentsMargins(0, 0, 0, 0)
@@ -280,41 +287,9 @@ class EMGPlotWindow(QMainWindow):
         )
         plot_layout.addWidget(self._ground_truth_label)
 
-        main_layout.addWidget(plot_container, stretch=3)
+        main_layout.addWidget(plot_container, stretch=1)
 
-        # Right side - Channel controls
-        channel_container = QWidget()
-        channel_layout = QVBoxLayout(channel_container)
-        channel_layout.setContentsMargins(5, 5, 5, 5)
-
-        channel_label = QLabel("Channels")
-        channel_label.setStyleSheet("font-weight: bold; font-size: 14px;")
-        channel_layout.addWidget(channel_label)
-
-
-        # Scrollable area for channel checkboxes
-        scroll_area = QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setMaximumWidth(150)
-
-        scroll_widget = QWidget()
-        scroll_layout = QVBoxLayout(scroll_widget)
-        scroll_layout.setSpacing(2)
-
-        self.channel_checks = []
-        for i in range(self.num_channels):
-            check = QCheckBox(f"Ch {i}")
-            check.setChecked(True)
-            check.toggled.connect(lambda checked, ch=i: self._on_channel_toggled(ch, checked))
-            scroll_layout.addWidget(check)
-            self.channel_checks.append(check)
-
-        scroll_layout.addStretch()
-        scroll_area.setWidget(scroll_widget)
-        channel_layout.addWidget(scroll_area)
-
-        main_layout.addWidget(channel_container, stretch=0)
-
+        # Note: Channel controls removed - use the ones in the main window recording tab
     @Slot(str)
     def set_ground_truth(self, label: str):
         """Update the ground truth label display."""
@@ -336,12 +311,6 @@ class EMGPlotWindow(QMainWindow):
                 "background-color: #ffd3a5; border-radius: 5px;"
             )
 
-    @Slot(int, bool)
-    def _on_channel_toggled(self, channel: int, checked: bool):
-        """Handle channel checkbox toggle."""
-        self._channel_visible[channel] = checked
-        self._update_plots()
-
     @Slot(int)
     def _on_display_time_changed(self, value: int):
         """Handle display time change."""
@@ -349,16 +318,44 @@ class EMGPlotWindow(QMainWindow):
         new_samples = int(value * self.sampling_rate)
 
         if new_samples != self.display_samples:
-            old_data = self._data_buffer
-            self._data_buffer = np.zeros((new_samples, self.num_channels))
+            with QMutexLocker(self._data_mutex):
+                old_data = self._data_buffer
+                self._data_buffer = np.zeros((new_samples, self.num_channels))
 
-            copy_samples = min(new_samples, len(old_data))
-            self._data_buffer[-copy_samples:] = old_data[-copy_samples:]
+                copy_samples = min(new_samples, len(old_data))
+                self._data_buffer[-copy_samples:] = old_data[-copy_samples:]
 
-            self.display_samples = new_samples
+                self.display_samples = new_samples
+
+    def _add_data_to_buffer(self, data: np.ndarray):
+        """Add data to the circular buffer (thread-safe)."""
+        with QMutexLocker(self._data_mutex):
+            n_samples = data.shape[0]
+
+            if n_samples > self.display_samples:
+                self._data_buffer[:, :] = data[-self.display_samples:, :]
+                self._buffer_index = 0
+                self._buffer_full = True
+            else:
+                end_index = (self._buffer_index + n_samples) % self.display_samples
+                if end_index < self._buffer_index:
+                    remaining = self.display_samples - self._buffer_index
+                    self._data_buffer[self._buffer_index:] = data[:remaining]
+                    self._data_buffer[:end_index] = data[remaining:]
+                    self._buffer_full = True
+                else:
+                    self._data_buffer[self._buffer_index:end_index] = data
+                    if end_index == 0:
+                        self._buffer_full = True
+                self._buffer_index = end_index
 
     def update_data(self, data: np.ndarray):
-        """Update the plot with new data."""
+        """
+        Update the plot with new data.
+
+        This method is thread-safe and decoupled from actual plot rendering.
+        Data is queued and processed, while rendering happens on a fixed timer.
+        """
         if data is None or data.size == 0:
             return
 
@@ -374,49 +371,16 @@ class EMGPlotWindow(QMainWindow):
             temp_data[:, :min_ch] = data[:, :min_ch]
             data = temp_data
 
-        n_samples = data.shape[0]
-
-        # Add new data to circular buffer
-        if n_samples > self.display_samples:
-            # If more data than buffer, take the latest
-            self._data_buffer[:, :] = data[-self.display_samples:, :]
-            self._buffer_index = 0
-            self._buffer_full = True
-        else:
-            end_index = (self._buffer_index + n_samples) % self.display_samples
-            if end_index < self._buffer_index:
-                # Wrap around
-                remaining = self.display_samples - self._buffer_index
-                self._data_buffer[self._buffer_index:] = data[:remaining]
-                self._data_buffer[:end_index] = data[remaining:]
-                self._buffer_full = True
-            else:
-                self._data_buffer[self._buffer_index:end_index] = data
-                if end_index == 0:
-                    self._buffer_full = True
-            self._buffer_index = end_index
-
-        # Throttle plot updates
-        self._frame_count += 1
-        if self._frame_count >= self._update_every_n_frames:
-            self._frame_count = 0
-            self._update_plots()
+        # Add data to buffer directly (main thread) or via signal (other threads)
+        self._add_data_to_buffer(data)
 
     def _update_plots(self):
-        """Update all plot curves."""
-        # Get ordered data
-        ordered_data = self._get_ordered_data()
-
-        # Filter visible channels if needed
-        if not all(self._channel_visible):
-            filtered_data = np.zeros_like(ordered_data)
-            for i in range(self.num_channels):
-                if self._channel_visible[i]:
-                    filtered_data[:, i] = ordered_data[:, i]
-            ordered_data = filtered_data
+        """Update all plot curves (called by timer for smooth rendering)."""
+        with QMutexLocker(self._data_mutex):
+            ordered_data = self._get_ordered_data()
 
         # Update plot with the data
-        if hasattr(self.plot_widget, 'update_data'):
+        if hasattr(self.plot_widget, 'update_data') and ordered_data.size > 0:
             self.plot_widget.update_data(ordered_data)
 
     def set_num_channels(self, num_channels: int):
@@ -424,9 +388,12 @@ class EMGPlotWindow(QMainWindow):
         if num_channels == self.num_channels:
             return
 
-        self.num_channels = num_channels
-        self._data_buffer = np.zeros((self.display_samples, num_channels))
-        self._channel_visible = [True] * num_channels
+        with QMutexLocker(self._data_mutex):
+            self.num_channels = num_channels
+            self._data_buffer = np.zeros((self.display_samples, num_channels))
+            self._channel_visible = [True] * num_channels
+            self._buffer_index = 0
+            self._buffer_full = False
 
         # Reconfigure plot widget
         self.plot_widget.configure(
@@ -437,20 +404,25 @@ class EMGPlotWindow(QMainWindow):
 
     def clear(self):
         """Clear all data."""
-        self._data_buffer = np.zeros((self.display_samples, self.num_channels))
-        self._buffer_index = 0
-        self._buffer_full = False
-        self._update_plots()
+        with QMutexLocker(self._data_mutex):
+            self._data_buffer = np.zeros((self.display_samples, self.num_channels))
+            self._buffer_index = 0
+            self._buffer_full = False
 
     def _get_ordered_data(self):
         """Get the data in chronological order (oldest to newest)."""
         if not self._buffer_full:
-            return self._data_buffer[:self._buffer_index]
+            return self._data_buffer[:self._buffer_index].copy()
         else:
-            return np.concatenate((self._data_buffer[self._buffer_index:], self._data_buffer[:self._buffer_index]), axis=0)
+            return np.concatenate(
+                (self._data_buffer[self._buffer_index:], self._data_buffer[:self._buffer_index]),
+                axis=0
+            )
 
     def closeEvent(self, event):
         """Handle window close event."""
+        # Stop the update timer
+        self._update_timer.stop()
         self.closed.emit()
         event.accept()
 

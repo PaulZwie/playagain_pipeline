@@ -606,7 +606,7 @@ class MLPClassifier(BaseClassifier):
             "epochs": kwargs.get("epochs", 100),
             "early_stopping": kwargs.get("early_stopping", True),
             "patience": kwargs.get("patience", 10),
-            "device": kwargs.get("device", "cpu")  # "cpu" or "cuda"
+            "device": kwargs.get("device", "mps")  # "cpu" or "cuda"
         }
         self._feature_extractor = EMGFeatureExtractor()
         self._scaler = None
@@ -686,7 +686,6 @@ class MLPClassifier(BaseClassifier):
             X_val_tensor = torch.FloatTensor(X_val_scaled).to(device)
             y_val_tensor = torch.LongTensor(y_val).to(device)
 
-        # Build model
         self._input_dim = X_train_scaled.shape[1]
         self._output_dim = len(np.unique(y_train))
         self._model = self._build_model(self._input_dim, self._output_dim).to(device)
@@ -756,7 +755,7 @@ class MLPClassifier(BaseClassifier):
 
             # Report progress
             if callback:
-                callback(epoch + 1, train_loss, val_loss)
+                callback(epoch + 1, train_loss, val_loss, train_acc, val_acc)
 
             # Early stopping
             if self.hyperparameters["early_stopping"] and X_val_scaled is not None:
@@ -887,6 +886,366 @@ class MLPClassifier(BaseClassifier):
         self._is_trained = True
 
 
+class CNNClassifier(BaseClassifier):
+    def __init__(self, name: str = "cnn_classifier", **kwargs):
+        super().__init__(name)
+        self.hyperparameters = {
+            "filters": kwargs.get("filters", [32, 64, 128]),
+            "kernel_sizes": kwargs.get("kernel_sizes", [5, 3, 3]),
+            "fc_layers": kwargs.get("fc_layers", (128,)),
+            "activation": kwargs.get("activation", "relu"),
+            "dropout": kwargs.get("dropout", 0.3),
+            "optimizer": kwargs.get("optimizer", "adam"),
+            "learning_rate": kwargs.get("learning_rate", 0.0005),
+            "batch_size": kwargs.get("batch_size", 32),
+            "epochs": kwargs.get("epochs", 100),
+            "early_stopping": kwargs.get("early_stopping", True),
+            "patience": kwargs.get("patience", 10),
+            "device": kwargs.get("device", "cpu")
+        }
+        self._scaler = None
+        self._model = None
+        self._input_shape = None
+        self._output_dim = 0
+
+    def extract_features(self, X: np.ndarray) -> np.ndarray:
+        if X.ndim == 3:
+            return np.transpose(X, (0, 2, 1))
+        return X
+
+    def _build_model(self, input_channels: int, input_length: int, output_dim: int):
+        layers = []
+        in_channels = input_channels
+
+        for out_channels, k_size in zip(self.hyperparameters["filters"], self.hyperparameters["kernel_sizes"]):
+            layers.append(nn.Conv1d(in_channels, out_channels, kernel_size=k_size, padding=k_size // 2))
+            layers.append(nn.BatchNorm1d(out_channels))
+
+            if self.hyperparameters["activation"] == "relu":
+                layers.append(nn.ReLU())
+            elif self.hyperparameters["activation"] == "tanh":
+                layers.append(nn.Tanh())
+
+            layers.append(nn.MaxPool1d(2))
+
+            if self.hyperparameters["dropout"] > 0:
+                layers.append(nn.Dropout(self.hyperparameters["dropout"]))
+
+            in_channels = out_channels
+
+        layers.append(nn.AdaptiveAvgPool1d(1))
+        layers.append(nn.Flatten())
+
+        current_dim = in_channels
+        for hidden_dim in self.hyperparameters["fc_layers"]:
+            layers.append(nn.Linear(current_dim, hidden_dim))
+            if self.hyperparameters["activation"] == "relu":
+                layers.append(nn.ReLU())
+            layers.append(nn.Dropout(self.hyperparameters["dropout"]))
+            current_dim = hidden_dim
+
+        layers.append(nn.Linear(current_dim, output_dim))
+        return nn.Sequential(*layers)
+
+    def train(
+            self,
+            X_train: np.ndarray,
+            y_train: np.ndarray,
+            X_val: Optional[np.ndarray] = None,
+            y_val: Optional[np.ndarray] = None,
+            **kwargs
+    ) -> Dict[str, Any]:
+        import time
+        start_time = time.time()
+        callback = kwargs.get("callback", None)
+
+        X_train_proc = self.extract_features(X_train)
+        N, C, T = X_train_proc.shape
+
+        # Scale per channel
+        self._scaler = StandardScaler()
+        X_train_flat = X_train_proc.transpose(0, 2, 1).reshape(-1, C)
+        X_train_scaled_flat = self._scaler.fit_transform(X_train_flat)
+        X_train_scaled = X_train_scaled_flat.reshape(N, T, C).transpose(0, 2, 1)
+
+        X_val_scaled = None
+        if X_val is not None:
+            X_val_proc = self.extract_features(X_val)
+            Nv, Cv, Tv = X_val_proc.shape
+            X_val_flat = X_val_proc.transpose(0, 2, 1).reshape(-1, Cv)
+            X_val_scaled_flat = self._scaler.transform(X_val_flat)
+            X_val_scaled = X_val_scaled_flat.reshape(Nv, Tv, Cv).transpose(0, 2, 1)
+
+        device = torch.device(self.hyperparameters["device"] if torch.cuda.is_available() else "cpu")
+
+        X_train_tensor = torch.FloatTensor(X_train_scaled).to(device)
+        y_train_tensor = torch.LongTensor(y_train).to(device)
+
+        X_val_tensor = None
+        y_val_tensor = None
+        if X_val_scaled is not None:
+            X_val_tensor = torch.FloatTensor(X_val_scaled).to(device)
+            y_val_tensor = torch.LongTensor(y_val).to(device)
+
+        self._input_shape = (C, T) # Ensure input shape is saved
+        self._output_dim = len(np.unique(y_train))
+        self._model = self._build_model(C, T, self._output_dim).to(device)
+
+        lr = self.hyperparameters["learning_rate"]
+        opt_name = self.hyperparameters["optimizer"]
+        if opt_name == "adam":
+            optimizer = optim.Adam(self._model.parameters(), lr=lr)
+        elif opt_name == "rmsprop":
+            optimizer = optim.RMSprop(self._model.parameters(), lr=lr)
+        else:
+            optimizer = optim.SGD(self._model.parameters(), lr=lr, momentum=0.9)
+
+        criterion = nn.CrossEntropyLoss()
+        dataset = TensorDataset(X_train_tensor, y_train_tensor)
+        dataloader = DataLoader(dataset, batch_size=self.hyperparameters["batch_size"], shuffle=True)
+
+        best_val_loss = float('inf')
+        patience_counter = 0
+        history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
+
+        for epoch in range(self.hyperparameters["epochs"]):
+            self._model.train()
+            train_loss = 0.0
+            correct = 0
+            total = 0
+
+            for inputs, targets in dataloader:
+                optimizer.zero_grad()
+                outputs = self._model(inputs)
+                loss = criterion(outputs, targets)
+                loss.backward()
+                optimizer.step()
+
+                train_loss += loss.item() * inputs.size(0)
+                _, predicted = outputs.max(1)
+                total += targets.size(0)
+                correct += predicted.eq(targets).sum().item()
+
+            train_loss /= len(dataloader.dataset)
+            train_acc = correct / total
+
+            val_loss = 0.0
+            val_acc = 0.0
+
+            if X_val_scaled is not None:
+                self._model.eval()
+                with torch.no_grad():
+                    outputs = self._model(X_val_tensor)
+                    loss = criterion(outputs, y_val_tensor)
+                    val_loss = loss.item()
+                    _, predicted = outputs.max(1)
+                    val_acc = predicted.eq(y_val_tensor).sum().item() / y_val_tensor.size(0)
+
+            history["train_loss"].append(train_loss)
+            history["val_loss"].append(val_loss)
+            history["train_acc"].append(train_acc)
+            history["val_acc"].append(val_acc)
+
+            if callback:
+                callback(epoch + 1, train_loss, val_loss, train_acc, val_acc)
+
+            if self.hyperparameters["early_stopping"] and X_val_scaled is not None:
+                if val_loss < best_val_loss:
+                    best_val_loss = val_loss
+                    patience_counter = 0
+                else:
+                    patience_counter += 1
+                    if patience_counter >= self.hyperparameters["patience"]:
+                        print(f"Early stopping at epoch {epoch}")
+                        break
+
+        training_time = time.time() - start_time
+        self._is_trained = True
+
+        self.metadata = ModelMetadata(
+            name=self.name,
+            model_type="CNN",
+            created_at=datetime.now(),
+            num_classes=self._output_dim,
+            num_channels=X_train.shape[2] if X_train.ndim > 2 else X_train.shape[1],
+            window_size_ms=kwargs.get("window_size_ms", 200),
+            sampling_rate=kwargs.get("sampling_rate", 2000),
+            training_accuracy=history["train_acc"][-1],
+            validation_accuracy=history["val_acc"][-1] if history["val_acc"] else 0.0,
+            hyperparameters=self.hyperparameters,
+            training_history=history
+        )
+
+        return {
+            "training_accuracy": history["train_acc"][-1],
+            "validation_accuracy": history["val_acc"][-1] if history["val_acc"] else 0.0,
+            "feature_count": C,
+            "training_time": training_time,
+            "epochs_trained": len(history["train_loss"])
+        }
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        if not self._is_trained:
+            raise ValueError("Model not trained")
+
+        X_proc = self.extract_features(X)
+        N, C, T = X_proc.shape
+        X_flat = X_proc.transpose(0, 2, 1).reshape(-1, C)
+        X_scaled_flat = self._scaler.transform(X_flat)
+        X_scaled = X_scaled_flat.reshape(N, T, C).transpose(0, 2, 1)
+
+        device = torch.device(self.hyperparameters["device"] if torch.cuda.is_available() else "cpu")
+        X_tensor = torch.FloatTensor(X_scaled).to(device)
+
+        self._model.eval()
+        with torch.no_grad():
+            outputs = self._model(X_tensor)
+            _, predicted = outputs.max(1)
+
+        return predicted.cpu().numpy()
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        if not self._is_trained:
+            raise ValueError("Model not trained")
+
+        X_proc = self.extract_features(X)
+        N, C, T = X_proc.shape
+        X_flat = X_proc.transpose(0, 2, 1).reshape(-1, C)
+        X_scaled_flat = self._scaler.transform(X_flat)
+        X_scaled = X_scaled_flat.reshape(N, T, C).transpose(0, 2, 1)
+
+        device = torch.device(self.hyperparameters["device"] if torch.cuda.is_available() else "cpu")
+        X_tensor = torch.FloatTensor(X_scaled).to(device)
+
+        self._model.eval()
+        with torch.no_grad():
+            outputs = self._model(X_tensor)
+            probs = torch.softmax(outputs, dim=1)
+
+        return probs.cpu().numpy()
+
+    def save(self, path: Path) -> None:
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
+
+        if self.metadata:
+            with open(path / "metadata.json", 'w') as f:
+                json.dump(self.metadata.to_dict(), f, indent=2)
+
+        torch.save(self._model.state_dict(), path / "model.pt")
+
+        with open(path / "scaler.pkl", 'wb') as f:
+            pickle.dump(self._scaler, f)
+
+        with open(path / "params.json", 'w') as f:
+            json.dump({
+                "input_channels": self._input_shape[0] if self._input_shape else 0,
+                "input_length": self._input_shape[1] if self._input_shape else 0,
+                "output_dim": self._output_dim,
+                "hyperparameters": self.hyperparameters
+            }, f)
+
+    def load(self, path: Path) -> None:
+        path = Path(path)
+
+        with open(path / "metadata.json", 'r') as f:
+            self.metadata = ModelMetadata.from_dict(json.load(f))
+
+        with open(path / "params.json", 'r') as f:
+            params = json.load(f)
+            self._input_shape = (params["input_channels"], params["input_length"])
+            self._output_dim = params["output_dim"]
+            self.hyperparameters = params["hyperparameters"]
+
+        with open(path / "scaler.pkl", 'rb') as f:
+            self._scaler = pickle.load(f)
+
+        self._model = self._build_model(self._input_shape[0], self._input_shape[1], self._output_dim)
+        device = torch.device(self.hyperparameters["device"] if torch.cuda.is_available() else "cpu")
+        self._model.load_state_dict(torch.load(path / "model.pt", map_location=device))
+        self._model.to(device)
+
+        self._is_trained = True
+
+
+class ChannelAttention(nn.Module):
+    def __init__(self, channels, reduction=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.fc = nn.Sequential(
+            nn.Linear(channels, channels // reduction, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Sigmoid()
+        )
+
+    def forward(self, x):
+        b, c, _ = x.size()
+        y = self.avg_pool(x).view(b, c)
+        y = self.fc(y).view(b, c, 1)
+        return x * y.expand_as(x)
+
+
+class InceptionBlock(nn.Module):
+    def __init__(self, in_channels, out_1x1, red_3x3, out_3x3, red_5x5, out_5x5, pool_proj):
+        super().__init__()
+        self.branch1 = nn.Sequential(nn.Conv1d(in_channels, out_1x1, kernel_size=1), nn.ReLU())
+
+        self.branch2 = nn.Sequential(
+            nn.Conv1d(in_channels, red_3x3, kernel_size=1), nn.ReLU(),
+            nn.Conv1d(red_3x3, out_3x3, kernel_size=3, padding=1), nn.ReLU()
+        )
+
+        self.branch3 = nn.Sequential(
+            nn.Conv1d(in_channels, red_5x5, kernel_size=1), nn.ReLU(),
+            nn.Conv1d(red_5x5, out_5x5, kernel_size=5, padding=2), nn.ReLU()
+        )
+
+        self.branch4 = nn.Sequential(
+            nn.MaxPool1d(kernel_size=3, stride=1, padding=1),
+            nn.Conv1d(in_channels, pool_proj, kernel_size=1), nn.ReLU()
+        )
+
+    def forward(self, x):
+        return torch.cat([self.branch1(x), self.branch2(x), self.branch3(x), self.branch4(x)], 1)
+
+
+class InceptionAttentionClassifier(CNNClassifier):
+    def __init__(self, name: str = "inception_att_classifier", **kwargs):
+        super().__init__(name, **kwargs)
+        self.hyperparameters.update({
+            "reduction_ratio": kwargs.get("reduction_ratio", 8),
+            "inception_channels": kwargs.get("inception_channels", 32)  # Base width
+        })
+
+    def _build_model(self, input_channels: int, input_length: int, output_dim: int):
+        base = self.hyperparameters["inception_channels"]
+
+        # Initial Feature Extraction
+        self.stem = nn.Sequential(
+            nn.Conv1d(input_channels, base, kernel_size=7, stride=2, padding=3),
+            nn.BatchNorm1d(base),
+            nn.ReLU()
+        )
+
+        # Inception Module
+        # Total output channels = 16 (br1) + 32 (br2) + 8 (br3) + 8 (br4) = 64
+        self.inception = InceptionBlock(base, 16, 16, 32, 4, 8, 8)
+
+        # Attention
+        self.attention = ChannelAttention(64, reduction=self.hyperparameters["reduction_ratio"])
+
+        # Classification Head
+        self.head = nn.Sequential(
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Dropout(self.hyperparameters["dropout"]),
+            nn.Linear(64, output_dim)
+        )
+
+        return nn.Sequential(self.stem, self.inception, self.attention, self.head)
+
+
 class CatBoostClassifier(BaseClassifier):
     """
     CatBoost classifier for gesture recognition.
@@ -1010,6 +1369,8 @@ class CatBoostClassifier(BaseClassifier):
         return self._model.predict_proba(X_scaled)
 
 
+
+
 class ModelManager:
     """
     Manages training, loading, and using gesture classification models.
@@ -1020,7 +1381,9 @@ class ModelManager:
         "random_forest": RandomForestClassifier,
         "lda": LDAClassifier,
         "catboost": CatBoostClassifier,
-        "mlp": MLPClassifier
+        "mlp": MLPClassifier,
+        "cnn": CNNClassifier,
+        "inceptionattn": InceptionAttentionClassifier,
     }
 
     def __init__(self, models_dir: Path):

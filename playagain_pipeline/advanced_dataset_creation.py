@@ -265,8 +265,8 @@ def main():
 
     # Load specific sessions
     sessions = []
-    sessions.append(data_manager.load_session("VP_00", "session_20260204_101826"))
-    sessions.append(data_manager.load_session("VP_01", "session_20260204_102914"))
+    sessions.append(data_manager.load_session("VP_00", "2026-02-04_10:18:26_3rep"))
+    sessions.append(data_manager.load_session("VP_01", "2026-02-04_10:29:14_3rep"))
 
     # You can modify sessions here before creating dataset
     for session in sessions:

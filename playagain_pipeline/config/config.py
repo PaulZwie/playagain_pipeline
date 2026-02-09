@@ -50,13 +50,55 @@ class ModelConfig:
     # SVM parameters
     svm_kernel: str = "rbf"
     svm_c: float = 1.0
+    svm_gamma: str = "scale"
 
     # Random Forest parameters
     rf_n_estimators: int = 100
-    rf_max_depth: Optional[int] = None
+    rf_max_depth: Optional[int] = 10
+    rf_min_samples_split: int = 2
 
     # LDA parameters
     lda_solver: str = "svd"
+    lda_shrinkage: Optional[str] = None
+
+    # CatBoost parameters
+    catboost_iterations: int = 500
+    catboost_learning_rate: float = 0.1
+    catboost_depth: int = 6
+    catboost_l2_leaf_reg: float = 3.0
+    catboost_early_stopping: bool = True
+
+    # MLP parameters
+    mlp_hidden_layers: tuple = (128, 64)
+    mlp_epochs: int = 1000
+    mlp_batch_size: int = 32
+    mlp_learning_rate: float = 0.0001
+    mlp_optimizer: str = "adam"
+    mlp_early_stopping: bool = True
+    mlp_patience: int = 20
+    mlp_dropout: float = 0.2
+
+    # CNN parameters
+    cnn_filters: str = "32, 64, 128"
+    cnn_kernels: str = "5, 3, 3"
+    cnn_fc_layers: str = "128"
+    cnn_epochs: int = 100
+    cnn_batch_size: int = 32
+    cnn_learning_rate: float = 0.0005
+    cnn_optimizer: str = "adam"
+    cnn_early_stopping: bool = True
+    cnn_patience: int = 5
+
+    # Inception parameters
+    inception_filters: str = "32, 64, 128"
+    inception_kernels: str = "1, 3, 5"
+    inception_fc_layers: str = "128"
+    inception_epochs: int = 100
+    inception_batch_size: int = 32
+    inception_learning_rate: float = 0.0005
+    inception_optimizer: str = "adam"
+    inception_early_stopping: bool = True
+    inception_patience: int = 8
 
 
 @dataclass
@@ -106,9 +148,34 @@ class PipelineConfig:
                 "cross_validation_folds": self.model.cross_validation_folds,
                 "svm_kernel": self.model.svm_kernel,
                 "svm_c": self.model.svm_c,
+                "svm_gamma": self.model.svm_gamma,
                 "rf_n_estimators": self.model.rf_n_estimators,
                 "rf_max_depth": self.model.rf_max_depth,
-                "lda_solver": self.model.lda_solver
+                "rf_min_samples_split": self.model.rf_min_samples_split,
+                "lda_solver": self.model.lda_solver,
+                "lda_shrinkage": self.model.lda_shrinkage,
+                "catboost_iterations": self.model.catboost_iterations,
+                "catboost_learning_rate": self.model.catboost_learning_rate,
+                "catboost_depth": self.model.catboost_depth,
+                "catboost_l2_leaf_reg": self.model.catboost_l2_leaf_reg,
+                "catboost_early_stopping": self.model.catboost_early_stopping,
+                "mlp_hidden_layers": list(self.model.mlp_hidden_layers),
+                "mlp_epochs": self.model.mlp_epochs,
+                "mlp_batch_size": self.model.mlp_batch_size,
+                "mlp_learning_rate": self.model.mlp_learning_rate,
+                "mlp_optimizer": self.model.mlp_optimizer,
+                "mlp_early_stopping": self.model.mlp_early_stopping,
+                "mlp_patience": self.model.mlp_patience,
+                "mlp_dropout": self.model.mlp_dropout,
+                "cnn_filters": self.model.cnn_filters,
+                "cnn_kernels": self.model.cnn_kernels,
+                "cnn_fc_layers": self.model.cnn_fc_layers,
+                "cnn_epochs": self.model.cnn_epochs,
+                "cnn_batch_size": self.model.cnn_batch_size,
+                "cnn_learning_rate": self.model.cnn_learning_rate,
+                "cnn_optimizer": self.model.cnn_optimizer,
+                "cnn_early_stopping": self.model.cnn_early_stopping,
+                "cnn_patience": self.model.cnn_patience
             },
             "display_time": self.display_time,
             "update_rate_hz": self.update_rate_hz
@@ -159,9 +226,34 @@ class PipelineConfig:
                 cross_validation_folds=m.get("cross_validation_folds", config.model.cross_validation_folds),
                 svm_kernel=m.get("svm_kernel", config.model.svm_kernel),
                 svm_c=m.get("svm_c", config.model.svm_c),
+                svm_gamma=m.get("svm_gamma", config.model.svm_gamma),
                 rf_n_estimators=m.get("rf_n_estimators", config.model.rf_n_estimators),
                 rf_max_depth=m.get("rf_max_depth", config.model.rf_max_depth),
-                lda_solver=m.get("lda_solver", config.model.lda_solver)
+                rf_min_samples_split=m.get("rf_min_samples_split", config.model.rf_min_samples_split),
+                lda_solver=m.get("lda_solver", config.model.lda_solver),
+                lda_shrinkage=m.get("lda_shrinkage", config.model.lda_shrinkage),
+                catboost_iterations=m.get("catboost_iterations", config.model.catboost_iterations),
+                catboost_learning_rate=m.get("catboost_learning_rate", config.model.catboost_learning_rate),
+                catboost_depth=m.get("catboost_depth", config.model.catboost_depth),
+                catboost_l2_leaf_reg=m.get("catboost_l2_leaf_reg", config.model.catboost_l2_leaf_reg),
+                catboost_early_stopping=m.get("catboost_early_stopping", config.model.catboost_early_stopping),
+                mlp_hidden_layers=tuple(m.get("mlp_hidden_layers", config.model.mlp_hidden_layers)),
+                mlp_epochs=m.get("mlp_epochs", config.model.mlp_epochs),
+                mlp_batch_size=m.get("mlp_batch_size", config.model.mlp_batch_size),
+                mlp_learning_rate=m.get("mlp_learning_rate", config.model.mlp_learning_rate),
+                mlp_optimizer=m.get("mlp_optimizer", config.model.mlp_optimizer),
+                mlp_early_stopping=m.get("mlp_early_stopping", config.model.mlp_early_stopping),
+                mlp_patience=m.get("mlp_patience", config.model.mlp_patience),
+                mlp_dropout=m.get("mlp_dropout", config.model.mlp_dropout),
+                cnn_filters=m.get("cnn_filters", config.model.cnn_filters),
+                cnn_kernels=m.get("cnn_kernels", config.model.cnn_kernels),
+                cnn_fc_layers=m.get("cnn_fc_layers", config.model.cnn_fc_layers),
+                cnn_epochs=m.get("cnn_epochs", config.model.cnn_epochs),
+                cnn_batch_size=m.get("cnn_batch_size", config.model.cnn_batch_size),
+                cnn_learning_rate=m.get("cnn_learning_rate", config.model.cnn_learning_rate),
+                cnn_optimizer=m.get("cnn_optimizer", config.model.cnn_optimizer),
+                cnn_early_stopping=m.get("cnn_early_stopping", config.model.cnn_early_stopping),
+                cnn_patience=m.get("cnn_patience", config.model.cnn_patience)
             )
 
         config.display_time = data.get("display_time", config.display_time)

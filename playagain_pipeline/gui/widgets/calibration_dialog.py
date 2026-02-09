@@ -20,15 +20,24 @@ class CalibrationDialog(QDialog):
 
     Guides the user through recording calibration gestures and
     computes the electrode rotation offset.
+
+    Uses single finger movements for more granular EMG response patterns,
+    which provides better electrode position discrimination.
     """
 
     calibration_complete = Signal(object)  # Emits CalibrationResult
 
+    # Single finger gestures provide more distinct and localized EMG patterns
+    # for better electrode orientation detection
     CALIBRATION_GESTURES = [
-        ("rest", "Keep your hand relaxed"),
-        ("fist", "Make a tight fist"),
-        ("extension", "Extend all fingers (open hand)"),
-        ("flexion", "Flex your wrist down")
+        ("rest", "Keep your hand completely relaxed, palm up"),
+        ("index_flex", "Bend your INDEX finger down toward your palm"),
+        ("middle_flex", "Bend your MIDDLE finger down toward your palm"),
+        ("ring_flex", "Bend your RING finger down toward your palm"),
+        ("pinky_flex", "Bend your PINKY finger down toward your palm"),
+        ("thumb_flex", "Bend your THUMB inward toward your palm"),
+        ("index_extend", "Extend/lift your INDEX finger up while others stay down"),
+        ("wrist_flex", "Flex your wrist (bend palm toward forearm)"),
     ]
 
     def __init__(self, calibrator, device, parent=None):
@@ -62,8 +71,10 @@ class CalibrationDialog(QDialog):
         instructions_layout = QVBoxLayout(instructions_group)
 
         self.instructions_label = QLabel(
-            "This calibration will determine the orientation of the electrode bracelet.\n"
-            "You will be asked to perform several gestures. Hold each gesture for 3 seconds.\n\n"
+            "This calibration will determine the orientation of the electrode bracelet.\n\n"
+            "You will be asked to perform individual finger movements. These single-finger\n"
+            "gestures produce distinct EMG patterns that help accurately detect electrode position.\n\n"
+            "Hold each gesture steadily for 3 seconds.\n\n"
             "Click 'Start Calibration' when ready."
         )
         self.instructions_label.setWordWrap(True)
