@@ -84,11 +84,30 @@ class DataManager:
         return [d.name for d in self.sessions_dir.iterdir() if d.is_dir()]
 
     def list_sessions(self, subject_id: str) -> List[str]:
-        """List all sessions for a subject."""
+        """List all sessions for a subject, sorted by recording order (creation time)."""
         subject_dir = self.sessions_dir / subject_id
         if not subject_dir.exists():
             return []
-        return [d.name for d in subject_dir.iterdir() if d.is_dir()]
+
+        sessions = []
+        for d in subject_dir.iterdir():
+            if d.is_dir():
+                metadata_path = d / "metadata.json"
+                if metadata_path.exists():
+                    try:
+                        with open(metadata_path, 'r') as f:
+                            data = json.load(f)
+                        created_at = datetime.fromisoformat(data["metadata"]["created_at"])
+                        sessions.append((d.name, created_at))
+                    except (KeyError, ValueError):
+                        # If can't parse, use directory name as fallback
+                        sessions.append((d.name, datetime.min))
+                else:
+                    sessions.append((d.name, datetime.min))
+
+        # Sort by creation time
+        sessions.sort(key=lambda x: x[1])
+        return [name for name, _ in sessions]
 
     def get_all_sessions(self, subject_id: Optional[str] = None) -> List[RecordingSession]:
         """
@@ -286,4 +305,3 @@ class DataManager:
             stratify=stratify_param,
             random_state=random_state
         )
-

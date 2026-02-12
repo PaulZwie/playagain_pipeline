@@ -175,7 +175,16 @@ class PipelineConfig:
                 "cnn_learning_rate": self.model.cnn_learning_rate,
                 "cnn_optimizer": self.model.cnn_optimizer,
                 "cnn_early_stopping": self.model.cnn_early_stopping,
-                "cnn_patience": self.model.cnn_patience
+                "cnn_patience": self.model.cnn_patience,
+                "inception_filters": self.model.inception_filters,
+                "inception_kernels": self.model.inception_kernels,
+                "inception_fc_layers": self.model.inception_fc_layers,
+                "inception_epochs": self.model.inception_epochs,
+                "inception_batch_size": self.model.inception_batch_size,
+                "inception_learning_rate": self.model.inception_learning_rate,
+                "inception_optimizer": self.model.inception_optimizer,
+                "inception_early_stopping": self.model.inception_early_stopping,
+                "inception_patience": self.model.inception_patience
             },
             "display_time": self.display_time,
             "update_rate_hz": self.update_rate_hz
@@ -253,7 +262,16 @@ class PipelineConfig:
                 cnn_learning_rate=m.get("cnn_learning_rate", config.model.cnn_learning_rate),
                 cnn_optimizer=m.get("cnn_optimizer", config.model.cnn_optimizer),
                 cnn_early_stopping=m.get("cnn_early_stopping", config.model.cnn_early_stopping),
-                cnn_patience=m.get("cnn_patience", config.model.cnn_patience)
+                cnn_patience=m.get("cnn_patience", config.model.cnn_patience),
+                inception_filters=m.get("inception_filters", config.model.inception_filters),
+                inception_kernels=m.get("inception_kernels", config.model.inception_kernels),
+                inception_fc_layers=m.get("inception_fc_layers", config.model.inception_fc_layers),
+                inception_epochs=m.get("inception_epochs", config.model.inception_epochs),
+                inception_batch_size=m.get("inception_batch_size", config.model.inception_batch_size),
+                inception_learning_rate=m.get("inception_learning_rate", config.model.inception_learning_rate),
+                inception_optimizer=m.get("inception_optimizer", config.model.inception_optimizer),
+                inception_early_stopping=m.get("inception_early_stopping", config.model.inception_early_stopping),
+                inception_patience=m.get("inception_patience", config.model.inception_patience)
             )
 
         config.display_time = data.get("display_time", config.display_time)

@@ -93,6 +93,8 @@ class HyperparameterWidget(QWidget):
             self._setup_mlp_params(layout)
         elif self.model_type == "cnn":
             self._setup_cnn_params(layout)
+        elif self.model_type == "inceptionattn":
+            self._setup_inception_params(layout)
         else:
             layout.addWidget(QLabel("No hyperparameters for this model type"))
 
@@ -339,27 +341,78 @@ class HyperparameterWidget(QWidget):
     def _setup_inception_params(self, layout):
         grid = QGridLayout()
 
-        # Base Inception Channels
+        # Inception Base Channels
         grid.addWidget(QLabel("Base Channels:"), 0, 0)
         self.inc_base_spin = QSpinBox()
         self.inc_base_spin.setRange(8, 256)
-        self.inc_base_spin.setValue(32)
+        self.inc_base_spin.setValue(int(self.config.model.inception_filters.split(",")[0].strip()) if self.config.model.inception_filters else 32)
         grid.addWidget(self.inc_base_spin, 0, 1)
 
+        # Inception Branch Kernel Sizes
+        grid.addWidget(QLabel("Branch Kernels:"), 1, 0)
+        self.inc_kernels_edit = QComboBox()
+        self.inc_kernels_edit.setEditable(True)
+        self.inc_kernels_edit.addItems([self.config.model.inception_kernels, "3, 5", "3, 7", "5, 9", "3, 3"])
+        self.inc_kernels_edit.setCurrentText(self.config.model.inception_kernels)
+        grid.addWidget(self.inc_kernels_edit, 1, 1)
+
         # Attention Reduction Ratio
-        grid.addWidget(QLabel("Attention Reduction:"), 1, 0)
+        grid.addWidget(QLabel("Attention Reduction:"), 2, 0)
         self.att_red_spin = QSpinBox()
         self.att_red_spin.setRange(1, 32)
         self.att_red_spin.setValue(8)
-        grid.addWidget(self.att_red_spin, 1, 1)
+        grid.addWidget(self.att_red_spin, 2, 1)
 
-        # Learning Rate (Inherited logic)
-        grid.addWidget(QLabel("Learning Rate:"), 2, 0)
+        # FC Layers
+        grid.addWidget(QLabel("FC Layers:"), 3, 0)
+        self.inc_fc_edit = QComboBox()
+        self.inc_fc_edit.setEditable(True)
+        self.inc_fc_edit.addItems([self.config.model.inception_fc_layers, "128", "256, 128", "64"])
+        self.inc_fc_edit.setCurrentText(self.config.model.inception_fc_layers)
+        grid.addWidget(self.inc_fc_edit, 3, 1)
+
+        # Epochs
+        grid.addWidget(QLabel("Epochs:"), 4, 0)
+        self.epochs_spin = QSpinBox()
+        self.epochs_spin.setRange(1, 10000)
+        self.epochs_spin.setValue(self.config.model.inception_epochs)
+        grid.addWidget(self.epochs_spin, 4, 1)
+
+        # Batch Size
+        grid.addWidget(QLabel("Batch Size:"), 5, 0)
+        self.batch_spin = QSpinBox()
+        self.batch_spin.setRange(1, 1024)
+        self.batch_spin.setValue(self.config.model.inception_batch_size)
+        grid.addWidget(self.batch_spin, 5, 1)
+
+        # Learning Rate
+        grid.addWidget(QLabel("Learning Rate:"), 6, 0)
         self.lr_spin = QDoubleSpinBox()
-        self.lr_spin.setRange(0.00001, 0.1)
-        self.lr_spin.setValue(0.001)
         self.lr_spin.setDecimals(5)
-        grid.addWidget(self.lr_spin, 2, 1)
+        self.lr_spin.setRange(0.00001, 1.0)
+        self.lr_spin.setValue(self.config.model.inception_learning_rate)
+        grid.addWidget(self.lr_spin, 6, 1)
+
+        # Optimizer
+        grid.addWidget(QLabel("Optimizer:"), 7, 0)
+        self.optimizer_combo = QComboBox()
+        self.optimizer_combo.addItems(["Adam", "RMSprop", "SGD"])
+        self.optimizer_combo.setCurrentText(self.config.model.inception_optimizer.capitalize())
+        grid.addWidget(self.optimizer_combo, 7, 1)
+
+        # Early Stopping Row
+        row_es = 8
+        self.early_stop_check = QCheckBox("Early Stopping")
+        self.early_stop_check.setChecked(self.config.model.inception_early_stopping)
+        grid.addWidget(self.early_stop_check, row_es, 0)
+
+        # Patience
+        patience_label = QLabel("Patience:")
+        grid.addWidget(patience_label, row_es, 1)
+        self.patience_spin = QSpinBox()
+        self.patience_spin.setRange(1, 100)
+        self.patience_spin.setValue(self.config.model.inception_patience)
+        grid.addWidget(self.patience_spin, row_es, 2)
 
         layout.addLayout(grid)
 
@@ -447,9 +500,35 @@ class HyperparameterWidget(QWidget):
 
         elif self.model_type == "inception":
             params = {
-                "base_channels": self.inc_base_spin.value(),
-                "attention_reduction": self.att_red_spin.value(),
+                "inception_channels": self.inc_base_spin.value(),
+                "reduction_ratio": self.att_red_spin.value(),
                 "learning_rate": self.lr_spin.value()
+            }
+        elif self.model_type == "inceptionattn":
+            # Parse branch kernel sizes
+            try:
+                kernels_str = self.inc_kernels_edit.currentText()
+                kernels_list = [int(x.strip()) for x in kernels_str.split(",") if x.strip()]
+                if not kernels_list:
+                    kernels_list = [3, 5]
+                # Ensure exactly two kernel sizes: repeat last if only one provided, or take first two
+                if len(kernels_list) == 1:
+                    kernels = [kernels_list[0], kernels_list[0]]
+                else:
+                    kernels = kernels_list[:2]
+            except ValueError:
+                kernels = [3, 5]
+
+            params = {
+                "inception_channels": self.inc_base_spin.value(),
+                "branch_kernels": kernels,
+                "reduction_ratio": self.att_red_spin.value(),
+                "epochs": self.epochs_spin.value(),
+                "batch_size": self.batch_spin.value(),
+                "learning_rate": self.lr_spin.value(),
+                "optimizer": self.optimizer_combo.currentText().lower(),
+                "early_stopping": self.early_stop_check.isChecked(),
+                "patience": self.patience_spin.value(),
             }
 
         return params

@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Optional
 
 import numpy as np
-from PySide6.QtCore import Qt, Slot, QTimer
+from PySide6.QtCore import Qt, Slot, QTimer, QThread, Signal, QMutex, QMutexLocker
 from PySide6.QtGui import QFont, QAction
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QPushButton, QComboBox,
                                QLineEdit, QLabel, QGroupBox, QFormLayout, QSpinBox, QMessageBox, QFileDialog, QTextEdit,
@@ -32,6 +32,53 @@ from playagain_pipeline.models.classifier import ModelManager, BaseClassifier
 from playagain_pipeline.protocols.protocol import (RecordingProtocol, ProtocolPhase,
                                                    create_quick_protocol, create_standard_protocol,
                                                    create_extended_protocol)
+
+
+class PredictionWorker(QThread):
+    """Background worker for model prediction to avoid blocking the GUI thread."""
+    prediction_ready = Signal(object, object)  # pred_class, proba_array
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._model = None
+        self._buffer = None
+        self._new_data = False
+        self._running = False
+        self._mutex = QMutex()
+
+    def set_model(self, model):
+        self._model = model
+
+    def update_buffer(self, buffer: np.ndarray):
+        """Thread-safe buffer update (called from main thread)."""
+        locker = QMutexLocker(self._mutex)
+        self._buffer = buffer.copy()
+        self._new_data = True
+
+    def run(self):
+        self._running = True
+        while self._running:
+            buffer = None
+            self._mutex.lock()
+            if self._new_data and self._buffer is not None:
+                buffer = self._buffer.copy()
+                self._new_data = False
+            self._mutex.unlock()
+
+            if buffer is not None and self._model is not None:
+                try:
+                    X = buffer[np.newaxis, :, :]
+                    pred = self._model.predict(X)[0]
+                    proba = self._model.predict_proba(X)[0]
+                    self.prediction_ready.emit(pred, proba)
+                except Exception:
+                    pass
+
+            self.msleep(100)  # Cap at ~10 predictions/sec
+
+    def stop(self):
+        self._running = False
+        self.wait()
 
 
 class MainWindow(QMainWindow):
@@ -66,6 +113,7 @@ class MainWindow(QMainWindow):
         self._prediction_buffer: Optional[np.ndarray] = None
         self._prediction_window_ms = 200
         self._is_predicting = False
+        self._prediction_worker: Optional[PredictionWorker] = None
 
         # Plot window
         self._plot_window: Optional[EMGPlotWindow] = None
@@ -575,6 +623,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close."""
+        # Stop prediction worker if running
+        if self._prediction_worker:
+            self._prediction_worker.stop()
+            self._prediction_worker = None
+
         # Stop recording if active
         if self._current_session and self._current_session.is_recording:
             self._on_stop_recording()
@@ -918,7 +971,7 @@ class MainWindow(QMainWindow):
 
         # Predict if enabled
         if self._is_predicting and self._current_model:
-            self._update_prediction(data)
+            self._update_prediction_buffer(data)
 
     # Recording handlers
     @Slot()
@@ -1383,6 +1436,12 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please connect and start device")
             return
 
+        # Create and start prediction worker thread
+        self._prediction_worker = PredictionWorker(self)
+        self._prediction_worker.set_model(self._current_model)
+        self._prediction_worker.prediction_ready.connect(self._on_prediction_ready)
+        self._prediction_worker.start()
+
         self._is_predicting = True
         self.start_pred_btn.setEnabled(False)
         self.stop_pred_btn.setEnabled(True)
@@ -1392,14 +1451,19 @@ class MainWindow(QMainWindow):
     def _on_stop_prediction(self):
         """Stop real-time prediction."""
         self._is_predicting = False
+
+        if self._prediction_worker:
+            self._prediction_worker.stop()
+            self._prediction_worker = None
+
         self.start_pred_btn.setEnabled(True)
         self.stop_pred_btn.setEnabled(False)
         self.prediction_label.setText("No prediction")
         self.confidence_label.setText("Confidence: -")
         self._log("Stopped prediction")
 
-    def _update_prediction(self, data: np.ndarray):
-        """Update prediction with new data."""
+    def _update_prediction_buffer(self, data: np.ndarray):
+        """Update the prediction buffer with new data and pass to worker."""
         if self._prediction_buffer is None or self._current_model is None:
             return
 
@@ -1408,31 +1472,30 @@ class MainWindow(QMainWindow):
         self._prediction_buffer = np.roll(self._prediction_buffer, -n_samples, axis=0)
         self._prediction_buffer[-n_samples:] = data[:n_samples]
 
-        # Make prediction
-        try:
-            X = self._prediction_buffer[np.newaxis, :, :]
-            pred = self._current_model.predict(X)[0]
-            proba = self._current_model.predict_proba(X)[0]
+        # Send updated buffer to worker thread
+        if self._prediction_worker:
+            self._prediction_worker.update_buffer(self._prediction_buffer)
 
-            # Get class name from metadata (keys may be strings from JSON)
+    @Slot(object, object)
+    def _on_prediction_ready(self, pred, proba):
+        """Handle prediction result from worker thread (updates UI)."""
+        if not self._is_predicting or self._current_model is None:
+            return
+
+        try:
             class_names = self._current_model.metadata.class_names
-            # Try int key first, then string key
             class_name = class_names.get(int(pred), class_names.get(str(pred), f"Class {pred}"))
 
-            # Handle confidence index - may need to map pred to array index
             try:
                 confidence = proba[int(pred)]
             except (IndexError, KeyError):
-                # If pred doesn't map directly to index, use max probability
                 confidence = np.max(proba)
 
-            # Format display name nicely
             display_name = class_name.replace("_", " ").title()
             self.prediction_label.setText(display_name)
             self.confidence_label.setText(f"Confidence: {confidence:.1%}")
-
-        except Exception as e:
-            pass  # Silently handle prediction errors
+        except Exception:
+            pass
 
     def _get_excluded_channels(self) -> list[int]:
         """Get list of excluded channel indices (0-based) from unchecked boxes."""

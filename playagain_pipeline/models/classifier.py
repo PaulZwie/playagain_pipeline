@@ -1172,10 +1172,11 @@ class ChannelAttention(nn.Module):
     def __init__(self, channels, reduction=16):
         super().__init__()
         self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        reduced = max(channels // reduction, 1)
         self.fc = nn.Sequential(
-            nn.Linear(channels, channels // reduction, bias=False),
+            nn.Linear(channels, reduced, bias=False),
             nn.ReLU(inplace=True),
-            nn.Linear(channels // reduction, channels, bias=False),
+            nn.Linear(reduced, channels, bias=False),
             nn.Sigmoid()
         )
 
@@ -1187,18 +1188,36 @@ class ChannelAttention(nn.Module):
 
 
 class InceptionBlock(nn.Module):
-    def __init__(self, in_channels, out_1x1, red_3x3, out_3x3, red_5x5, out_5x5, pool_proj):
+    def __init__(self, in_channels, out_1x1, red_k1, out_k1, red_k2, out_k2, pool_proj,
+                 branch_kernels=(3, 5)):
         super().__init__()
-        self.branch1 = nn.Sequential(nn.Conv1d(in_channels, out_1x1, kernel_size=1), nn.ReLU())
+        # Support variable-length kernel specifications from UI: use first two values,
+        # repeat if only one provided, fallback to defaults when empty.
+        if isinstance(branch_kernels, (list, tuple)):
+            bk = tuple(branch_kernels)
+        else:
+            bk = (branch_kernels,)
+
+        if len(bk) == 0:
+            k1, k2 = 3, 5
+        elif len(bk) == 1:
+            k1 = bk[0]
+            k2 = bk[0]
+        else:
+            k1, k2 = bk[0], bk[1]
+
+        self.branch1 = nn.Sequential(
+            nn.Conv1d(in_channels, out_1x1, kernel_size=1), nn.ReLU()
+        )
 
         self.branch2 = nn.Sequential(
-            nn.Conv1d(in_channels, red_3x3, kernel_size=1), nn.ReLU(),
-            nn.Conv1d(red_3x3, out_3x3, kernel_size=3, padding=1), nn.ReLU()
+            nn.Conv1d(in_channels, red_k1, kernel_size=1), nn.ReLU(),
+            nn.Conv1d(red_k1, out_k1, kernel_size=k1, padding=k1 // 2), nn.ReLU()
         )
 
         self.branch3 = nn.Sequential(
-            nn.Conv1d(in_channels, red_5x5, kernel_size=1), nn.ReLU(),
-            nn.Conv1d(red_5x5, out_5x5, kernel_size=5, padding=2), nn.ReLU()
+            nn.Conv1d(in_channels, red_k2, kernel_size=1), nn.ReLU(),
+            nn.Conv1d(red_k2, out_k2, kernel_size=k2, padding=k2 // 2), nn.ReLU()
         )
 
         self.branch4 = nn.Sequential(
@@ -1210,40 +1229,94 @@ class InceptionBlock(nn.Module):
         return torch.cat([self.branch1(x), self.branch2(x), self.branch3(x), self.branch4(x)], 1)
 
 
-class InceptionAttentionClassifier(CNNClassifier):
-    def __init__(self, name: str = "inception_att_classifier", **kwargs):
-        super().__init__(name, **kwargs)
-        self.hyperparameters.update({
-            "reduction_ratio": kwargs.get("reduction_ratio", 8),
-            "inception_channels": kwargs.get("inception_channels", 32)  # Base width
-        })
+class InceptionAttentionNet(nn.Module):
+    """Proper nn.Module for the InceptionAttention architecture."""
 
-    def _build_model(self, input_channels: int, input_length: int, output_dim: int):
-        base = self.hyperparameters["inception_channels"]
+    def __init__(self, input_channels, output_dim, inception_channels=32,
+                 branch_kernels=(3, 5), reduction_ratio=8, dropout=0.3):
+        super().__init__()
+        base = inception_channels
 
-        # Initial Feature Extraction
+        # Stem: initial feature extraction
         self.stem = nn.Sequential(
             nn.Conv1d(input_channels, base, kernel_size=7, stride=2, padding=3),
             nn.BatchNorm1d(base),
             nn.ReLU()
         )
 
-        # Inception Module
-        # Total output channels = 16 (br1) + 32 (br2) + 8 (br3) + 8 (br4) = 64
-        self.inception = InceptionBlock(base, 16, 16, 32, 4, 8, 8)
+        # Inception channel allocations (proportional to base)
+        out_1x1 = max(base // 2, 1)
+        red_k1 = max(base // 2, 1)
+        out_k1 = base
+        red_k2 = max(base // 8, 1)
+        out_k2 = max(base // 4, 1)
+        pool_proj = max(base // 4, 1)
 
-        # Attention
-        self.attention = ChannelAttention(64, reduction=self.hyperparameters["reduction_ratio"])
+        total_inception_out = out_1x1 + out_k1 + out_k2 + pool_proj
 
-        # Classification Head
-        self.head = nn.Sequential(
-            nn.AdaptiveAvgPool1d(1),
-            nn.Flatten(),
-            nn.Dropout(self.hyperparameters["dropout"]),
-            nn.Linear(64, output_dim)
+        # Inception module with configurable kernel sizes
+        self.inception = InceptionBlock(
+            base, out_1x1, red_k1, out_k1, red_k2, out_k2, pool_proj,
+            branch_kernels=branch_kernels
         )
 
-        return nn.Sequential(self.stem, self.inception, self.attention, self.head)
+        # Channel attention
+        self.attention = ChannelAttention(total_inception_out, reduction=reduction_ratio)
+
+        # Classification head
+        self.pool = nn.AdaptiveAvgPool1d(1)
+        self.flatten = nn.Flatten()
+        self.dropout = nn.Dropout(dropout)
+        self.classifier = nn.Linear(total_inception_out, output_dim)
+
+    def forward(self, x):
+        x = self.stem(x)
+        x = self.inception(x)
+        x = self.attention(x)
+        x = self.pool(x)
+        x = self.flatten(x)
+        x = self.dropout(x)
+        x = self.classifier(x)
+        return x
+
+
+class InceptionAttentionClassifier(CNNClassifier):
+    def __init__(self, name: str = "inception_att_classifier", **kwargs):
+        super().__init__(name, **kwargs)
+        self.hyperparameters.update({
+            "reduction_ratio": kwargs.get("reduction_ratio", 8),
+            "inception_channels": kwargs.get("inception_channels", 32),
+            "branch_kernels": kwargs.get("branch_kernels", [3, 5]),
+        })
+
+    def _build_model(self, input_channels: int, input_length: int, output_dim: int):
+        branch_kernels = self.hyperparameters.get("branch_kernels", [3, 5])
+        if isinstance(branch_kernels, list):
+            branch_kernels = tuple(branch_kernels)
+
+        return InceptionAttentionNet(
+            input_channels=input_channels,
+            output_dim=output_dim,
+            inception_channels=self.hyperparameters.get("inception_channels", 32),
+            branch_kernels=branch_kernels,
+            reduction_ratio=self.hyperparameters.get("reduction_ratio", 8),
+            dropout=self.hyperparameters.get("dropout", 0.3)
+        )
+
+    def train(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: Optional[np.ndarray] = None,
+        y_val: Optional[np.ndarray] = None,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """Train the InceptionAttention model (sets correct model_type in metadata)."""
+        results = super().train(X_train, y_train, X_val, y_val, **kwargs)
+        # Fix model_type in metadata (parent sets it to "CNN")
+        if self.metadata:
+            self.metadata.model_type = "InceptionAttn"
+        return results
 
 
 class CatBoostClassifier(BaseClassifier):
@@ -1356,8 +1429,9 @@ class CatBoostClassifier(BaseClassifier):
 
         X_features = self.extract_features(X)
         X_scaled = self._scaler.transform(X_features)
-        # Flatten is required because CatBoost returns (N, 1) rather than (N,)
-        return self._model.predict(X_scaled).flatten()
+        # CatBoost predict returns class labels; flatten (N,1) → (N,)
+        preds = self._model.predict(X_scaled).flatten()
+        return preds.astype(int)
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """Get prediction probabilities."""
@@ -1368,7 +1442,48 @@ class CatBoostClassifier(BaseClassifier):
         X_scaled = self._scaler.transform(X_features)
         return self._model.predict_proba(X_scaled)
 
+    def save(self, path: Path) -> None:
+        """Save CatBoost model, scaler, and metadata."""
+        path = Path(path)
+        path.mkdir(parents=True, exist_ok=True)
 
+        if self.metadata:
+            with open(path / "metadata.json", 'w') as f:
+                json.dump(self.metadata.to_dict(), f, indent=2)
+
+        # Save CatBoost model using its native format
+        self._model.save_model(str(path / "model.cbm"))
+
+        # Save scaler
+        with open(path / "scaler.pkl", 'wb') as f:
+            pickle.dump(self._scaler, f)
+
+    def load(self, path: Path) -> None:
+        """Load CatBoost model, scaler, and metadata."""
+        path = Path(path)
+
+        with open(path / "metadata.json", 'r') as f:
+            self.metadata = ModelMetadata.from_dict(json.load(f))
+
+        # Load CatBoost model
+        self._model = CatBoostWrapper()
+        model_cbm = path / "model.cbm"
+        model_pkl = path / "model.pkl"
+        if model_cbm.exists():
+            self._model.load_model(str(model_cbm))
+        elif model_pkl.exists():
+            with open(model_pkl, 'rb') as f:
+                self._model = pickle.load(f)
+
+        # Load scaler
+        scaler_path = path / "scaler.pkl"
+        if scaler_path.exists():
+            with open(scaler_path, 'rb') as f:
+                self._scaler = pickle.load(f)
+        else:
+            self._scaler = StandardScaler()
+
+        self._is_trained = True
 
 
 class ModelManager:
@@ -1485,6 +1600,8 @@ class ModelManager:
             model_type = metadata["model_type"].lower()
             if model_type == "randomforest":
                 model_type = "random_forest"
+            elif model_type == "inceptionattn":
+                model_type = "inceptionattn"
 
         model = self.create_model(model_type, name=name)
         model.load(model_path)
