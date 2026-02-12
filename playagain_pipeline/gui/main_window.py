@@ -32,6 +32,7 @@ from playagain_pipeline.models.classifier import ModelManager, BaseClassifier
 from playagain_pipeline.protocols.protocol import (RecordingProtocol, ProtocolPhase,
                                                    create_quick_protocol, create_standard_protocol,
                                                    create_extended_protocol)
+from playagain_pipeline.prediction_server import PredictionServer
 
 
 class PredictionWorker(QThread):
@@ -114,6 +115,9 @@ class MainWindow(QMainWindow):
         self._prediction_window_ms = 200
         self._is_predicting = False
         self._prediction_worker: Optional[PredictionWorker] = None
+
+        # Unity prediction server
+        self._prediction_server: Optional[PredictionServer] = None
 
         # Plot window
         self._plot_window: Optional[EMGPlotWindow] = None
@@ -532,6 +536,38 @@ class MainWindow(QMainWindow):
 
         layout.addWidget(control_group)
 
+        # Unity TCP Server
+        server_group = QGroupBox("Unity TCP Server")
+        server_layout = QVBoxLayout(server_group)
+
+        server_config_layout = QHBoxLayout()
+        server_config_layout.addWidget(QLabel("Host:"))
+        self.server_host_edit = QLineEdit("127.0.0.1")
+        self.server_host_edit.setMaximumWidth(120)
+        server_config_layout.addWidget(self.server_host_edit)
+        server_config_layout.addWidget(QLabel("Port:"))
+        self.server_port_spin = QSpinBox()
+        self.server_port_spin.setRange(1024, 65535)
+        self.server_port_spin.setValue(5555)
+        server_config_layout.addWidget(self.server_port_spin)
+        server_layout.addLayout(server_config_layout)
+
+        server_btn_layout = QHBoxLayout()
+        self.start_server_btn = QPushButton("Start Server")
+        self.start_server_btn.clicked.connect(self._on_start_server)
+        server_btn_layout.addWidget(self.start_server_btn)
+
+        self.stop_server_btn = QPushButton("Stop Server")
+        self.stop_server_btn.setEnabled(False)
+        self.stop_server_btn.clicked.connect(self._on_stop_server)
+        server_btn_layout.addWidget(self.stop_server_btn)
+        server_layout.addLayout(server_btn_layout)
+
+        self.server_status_label = QLabel("Server: Not running")
+        server_layout.addWidget(self.server_status_label)
+
+        layout.addWidget(server_group)
+
         layout.addStretch()
         return tab
 
@@ -623,6 +659,11 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         """Handle window close."""
+        # Stop prediction server if running
+        if self._prediction_server:
+            self._prediction_server.stop()
+            self._prediction_server = None
+
         # Stop prediction worker if running
         if self._prediction_worker:
             self._prediction_worker.stop()
@@ -972,6 +1013,10 @@ class MainWindow(QMainWindow):
         # Predict if enabled
         if self._is_predicting and self._current_model:
             self._update_prediction_buffer(data)
+
+        # Feed data to Unity TCP server if running
+        if self._prediction_server and self._prediction_server.is_running:
+            self._prediction_server.on_emg_data(data)
 
     # Recording handlers
     @Slot()
@@ -1461,6 +1506,37 @@ class MainWindow(QMainWindow):
         self.prediction_label.setText("No prediction")
         self.confidence_label.setText("Confidence: -")
         self._log("Stopped prediction")
+
+    @Slot()
+    def _on_start_server(self):
+        """Start the Unity TCP prediction server."""
+        if not self._current_model:
+            QMessageBox.warning(self, "Warning", "Please load a model first")
+            return
+
+        host = self.server_host_edit.text().strip()
+        port = self.server_port_spin.value()
+
+        self._prediction_server = PredictionServer(host=host, port=port)
+        self._prediction_server.set_model(self._current_model)
+        self._prediction_server.start()
+
+        self.start_server_btn.setEnabled(False)
+        self.stop_server_btn.setEnabled(True)
+        self.server_status_label.setText(f"Server: Running on {host}:{port}")
+        self._log(f"Unity TCP server started on {host}:{port}")
+
+    @Slot()
+    def _on_stop_server(self):
+        """Stop the Unity TCP prediction server."""
+        if self._prediction_server:
+            self._prediction_server.stop()
+            self._prediction_server = None
+
+        self.start_server_btn.setEnabled(True)
+        self.stop_server_btn.setEnabled(False)
+        self.server_status_label.setText("Server: Not running")
+        self._log("Unity TCP server stopped")
 
     def _update_prediction_buffer(self, data: np.ndarray):
         """Update the prediction buffer with new data and pass to worker."""
