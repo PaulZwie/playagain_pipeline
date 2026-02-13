@@ -153,12 +153,9 @@ class ZeroCrossingFeature(BaseFeatureExtractor):
         return "Zero Crossings"
     def compute(self, data: np.ndarray) -> np.ndarray:
         if data.ndim == 3:
-            zc = np.zeros((data.shape[0], data.shape[2]))
-            for i in range(data.shape[0]):
-                for j in range(data.shape[2]):
-                    signal = data[i, :, j]
-                    zc[i, j] = np.sum((np.abs(np.diff(np.sign(signal))) > 0) & (np.abs(np.diff(signal)) > self.threshold))
-            return zc
+            sign_diff = np.abs(np.diff(np.sign(data), axis=1))
+            val_diff = np.abs(np.diff(data, axis=1))
+            return np.sum((sign_diff > 0) & (val_diff > self.threshold), axis=1)
         else:
             return np.sum((np.abs(np.diff(np.sign(data), axis=0)) > 0) & (np.abs(np.diff(data, axis=0)) > self.threshold), axis=0)
 
@@ -177,13 +174,12 @@ class SlopeSignChangeFeature(BaseFeatureExtractor):
         return "Slope Sign Changes"
     def compute(self, data: np.ndarray) -> np.ndarray:
         if data.ndim == 3:
-            ssc = np.zeros((data.shape[0], data.shape[2]))
-            for i in range(data.shape[0]):
-                for j in range(data.shape[2]):
-                    signal = data[i, :, j]
-                    diff = np.diff(signal)
-                    ssc[i, j] = np.sum((diff[:-1] * diff[1:] < 0) & (np.abs(diff[:-1] - diff[1:]) > self.threshold))
-            return ssc
+            diff = np.diff(data, axis=1)
+            return np.sum(
+                (diff[:, :-1, :] * diff[:, 1:, :] < 0) &
+                (np.abs(diff[:, :-1, :] - diff[:, 1:, :]) > self.threshold),
+                axis=1
+            )
         else:
             diff = np.diff(data, axis=0)
             return np.sum((diff[:-1] * diff[1:] < 0) & (np.abs(diff[:-1] - diff[1:]) > self.threshold), axis=0)

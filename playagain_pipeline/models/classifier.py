@@ -6,6 +6,8 @@ different ML models for EMG gesture recognition.
 """
 
 import json
+import logging
+import os
 import pickle
 import numpy as np
 
@@ -20,6 +22,51 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+
+logger = logging.getLogger(__name__)
+
+
+def get_best_device() -> torch.device:
+    """
+    Automatically detect the best available compute device.
+
+    Priority: CUDA (NVIDIA GPU) > MPS (Apple Silicon) > CPU.
+    """
+    if torch.cuda.is_available():
+        device = torch.device("cuda")
+        logger.info(f"Using CUDA device: {torch.cuda.get_device_name(0)}")
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        device = torch.device("mps")
+        logger.info("Using Apple MPS (Metal Performance Shaders) device")
+    else:
+        device = torch.device("cpu")
+        logger.info("Using CPU device")
+    return device
+
+
+def resolve_device(requested: str = "auto") -> torch.device:
+    """
+    Resolve a device string to an actual torch.device.
+
+    Args:
+        requested: "auto", "cuda", "mps", or "cpu"
+
+    Returns:
+        A valid torch.device, falling back to CPU if the requested
+        accelerator is unavailable.
+    """
+    if requested == "auto":
+        return get_best_device()
+    if requested == "cuda" and torch.cuda.is_available():
+        return torch.device("cuda")
+    if requested == "mps" and hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        return torch.device("mps")
+    if requested not in ("cuda", "mps", "cpu"):
+        logger.warning(f"Unknown device '{requested}', falling back to auto-detection")
+        return get_best_device()
+    if requested != "cpu":
+        logger.warning(f"Requested device '{requested}' is not available, falling back to CPU")
+    return torch.device("cpu")
 
 
 @dataclass
@@ -199,40 +246,28 @@ class EMGFeatureExtractor:
 
     @staticmethod
     def compute_zc(data: np.ndarray, threshold: float = 0.01) -> np.ndarray:
-        """Compute Zero Crossings."""
-        # For each window and channel
+        """Compute Zero Crossings (fully vectorized)."""
         if data.ndim == 3:
-            zc = np.zeros((data.shape[0], data.shape[2]))
-            for i in range(data.shape[0]):
-                for j in range(data.shape[2]):
-                    signal = data[i, :, j]
-                    zc[i, j] = np.sum(
-                        (np.abs(np.diff(np.sign(signal))) > 0) &
-                        (np.abs(np.diff(signal)) > threshold)
-                    )
-            return zc
+            sign_diff = np.abs(np.diff(np.sign(data), axis=1))
+            val_diff = np.abs(np.diff(data, axis=1))
+            return np.sum((sign_diff > 0) & (val_diff > threshold), axis=1)
         else:
-            signal = data
             return np.sum(
-                (np.abs(np.diff(np.sign(signal), axis=0)) > 0) &
-                (np.abs(np.diff(signal, axis=0)) > threshold),
+                (np.abs(np.diff(np.sign(data), axis=0)) > 0) &
+                (np.abs(np.diff(data, axis=0)) > threshold),
                 axis=0
             )
 
     @staticmethod
     def compute_ssc(data: np.ndarray, threshold: float = 0.01) -> np.ndarray:
-        """Compute Slope Sign Changes."""
+        """Compute Slope Sign Changes (fully vectorized)."""
         if data.ndim == 3:
-            ssc = np.zeros((data.shape[0], data.shape[2]))
-            for i in range(data.shape[0]):
-                for j in range(data.shape[2]):
-                    signal = data[i, :, j]
-                    diff = np.diff(signal)
-                    ssc[i, j] = np.sum(
-                        (diff[:-1] * diff[1:] < 0) &
-                        (np.abs(diff[:-1] - diff[1:]) > threshold)
-                    )
-            return ssc
+            diff = np.diff(data, axis=1)
+            return np.sum(
+                (diff[:, :-1, :] * diff[:, 1:, :] < 0) &
+                (np.abs(diff[:, :-1, :] - diff[:, 1:, :]) > threshold),
+                axis=1
+            )
         else:
             diff = np.diff(data, axis=0)
             return np.sum(
@@ -394,7 +429,8 @@ class RandomForestClassifier(BaseClassifier):
             "max_depth": kwargs.get("max_depth", None),
             "min_samples_split": kwargs.get("min_samples_split", 2),
             "min_samples_leaf": kwargs.get("min_samples_leaf", 1),
-            "random_state": kwargs.get("random_state", 42)
+            "random_state": kwargs.get("random_state", 42),
+            "n_jobs": kwargs.get("n_jobs", -1)  # Use all CPU cores
         }
         self._feature_extractor = EMGFeatureExtractor()
 
@@ -606,7 +642,7 @@ class MLPClassifier(BaseClassifier):
             "epochs": kwargs.get("epochs", 100),
             "early_stopping": kwargs.get("early_stopping", True),
             "patience": kwargs.get("patience", 10),
-            "device": kwargs.get("device", "mps")  # "cpu" or "cuda"
+            "device": kwargs.get("device", "auto")  # "auto", "cuda", "mps", or "cpu"
         }
         self._feature_extractor = EMGFeatureExtractor()
         self._scaler = None
@@ -674,7 +710,7 @@ class MLPClassifier(BaseClassifier):
             X_val_scaled = None
 
         # Convert to PyTorch tensors
-        device = torch.device(self.hyperparameters["device"] if torch.cuda.is_available() else "cpu")
+        device = resolve_device(self.hyperparameters["device"])
 
         X_train_tensor = torch.FloatTensor(X_train_scaled).to(device)
         y_train_tensor = torch.LongTensor(y_train).to(device)
@@ -707,9 +743,14 @@ class MLPClassifier(BaseClassifier):
         batch_size = self.hyperparameters["batch_size"]
         epochs = self.hyperparameters["epochs"]
         dataset = TensorDataset(X_train_tensor, y_train_tensor)
-        dataloader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+        use_pin_memory = device.type != "cpu"
+        dataloader = DataLoader(
+            dataset, batch_size=batch_size, shuffle=True,
+            num_workers=0, pin_memory=use_pin_memory
+        )
 
         best_val_loss = float('inf')
+        best_model_state = None
         patience_counter = 0
         history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
 
@@ -740,7 +781,7 @@ class MLPClassifier(BaseClassifier):
 
             if X_val_scaled is not None:
                 self._model.eval()
-                with torch.no_grad():
+                with torch.inference_mode():
                     outputs = self._model(X_val_tensor)
                     loss = criterion(outputs, y_val_tensor)
                     val_loss = loss.item()
@@ -763,10 +804,14 @@ class MLPClassifier(BaseClassifier):
                     best_val_loss = val_loss
                     patience_counter = 0
                     # Save best model state
-                    # self._best_state = self._model.state_dict()
+                    best_model_state = {k: v.cpu().clone() for k, v in self._model.state_dict().items()}
                 else:
                     patience_counter += 1
                     if patience_counter >= self.hyperparameters["patience"]:
+                        # Restore best model weights
+                        if best_model_state is not None:
+                            self._model.load_state_dict(best_model_state)
+                            self._model.to(device)
                         print(f"Early stopping at epoch {epoch}")
                         break
 
@@ -804,11 +849,11 @@ class MLPClassifier(BaseClassifier):
         X_features = self.extract_features(X)
         X_scaled = self._scaler.transform(X_features)
 
-        device = torch.device(self.hyperparameters["device"] if torch.cuda.is_available() else "cpu")
+        device = resolve_device(self.hyperparameters["device"])
         X_tensor = torch.FloatTensor(X_scaled).to(device)
 
         self._model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = self._model(X_tensor)
             _, predicted = outputs.max(1)
 
@@ -822,11 +867,11 @@ class MLPClassifier(BaseClassifier):
         X_features = self.extract_features(X)
         X_scaled = self._scaler.transform(X_features)
 
-        device = torch.device(self.hyperparameters["device"] if torch.cuda.is_available() else "cpu")
+        device = resolve_device(self.hyperparameters["device"])
         X_tensor = torch.FloatTensor(X_scaled).to(device)
 
         self._model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = self._model(X_tensor)
             probs = torch.softmax(outputs, dim=1)
 
@@ -879,7 +924,7 @@ class MLPClassifier(BaseClassifier):
         # Rebuild and load model
         self._model = self._build_model(self._input_dim, self._output_dim)
 
-        device = torch.device(self.hyperparameters["device"] if torch.cuda.is_available() else "cpu")
+        device = resolve_device(self.hyperparameters["device"])
         self._model.load_state_dict(torch.load(path / "model.pt", map_location=device))
         self._model.to(device)
 
@@ -901,7 +946,7 @@ class CNNClassifier(BaseClassifier):
             "epochs": kwargs.get("epochs", 100),
             "early_stopping": kwargs.get("early_stopping", True),
             "patience": kwargs.get("patience", 10),
-            "device": kwargs.get("device", "cpu")
+            "device": kwargs.get("device", "auto")
         }
         self._scaler = None
         self._model = None
@@ -976,7 +1021,7 @@ class CNNClassifier(BaseClassifier):
             X_val_scaled_flat = self._scaler.transform(X_val_flat)
             X_val_scaled = X_val_scaled_flat.reshape(Nv, Tv, Cv).transpose(0, 2, 1)
 
-        device = torch.device(self.hyperparameters["device"] if torch.cuda.is_available() else "cpu")
+        device = resolve_device(self.hyperparameters["device"])
 
         X_train_tensor = torch.FloatTensor(X_train_scaled).to(device)
         y_train_tensor = torch.LongTensor(y_train).to(device)
@@ -1002,9 +1047,14 @@ class CNNClassifier(BaseClassifier):
 
         criterion = nn.CrossEntropyLoss()
         dataset = TensorDataset(X_train_tensor, y_train_tensor)
-        dataloader = DataLoader(dataset, batch_size=self.hyperparameters["batch_size"], shuffle=True)
+        use_pin_memory = device.type != "cpu"
+        dataloader = DataLoader(
+            dataset, batch_size=self.hyperparameters["batch_size"], shuffle=True,
+            num_workers=0, pin_memory=use_pin_memory
+        )
 
         best_val_loss = float('inf')
+        best_model_state = None
         patience_counter = 0
         history = {"train_loss": [], "val_loss": [], "train_acc": [], "val_acc": []}
 
@@ -1034,7 +1084,7 @@ class CNNClassifier(BaseClassifier):
 
             if X_val_scaled is not None:
                 self._model.eval()
-                with torch.no_grad():
+                with torch.inference_mode():
                     outputs = self._model(X_val_tensor)
                     loss = criterion(outputs, y_val_tensor)
                     val_loss = loss.item()
@@ -1053,9 +1103,13 @@ class CNNClassifier(BaseClassifier):
                 if val_loss < best_val_loss:
                     best_val_loss = val_loss
                     patience_counter = 0
+                    best_model_state = {k: v.cpu().clone() for k, v in self._model.state_dict().items()}
                 else:
                     patience_counter += 1
                     if patience_counter >= self.hyperparameters["patience"]:
+                        if best_model_state is not None:
+                            self._model.load_state_dict(best_model_state)
+                            self._model.to(device)
                         print(f"Early stopping at epoch {epoch}")
                         break
 
@@ -1094,11 +1148,11 @@ class CNNClassifier(BaseClassifier):
         X_scaled_flat = self._scaler.transform(X_flat)
         X_scaled = X_scaled_flat.reshape(N, T, C).transpose(0, 2, 1)
 
-        device = torch.device(self.hyperparameters["device"] if torch.cuda.is_available() else "cpu")
+        device = resolve_device(self.hyperparameters["device"])
         X_tensor = torch.FloatTensor(X_scaled).to(device)
 
         self._model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = self._model(X_tensor)
             _, predicted = outputs.max(1)
 
@@ -1114,11 +1168,11 @@ class CNNClassifier(BaseClassifier):
         X_scaled_flat = self._scaler.transform(X_flat)
         X_scaled = X_scaled_flat.reshape(N, T, C).transpose(0, 2, 1)
 
-        device = torch.device(self.hyperparameters["device"] if torch.cuda.is_available() else "cpu")
+        device = resolve_device(self.hyperparameters["device"])
         X_tensor = torch.FloatTensor(X_scaled).to(device)
 
         self._model.eval()
-        with torch.no_grad():
+        with torch.inference_mode():
             outputs = self._model(X_tensor)
             probs = torch.softmax(outputs, dim=1)
 
@@ -1161,7 +1215,7 @@ class CNNClassifier(BaseClassifier):
             self._scaler = pickle.load(f)
 
         self._model = self._build_model(self._input_shape[0], self._input_shape[1], self._output_dim)
-        device = torch.device(self.hyperparameters["device"] if torch.cuda.is_available() else "cpu")
+        device = resolve_device(self.hyperparameters["device"])
         self._model.load_state_dict(torch.load(path / "model.pt", map_location=device))
         self._model.to(device)
 
@@ -1229,7 +1283,7 @@ class InceptionBlock(nn.Module):
         return torch.cat([self.branch1(x), self.branch2(x), self.branch3(x), self.branch4(x)], 1)
 
 
-class InceptionAttentionNet(nn.Module):
+class AttentionNet(nn.Module):
     """Proper nn.Module for the InceptionAttention architecture."""
 
     def __init__(self, input_channels, output_dim, inception_channels=32,
@@ -1280,8 +1334,8 @@ class InceptionAttentionNet(nn.Module):
         return x
 
 
-class InceptionAttentionClassifier(CNNClassifier):
-    def __init__(self, name: str = "inception_att_classifier", **kwargs):
+class AttentionNetClassifier(CNNClassifier):
+    def __init__(self, name: str = "attention_net_classifier", **kwargs):
         super().__init__(name, **kwargs)
         self.hyperparameters.update({
             "reduction_ratio": kwargs.get("reduction_ratio", 8),
@@ -1294,7 +1348,7 @@ class InceptionAttentionClassifier(CNNClassifier):
         if isinstance(branch_kernels, list):
             branch_kernels = tuple(branch_kernels)
 
-        return InceptionAttentionNet(
+        return AttentionNet(
             input_channels=input_channels,
             output_dim=output_dim,
             inception_channels=self.hyperparameters.get("inception_channels", 32),
@@ -1311,11 +1365,11 @@ class InceptionAttentionClassifier(CNNClassifier):
         y_val: Optional[np.ndarray] = None,
         **kwargs
     ) -> Dict[str, Any]:
-        """Train the InceptionAttention model (sets correct model_type in metadata)."""
+        """Train the AttentionNet model (sets correct model_type in metadata)."""
         results = super().train(X_train, y_train, X_val, y_val, **kwargs)
         # Fix model_type in metadata (parent sets it to "CNN")
         if self.metadata:
-            self.metadata.model_type = "InceptionAttn"
+            self.metadata.model_type = "AttentionNet"
         return results
 
 
@@ -1334,7 +1388,7 @@ class CatBoostClassifier(BaseClassifier):
             "l2_leaf_reg": kwargs.get("l2_leaf_reg", 3),
             "loss_function": kwargs.get("loss_function", "MultiClass"),
             "verbose": kwargs.get("verbose", False),
-            "task_type": kwargs.get("task_type", "CPU"),  # Use "GPU" if available
+            "task_type": kwargs.get("task_type", "auto"),  # auto-detected below
             "early_stopping_rounds": kwargs.get("early_stopping_rounds", 50)
         }
         self._feature_extractor = EMGFeatureExtractor()
@@ -1375,8 +1429,16 @@ class CatBoostClassifier(BaseClassifier):
             X_val_scaled = self._scaler.transform(X_val_features)
             eval_set = (X_val_scaled, y_val)
 
-        # Create model
-        self._model = CatBoostWrapper(**self.hyperparameters)
+        # Create model with auto GPU detection for CatBoost
+        catboost_params = self.hyperparameters.copy()
+        if catboost_params.get("task_type") == "auto":
+            if torch.cuda.is_available():
+                catboost_params["task_type"] = "GPU"
+                logger.info("CatBoost: using GPU (CUDA)")
+            else:
+                catboost_params["task_type"] = "CPU"
+                logger.info("CatBoost: using CPU")
+        self._model = CatBoostWrapper(**catboost_params)
 
         # Fit model
         self._model.fit(
@@ -1498,7 +1560,7 @@ class ModelManager:
         "catboost": CatBoostClassifier,
         "mlp": MLPClassifier,
         "cnn": CNNClassifier,
-        "inceptionattn": InceptionAttentionClassifier,
+        "attention_net": AttentionNetClassifier,
     }
 
     def __init__(self, models_dir: Path):
@@ -1600,8 +1662,8 @@ class ModelManager:
             model_type = metadata["model_type"].lower()
             if model_type == "randomforest":
                 model_type = "random_forest"
-            elif model_type == "inceptionattn":
-                model_type = "inceptionattn"
+            elif model_type == "attentionnet":
+                model_type = "attention_net"
 
         model = self.create_model(model_type, name=name)
         model.load(model_path)

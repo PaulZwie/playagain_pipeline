@@ -458,7 +458,7 @@ class MainWindow(QMainWindow):
         model_layout = QFormLayout(model_group)
 
         self.model_type_combo = QComboBox()
-        self.model_type_combo.addItems(["SVM", "Random Forest", "LDA", "CatBoost", "MLP", "CNN", "InceptionAttn"])
+        self.model_type_combo.addItems(["SVM", "Random Forest", "LDA", "CatBoost", "MLP", "CNN", "AttentionNet"])
         model_layout.addRow("Model Type:", self.model_type_combo)
 
         train_btn_layout = QHBoxLayout()
@@ -802,7 +802,7 @@ class MainWindow(QMainWindow):
             from playagain_pipeline.gui.widgets.training_dialog import TrainingProgressDialog
 
             # Get available model types
-            available_models = ["SVM", "CatBoost", "Random Forest", "LDA", "MLP", "CNN", "InceptionAttn"]
+            available_models = ["SVM", "CatBoost", "Random Forest", "LDA", "MLP", "CNN", "AttentionNet"]
 
             # Create dialog without pre-selected dataset/model to enable selection
             dialog = TrainingProgressDialog(
@@ -1407,7 +1407,12 @@ class MainWindow(QMainWindow):
                      f"{num_channels} channels, {window_samples} samples/window")
 
             # Create model
-            model_type = self.model_type_combo.currentText().lower().replace(" ", "_")
+            model_type_text = self.model_type_combo.currentText()
+            # Convert UI display names to internal model type names
+            if model_type_text == "AttentionNet":
+                model_type = "attention_net"
+            else:
+                model_type = model_type_text.lower().replace(" ", "_")
             self._log(f"Creating {model_type} model...")
 
             # Build model name: type_datasetname
@@ -1644,6 +1649,13 @@ class MainWindow(QMainWindow):
 
 def main():
     """Run the application."""
+    import os
+    # Suppress harmless Qt pointer dispatch warnings on macOS
+    # (caused by pyqtgraph plots receiving touch/pointer events without target windows)
+    os.environ.setdefault(
+        "QT_LOGGING_RULES",
+        "qt.pointer.dispatch=false"
+    )
 
     app = QApplication(sys.argv)
     app.setStyle("Fusion")

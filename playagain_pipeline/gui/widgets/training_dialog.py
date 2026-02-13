@@ -93,7 +93,7 @@ class HyperparameterWidget(QWidget):
             self._setup_mlp_params(layout)
         elif self.model_type == "cnn":
             self._setup_cnn_params(layout)
-        elif self.model_type == "inceptionattn":
+        elif self.model_type == "attention_net":
             self._setup_inception_params(layout)
         else:
             layout.addWidget(QLabel("No hyperparameters for this model type"))
@@ -498,13 +498,7 @@ class HyperparameterWidget(QWidget):
                 "patience": self.patience_spin.value()
             }
 
-        elif self.model_type == "inception":
-            params = {
-                "inception_channels": self.inc_base_spin.value(),
-                "reduction_ratio": self.att_red_spin.value(),
-                "learning_rate": self.lr_spin.value()
-            }
-        elif self.model_type == "inceptionattn":
+        elif self.model_type == "attention_net":
             # Parse branch kernel sizes
             try:
                 kernels_str = self.inc_kernels_edit.currentText()
@@ -588,7 +582,12 @@ class TrainingProgressDialog(QDialog):
                 self.model_type_combo.addItems(self.available_models)
                 self.model_type_combo.currentTextChanged.connect(self._on_model_type_changed)
                 selection_layout.addWidget(self.model_type_combo, 0, 1)
-                self.model_type = self.available_models[0].lower().replace(" ", "_")
+                # Convert first available model name to internal type name
+                first_model = self.available_models[0]
+                if first_model == "AttentionNet":
+                    self.model_type = "attention_net"
+                else:
+                    self.model_type = first_model.lower().replace(" ", "_")
             else:
                 self.model_type_combo = None
 
@@ -708,7 +707,11 @@ class TrainingProgressDialog(QDialog):
 
     def _on_model_type_changed(self, model_name: str):
         """Handle model type change."""
-        self.model_type = model_name.lower().replace(" ", "_")
+        # Convert UI display names to internal model type names
+        if model_name == "AttentionNet":
+            self.model_type = "attention_net"
+        else:
+            self.model_type = model_name.lower().replace(" ", "_")
         # Update hyperparameter widget
         # Find the tab index for hyperparameters
         for i in range(self.tabs.count()):
