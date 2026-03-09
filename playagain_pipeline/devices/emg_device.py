@@ -12,6 +12,12 @@ from dataclasses import dataclass
 import numpy as np
 from PySide6.QtCore import QObject, Signal, QTimer, QMutex, QMutexLocker
 
+# Detect the current OS and inject local package paths into sys.path so that
+# device_interfaces can be imported without hard-coded absolute paths in
+# requirements.txt (works on macOS, Windows, and Linux alike).
+from playagain_pipeline.utils.platform_utils import inject_local_packages, get_os_name
+_injected = inject_local_packages()
+
 # Try to import device_interfaces for real device support
 try:
     from device_interfaces.devices.muovi import Muovi

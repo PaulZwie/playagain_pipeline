@@ -28,7 +28,10 @@ class RecordingMetadata:
     protocol_name: str
     calibration_applied: bool = False
     channel_mapping: Optional[List[int]] = None
+    rotation_offset: int = 0  # Detected bracelet rotation (channels shifted from reference)
+    rotation_confidence: float = 0.0  # Confidence of the rotation detection [0, 1]
     notes: str = ""
+    bad_channels: List[int] = field(default_factory=list)  # Indices of bad channels (0-based)
     custom_metadata: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
@@ -43,7 +46,10 @@ class RecordingMetadata:
             "protocol_name": self.protocol_name,
             "calibration_applied": self.calibration_applied,
             "channel_mapping": self.channel_mapping,
+            "rotation_offset": self.rotation_offset,
+            "rotation_confidence": self.rotation_confidence,
             "notes": self.notes,
+            "bad_channels": self.bad_channels,
             "custom_metadata": self.custom_metadata
         }
 
@@ -51,6 +57,9 @@ class RecordingMetadata:
     def from_dict(cls, data: Dict[str, Any]) -> "RecordingMetadata":
         data = data.copy()
         data["created_at"] = datetime.fromisoformat(data["created_at"])
+        # Ensure backward compatibility for older sessions without bad_channels
+        if "bad_channels" not in data:
+            data["bad_channels"] = []
         return cls(**data)
 
 
@@ -123,6 +132,7 @@ class RecordingSession:
         self._is_recording: bool = False
         self._current_trial_start: Optional[int] = None
         self._current_trial_gesture: Optional[str] = None
+        self._source_dir: Optional[Path] = None  # Set when loaded from disk
 
     @property
     def is_recording(self) -> bool:
@@ -311,9 +321,13 @@ class RecordingSession:
             RecordingTrial.from_dict(t) for t in session_info["trials"]
         ]
 
-        # Load data
-        data = np.load(directory / "data.npy")
+        # Load data — use memory-mapping by default so we only read
+        # pages that are actually accessed.  The mmap is read-only; any
+        # write (e.g. zeroing bad channels) triggers a copy-on-write via
+        # numpy slicing, so callers stay safe.
+        data = np.load(directory / "data.npy", mmap_mode="r")
         session._data_chunks = [data]
         session._current_sample = data.shape[0]
+        session._source_dir = directory  # remember where we came from
 
         return session

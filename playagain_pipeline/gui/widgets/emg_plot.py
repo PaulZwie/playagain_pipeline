@@ -10,7 +10,7 @@ from typing import Optional
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, QSpinBox,
                                 QCheckBox, QMainWindow)
-from PySide6.QtCore import Slot, Signal, QMutex, QMutexLocker, QTimer
+from PySide6.QtCore import Slot, Signal, QMutex, QMutexLocker, QTimer, Qt
 from gui_custom_elements.vispy.biosignal_plot import VispyBiosignalPlot
 
 
@@ -21,9 +21,12 @@ class EMGPlotWidget(QWidget):
     Features:
     - Multi-channel display with configurable layout
     - Auto-scaling and manual range control
-    - Channel selection and highlighting
+    - Channel selection and highlighting via VispyBiosignalPlot's built-in checkboxes
     - Uses VispyBiosignalPlot for efficient visualization
     """
+
+    # Forwarded from VispyBiosignalPlot — emits bool array (True=enabled, False=bad)
+    bad_channels_updated = Signal(np.ndarray)
 
     def __init__(
         self,
@@ -44,16 +47,22 @@ class EMGPlotWidget(QWidget):
         self._buffer_index = 0
         self._buffer_full = False
 
+        # Thread safety for data buffer
+        self._data_mutex = QMutex()
 
         # Channel visibility
         self._channel_visible = [True] * num_channels
 
-        # Frame counter for throttling updates
-        self._frame_count = 0
-        self._update_every_n_frames = 2  # Update plot every N data frames for performance
+        # Update timer - decoupled from data reception for smoother UI (~30 FPS)
+        self._update_timer = QTimer(self)
+        self._update_timer.timeout.connect(self._update_plots)
+        self._update_timer.setInterval(33)
 
         # Setup UI
         self._setup_ui()
+
+        # Start update timer after UI is set up
+        self._update_timer.start()
 
     def _setup_ui(self):
         """Setup the user interface."""
@@ -77,9 +86,46 @@ class EMGPlotWidget(QWidget):
         control_layout.addStretch()
         layout.addLayout(control_layout)
 
-        # Plot widget using VispyBiosignalPlot
+        # Plot widget using VispyBiosignalPlot — must call configure() before use
         self.plot_widget = VispyBiosignalPlot()
-        layout.addWidget(self.plot_widget)
+        self.plot_widget.configure(
+            lines=self.num_channels,
+            sampling_freuqency=self.sampling_rate,
+            display_time=int(self.display_seconds),
+        )
+        # Forward channel toggle signal from the built-in checkboxes
+        self.plot_widget.bad_channels_updated.connect(self.bad_channels_updated)
+        layout.addWidget(self.plot_widget, stretch=1)
+
+        # Ground truth label display
+        self._ground_truth_label = QLabel("Ground Truth: -")
+        self._ground_truth_label.setStyleSheet(
+            "font-size: 14px; font-weight: bold; padding: 5px; "
+            "background-color: #e0e0e0; border-radius: 5px;"
+        )
+        self._ground_truth_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self._ground_truth_label)
+
+    @Slot(str)
+    def set_ground_truth(self, label: str):
+        """Update the ground truth label display."""
+        self._ground_truth_label.setText(f"Ground Truth: {label}")
+        # Change background color based on gesture
+        if label == "Unknown" or label == "-":
+            self._ground_truth_label.setStyleSheet(
+                "font-size: 14px; font-weight: bold; padding: 5px; "
+                "background-color: #e0e0e0; border-radius: 5px; color: black;"
+            )
+        elif label == "Rest":
+            self._ground_truth_label.setStyleSheet(
+                "font-size: 14px; font-weight: bold; padding: 5px; "
+                "background-color: #d1ecf1; border-radius: 5px; color: #0c5460;"
+            )
+        else:
+            self._ground_truth_label.setStyleSheet(
+                "font-size: 14px; font-weight: bold; padding: 5px; "
+                "background-color: #d4edda; border-radius: 5px; color: #155724;"
+            )
 
     @Slot(int)
     def _on_display_time_changed(self, value: int):
@@ -87,20 +133,43 @@ class EMGPlotWidget(QWidget):
         self.display_seconds = value
         new_samples = int(value * self.sampling_rate)
 
-        # Resize buffer
         if new_samples != self.display_samples:
-            old_data = self._data_buffer
-            self._data_buffer = np.zeros((new_samples, self.num_channels))
+            with QMutexLocker(self._data_mutex):
+                old_data = self._data_buffer
+                self._data_buffer = np.zeros((new_samples, self.num_channels))
 
-            # Copy existing data
-            copy_samples = min(new_samples, len(old_data))
-            self._data_buffer[-copy_samples:] = old_data[-copy_samples:]
+                copy_samples = min(new_samples, len(old_data))
+                self._data_buffer[-copy_samples:] = old_data[-copy_samples:]
 
-            self.display_samples = new_samples
+                self.display_samples = new_samples
+
+    def _add_data_to_buffer(self, data: np.ndarray):
+        """Add data to the circular buffer (thread-safe)."""
+        with QMutexLocker(self._data_mutex):
+            n_samples = data.shape[0]
+
+            if n_samples > self.display_samples:
+                self._data_buffer[:, :] = data[-self.display_samples:, :]
+                self._buffer_index = 0
+                self._buffer_full = True
+            else:
+                end_index = (self._buffer_index + n_samples) % self.display_samples
+                if end_index < self._buffer_index:
+                    remaining = self.display_samples - self._buffer_index
+                    self._data_buffer[self._buffer_index:] = data[:remaining]
+                    self._data_buffer[:end_index] = data[remaining:]
+                    self._buffer_full = True
+                else:
+                    self._data_buffer[self._buffer_index:end_index] = data
+                    if end_index == 0:
+                        self._buffer_full = True
+                self._buffer_index = end_index
 
     def update_data(self, data: np.ndarray):
         """
-        Update the plot with new data.
+        Update the plot with new data (thread-safe).
+
+        Data is buffered immediately; rendering happens on the 30 FPS timer.
 
         Args:
             data: New EMG data (samples, channels)
@@ -120,41 +189,14 @@ class EMGPlotWidget(QWidget):
             temp_data[:, :min_ch] = data[:, :min_ch]
             data = temp_data
 
-        n_samples = data.shape[0]
-
-        # Add new data to circular buffer
-        if n_samples > self.display_samples:
-            # If more data than buffer, take the latest
-            self._data_buffer[:, :] = data[-self.display_samples:, :]
-            self._buffer_index = 0
-            self._buffer_full = True
-        else:
-            end_index = (self._buffer_index + n_samples) % self.display_samples
-            if end_index < self._buffer_index:
-                # Wrap around
-                remaining = self.display_samples - self._buffer_index
-                self._data_buffer[self._buffer_index:] = data[:remaining]
-                self._data_buffer[:end_index] = data[remaining:]
-                self._buffer_full = True
-            else:
-                self._data_buffer[self._buffer_index:end_index] = data
-                if end_index == 0:
-                    self._buffer_full = True
-            self._buffer_index = end_index
-
-        # Throttle plot updates for performance
-        self._frame_count += 1
-        if self._frame_count >= self._update_every_n_frames:
-            self._frame_count = 0
-            self._update_plots()
+        self._add_data_to_buffer(data)
 
     def _update_plots(self):
-        """Update the plot with current buffer data."""
-        # Get ordered data
-        ordered_data = self._get_ordered_data()
+        """Update the plot with current buffer data (called by timer at ~30 FPS)."""
+        with QMutexLocker(self._data_mutex):
+            ordered_data = self._get_ordered_data()
 
-        # Update plot with the data
-        if hasattr(self.plot_widget, 'update_data'):
+        if hasattr(self.plot_widget, 'update_data') and ordered_data.size > 0:
             self.plot_widget.update_data(ordered_data)
 
     def set_channel_visible(self, channel: int, visible: bool):
@@ -167,16 +209,36 @@ class EMGPlotWidget(QWidget):
         if num_channels == self.num_channels:
             return
 
+        # Stop the update timer to prevent race conditions during reconfiguration
+        was_running = self._update_timer.isActive()
+        if was_running:
+            self._update_timer.stop()
+
+        # Update channel count and reset buffers
         self.num_channels = num_channels
         self._data_buffer = np.zeros((self.display_samples, num_channels))
         self._channel_visible = [True] * num_channels
+        self._buffer_index = 0
+        self._buffer_full = False
 
-        # Reconfigure plot widget
+        # Reconfigure plot widget - updates number_of_lines and rebuilds checkboxes,
+        # but does NOT reset downsample_buffer internally
         self.plot_widget.configure(
             lines=self.num_channels,
             sampling_freuqency=self.sampling_rate,
             display_time=int(self.display_seconds),
         )
+
+        # CRITICAL: set downsample_buffer to None after reconfigure.
+        # configure() never resets it, so it still holds the old channel shape.
+        # The library checks `if self.downsample_buffer is not None` before
+        # hstacking, so None is the only safe value to clear stale channel state.
+        if hasattr(self.plot_widget, 'downsample_buffer'):
+            self.plot_widget.downsample_buffer = None
+
+        # Restart the timer if it was previously running
+        if was_running:
+            self._update_timer.start()
 
     def clear(self):
         """Clear all data."""
@@ -388,6 +450,11 @@ class EMGPlotWindow(QMainWindow):
         if num_channels == self.num_channels:
             return
 
+        # Stop timer to prevent concurrent rendering during reconfiguration
+        was_running = self._update_timer.isActive()
+        if was_running:
+            self._update_timer.stop()
+
         with QMutexLocker(self._data_mutex):
             self.num_channels = num_channels
             self._data_buffer = np.zeros((self.display_samples, num_channels))
@@ -401,6 +468,14 @@ class EMGPlotWindow(QMainWindow):
             sampling_freuqency=self.sampling_rate,
             display_time=int(self.display_seconds),
         )
+
+        # CRITICAL: configure() never resets downsample_buffer; set to None
+        # so the library skips the dimension-mismatched hstack on next update.
+        if hasattr(self.plot_widget, 'downsample_buffer'):
+            self.plot_widget.downsample_buffer = None
+
+        if was_running:
+            self._update_timer.start()
 
     def clear(self):
         """Clear all data."""

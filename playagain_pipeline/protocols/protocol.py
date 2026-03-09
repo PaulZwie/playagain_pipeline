@@ -13,6 +13,7 @@ import json
 from pathlib import Path
 
 from playagain_pipeline.core.gesture import GestureSet, Gesture
+from playagain_pipeline.config.config import get_default_config
 
 
 class ProtocolPhase(Enum):
@@ -58,12 +59,12 @@ class ProtocolConfig:
     # Timing parameters (in seconds)
     preparation_time: float = 3.0
     cue_time: float = 1.0
-    hold_time: float = 3.0
+    hold_time: float = 8.0
     release_time: float = 0.5
-    rest_time: float = 2.0
+    rest_time: float = 5.0
 
     # Repetition parameters
-    repetitions_per_gesture: int = 5
+    repetitions_per_gesture: int = 3
     randomize_order: bool = True
 
     # Recording parameters
@@ -134,8 +135,8 @@ class RecordingProtocol:
         self._steps.append(ProtocolStep(
             phase=ProtocolPhase.PREPARATION,
             gesture=None,
-            duration=3.0,
-            message="Get ready! We will start soon.",
+            duration=self.config.preparation_time,
+            message="Bereit? Wir starten gleich!",
             is_recording=False
         ))
 
@@ -144,40 +145,55 @@ class RecordingProtocol:
         if self.config.randomize_order:
             random.shuffle(gestures)
 
+        # Find the rest gesture in the set (for labeling rest phases)
+        rest_gesture = None
+        for g in gestures:
+            if g.name == "rest":
+                rest_gesture = g
+                break
+
+        # Filter out the rest gesture from the active gesture sequence
+        # (rest data is now automatically collected between gestures)
+        active_gestures = [g for g in gestures if g.name != "rest"]
+        if not active_gestures:
+            active_gestures = gestures  # Fallback if no non-rest gestures
+
         # Repeat the sequence
         for rep in range(self.config.repetitions_per_gesture):
-            for i, gesture in enumerate(gestures):
-                # Hold phase (5s)
+            for i, gesture in enumerate(active_gestures):
+                # Hold phase — perform the gesture
                 self._steps.append(ProtocolStep(
                     phase=ProtocolPhase.HOLD,
                     gesture=gesture,
-                    duration=5.0,
-                    message=f"Perform: {gesture.display_name}",
-                    trial_index=rep * len(gestures) + i,
+                    duration=self.config.hold_time,
+                    message=f"{gesture.display_name}",
+                    trial_index=rep * len(active_gestures) + i,
                     repetition_index=rep,
                     is_recording=True
                 ))
 
                 # Check if there's a next gesture (not last gesture of last repetition)
-                is_last_gesture = (i == len(gestures) - 1) and (rep == self.config.repetitions_per_gesture - 1)
+                is_last_gesture = (i == len(active_gestures) - 1) and (rep == self.config.repetitions_per_gesture - 1)
 
                 if not is_last_gesture:
                     # Determine next gesture
-                    next_i = (i + 1) % len(gestures)
+                    next_i = (i + 1) % len(active_gestures)
                     if next_i == 0 and rep + 1 < self.config.repetitions_per_gesture:
-                        next_gesture = gestures[0]  # Next repetition starts with first
+                        next_gesture = active_gestures[0]  # Next repetition starts with first
                     else:
-                        next_gesture = gestures[next_i]
+                        next_gesture = active_gestures[next_i]
 
-                    # Pause phase (3s) - show next gesture
+                    # Pause phase — also recorded as rest data
+                    # The REST phase is now recorded as a "rest" trial automatically,
+                    # so users don't need to perform "rest" as a separate gesture.
                     self._steps.append(ProtocolStep(
                         phase=ProtocolPhase.REST,
                         gesture=next_gesture,  # Pass next gesture for visualization
-                        duration=3.0,
-                        message=f"Pause. Next: {next_gesture.display_name}",
-                        trial_index=rep * len(gestures) + i,
+                        duration=self.config.rest_time,
+                        message=f"Rest. Next: {next_gesture.display_name}",
+                        trial_index=rep * len(active_gestures) + i,
                         repetition_index=rep,
-                        is_recording=False
+                        is_recording=True  # Now recorded as rest data
                     ))
 
 
@@ -260,44 +276,53 @@ class RecordingProtocol:
 # Pre-defined protocol configurations
 def create_quick_protocol() -> ProtocolConfig:
     """Create a quick protocol for testing."""
+    settings = get_default_config().protocol
     return ProtocolConfig(
         name="quick",
-        description="Quick protocol for testing (3 repetitions, short holds)",
-        preparation_time=2.0,
-        cue_time=0.5,
-        hold_time=2.0,
-        release_time=0.3,
-        rest_time=1.0,
-        repetitions_per_gesture=3,
-        randomize_order=True
+        description="Quick protocol for testing",
+        preparation_time=settings.quick_preparation_time,
+        cue_time=settings.quick_cue_time,
+        hold_time=settings.quick_hold_time,
+        release_time=settings.quick_release_time,
+        rest_time=settings.quick_rest_time,
+        repetitions_per_gesture=settings.quick_repetitions,
+        randomize_order=settings.quick_randomize
     )
 
 
 def create_standard_protocol() -> ProtocolConfig:
     """Create a standard recording protocol."""
+    settings = get_default_config().protocol
     return ProtocolConfig(
         name="standard",
-        description="Standard protocol (5 repetitions, 3s holds)",
-        preparation_time=3.0,
-        cue_time=1.0,
-        hold_time=3.0,
-        release_time=0.5,
-        rest_time=2.0,
-        repetitions_per_gesture=5,
-        randomize_order=True
+        description="Standard protocol",
+        preparation_time=settings.std_preparation_time,
+        cue_time=settings.std_cue_time,
+        hold_time=settings.std_hold_time,
+        release_time=settings.std_release_time,
+        rest_time=settings.std_rest_time,
+        repetitions_per_gesture=settings.std_repetitions,
+        randomize_order=settings.std_randomize
     )
 
 
 def create_extended_protocol() -> ProtocolConfig:
     """Create an extended protocol for thorough data collection."""
+    # Extended protocol uses standard settings but doubled repetitions (or we can add specific config if needed)
+    # For now, let's just keep it hardcoded or maybe use standard settings x2?
+    # The user specifically asked for standard repetition number and time.
+    # Let's leave extended as is but maybe base time on standard?
+    # But for consistency, let's use the standard times at least.
+
+    settings = get_default_config().protocol
     return ProtocolConfig(
         name="extended",
-        description="Extended protocol (10 repetitions, 4s holds)",
-        preparation_time=5.0,
-        cue_time=1.5,
-        hold_time=4.0,
+        description="Extended protocol (10 repetitions)",
+        preparation_time=5.0, # Kept longer
+        cue_time=1.5, # Kept longer
+        hold_time=4.0, # Kept longer
         release_time=0.5,
-        rest_time=3.0,
+        rest_time=3.0, # Kept longer
         repetitions_per_gesture=10,
         randomize_order=True
     )
@@ -305,14 +330,15 @@ def create_extended_protocol() -> ProtocolConfig:
 
 def create_calibration_protocol() -> ProtocolConfig:
     """Create a protocol specifically for calibration."""
+    settings = get_default_config().protocol
     return ProtocolConfig(
         name="calibration",
-        description="Calibration protocol (3 repetitions, 2s holds)",
-        preparation_time=2.0,
-        cue_time=0.5,
-        hold_time=2.0,
-        release_time=0.3,
-        rest_time=1.5,
-        repetitions_per_gesture=3,
-        randomize_order=False  # Keep order consistent for calibration
+        description="Calibration protocol",
+        preparation_time=settings.cal_preparation_time,
+        cue_time=settings.cal_cue_time,
+        hold_time=settings.cal_hold_time,
+        release_time=settings.cal_release_time,
+        rest_time=settings.cal_rest_time,
+        repetitions_per_gesture=settings.cal_repetitions,
+        randomize_order=settings.cal_randomize
     )

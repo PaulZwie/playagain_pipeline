@@ -80,8 +80,17 @@ class DataManager:
         return RecordingSession.load(path)
 
     def list_subjects(self) -> List[str]:
-        """List all subjects with recorded data."""
-        return [d.name for d in self.sessions_dir.iterdir() if d.is_dir()]
+        """List all subjects with recorded data, sorted in natural rising order."""
+        subjects = [d.name for d in self.sessions_dir.iterdir() if d.is_dir()]
+        subjects.sort(key=self._natural_sort_key)
+        return subjects
+
+    @staticmethod
+    def _natural_sort_key(text: str):
+        """Sort key for natural ordering: VP_00 < VP_01 < VP_02 < VP_10."""
+        import re
+        return [int(c) if c.isdigit() else c.lower()
+                for c in re.split(r'(\d+)', text)]
 
     def list_sessions(self, subject_id: str) -> List[str]:
         """List all sessions for a subject, sorted by recording order (creation time)."""
@@ -105,8 +114,8 @@ class DataManager:
                 else:
                     sessions.append((d.name, datetime.min))
 
-        # Sort by creation time
-        sessions.sort(key=lambda x: x[1])
+        # Sort by creation time, then by name for stable ordering
+        sessions.sort(key=lambda x: (x[1], self._natural_sort_key(x[0])))
         return [name for name, _ in sessions]
 
     def get_all_sessions(self, subject_id: Optional[str] = None) -> List[RecordingSession]:
@@ -139,7 +148,11 @@ class DataManager:
         window_size_ms: int = 200,
         window_stride_ms: int = 50,
         include_invalid: bool = False,
-        preprocessing_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None
+        preprocessing_fn: Optional[Callable[[np.ndarray], np.ndarray]] = None,
+        calibration=None,
+        use_per_session_rotation: bool = False,
+        feature_config: Optional[Dict[str, Any]] = None,
+        bad_channels: Optional[Dict[str, List[int]]] = None,
     ) -> Dict[str, Any]:
         """
         Create a machine learning dataset from recording sessions.
@@ -152,10 +165,22 @@ class DataManager:
             window_stride_ms: Window stride in milliseconds
             include_invalid: Whether to include invalid trials
             preprocessing_fn: Optional function to preprocess EMG data before windowing
+            calibration: Optional CalibrationResult to apply a single global channel
+                reordering. Ignored when use_per_session_rotation is True.
+            use_per_session_rotation: If True, each session's own rotation_offset
+                (stored in its metadata) is used to rotate channels into the
+                canonical reference layout. This is the recommended mode when
+                combining recordings from different bracelet placements, because
+                each session gets its own correction rather than a single global one.
+            feature_config: Optional dict with keys 'mode' and 'features' for
+                pre-extracting features at dataset creation time. If provided and
+                mode is not 'raw', features are computed and stored as 2D X.
+            bad_channels: Optional dict mapping session_id -> list of bad channel
+                indices (0-based). Bad channels are zeroed out per session.
 
         Returns:
             Dictionary containing:
-            - X: Feature array (windows x samples x channels)
+            - X: Feature array (windows x samples x channels) or (windows x features)
             - y: Label array
             - metadata: Dataset metadata
         """
@@ -166,37 +191,127 @@ class DataManager:
             for sid in subject_ids:
                 sessions.extend(self.get_all_sessions(sid))
 
-        windows = []
-        labels = []
-        trial_ids = []
+        per_session_rotations = {}  # session_id -> rotation_offset applied
 
-        for session in sessions:
-            data = session.get_data()
+        # ── Helper: prepare one session's data (rotation, bad-ch, preproc) ──
+        def _prepare_session_data(session: RecordingSession):
+            """Return processed data array (as float32) for a single session."""
+            data = np.array(session.get_data(), dtype=np.float32, copy=True)
 
-            # Apply preprocessing if provided
+            # Zero out bad channels for this session
+            session_bad_chs: list = []
+            if bad_channels is not None:
+                session_bad_chs = list(bad_channels.get(session.metadata.session_id, []))
+            if hasattr(session.metadata, 'bad_channels') and session.metadata.bad_channels:
+                session_bad_chs = list(set(session_bad_chs) | set(session.metadata.bad_channels))
+            if session_bad_chs:
+                for ch_idx in session_bad_chs:
+                    if ch_idx < data.shape[1]:
+                        data[:, ch_idx] = 0.0
+
+            # Determine rotation to apply
+            if use_per_session_rotation:
+                rot = session.metadata.rotation_offset
+                if rot != 0 and data.shape[1] >= session.metadata.num_channels:
+                    n_ch = session.metadata.num_channels
+                    mapping = [(i - rot) % n_ch for i in range(n_ch)]
+                    data = data[:, mapping]
+                per_session_rotations[session.metadata.session_id] = rot
+            elif calibration is not None:
+                try:
+                    data = calibration.apply_to_data(data)
+                except ValueError:
+                    pass
+
             if preprocessing_fn is not None:
                 data = preprocessing_fn(data)
 
-            trials = session.trials if include_invalid else session.get_valid_trials()
+            return data
 
+        # ── Pass 1: count total windows so we can pre-allocate ──────────
+        window_counts = []   # (session_idx, n_windows)
+        expected_shape = None
+        total_windows = 0
+
+        for sess_idx, session in enumerate(sessions):
+            trials = session.trials if include_invalid else session.get_valid_trials()
+            window_samples = int(window_size_ms * session.metadata.sampling_rate / 1000)
+            stride_samples = int(window_stride_ms * session.metadata.sampling_rate / 1000)
+            n_wins = 0
+            for trial in trials:
+                trial_len = trial.end_sample - trial.start_sample
+                if trial_len >= window_samples:
+                    n_wins += (trial_len - window_samples) // stride_samples + 1
+            window_counts.append(n_wins)
+            total_windows += n_wins
+
+            if expected_shape is None and n_wins > 0:
+                n_channels = session.metadata.num_channels
+                expected_shape = (window_samples, n_channels)
+
+        if total_windows == 0 or expected_shape is None:
+            raise ValueError("No data windows extracted")
+
+        # ── Pre-allocate output arrays (float32 saves ~50% memory) ──────
+        X = np.empty((total_windows, expected_shape[0], expected_shape[1]),
+                      dtype=np.float32)
+        y = np.empty(total_windows, dtype=np.int64)
+        trial_id_list: List[str] = []
+        write_pos = 0
+        skipped_windows = 0
+
+        # ── Pass 2: fill arrays one session at a time ───────────────────
+        for sess_idx, session in enumerate(sessions):
+            if window_counts[sess_idx] == 0:
+                continue
+
+            data = _prepare_session_data(session)
+
+            trials = session.trials if include_invalid else session.get_valid_trials()
             window_samples = int(window_size_ms * session.metadata.sampling_rate / 1000)
             stride_samples = int(window_stride_ms * session.metadata.sampling_rate / 1000)
 
             for trial in trials:
                 trial_data = data[trial.start_sample:trial.end_sample]
 
-                # Extract windows
                 for start in range(0, len(trial_data) - window_samples + 1, stride_samples):
                     window = trial_data[start:start + window_samples]
-                    windows.append(window)
-                    labels.append(trial.gesture_label)
-                    trial_ids.append(f"{session.metadata.session_id}_{trial.trial_id}")
+                    # Validate shape
+                    if window.shape != expected_shape:
+                        skipped_windows += 1
+                        continue
+                    X[write_pos] = window
+                    y[write_pos] = trial.gesture_label
+                    trial_id_list.append(
+                        f"{session.metadata.session_id}_{trial.trial_id}")
+                    write_pos += 1
 
-        if not windows:
-            raise ValueError("No data windows extracted")
+            # Release the session data we just used
+            del data
 
-        X = np.array(windows)
-        y = np.array(labels)
+        # Trim if we skipped any windows
+        if skipped_windows > 0:
+            print(f"  Skipped {skipped_windows} windows with inconsistent shape.")
+        if write_pos < total_windows:
+            X = X[:write_pos]
+            y = y[:write_pos]
+
+        if write_pos == 0:
+            raise ValueError("No valid windows after filtering inconsistent shapes")
+
+        # Store original shape info before potential feature extraction
+        raw_window_samples = X.shape[1] if X.ndim > 1 else len(X)
+        raw_num_channels = X.shape[2] if X.ndim > 2 else (sessions[0].metadata.num_channels if sessions else 0)
+
+        # Pre-extract features if requested
+        features_extracted = False
+        feature_dim = 0
+        if feature_config is not None and feature_config.get("mode") != "raw" and X.ndim == 3:
+            from playagain_pipeline.models.classifier import EMGFeatureExtractor
+            extractor = EMGFeatureExtractor(feature_config)
+            X = extractor.extract_features(X)
+            features_extracted = True
+            feature_dim = X.shape[1] if X.ndim == 2 else 0
 
         # Get gesture names from first session (use display_name for nicer UI)
         gesture_set = sessions[0].gesture_set
@@ -209,16 +324,26 @@ class DataManager:
             "num_classes": len(np.unique(y)),
             "window_size_ms": window_size_ms,
             "window_stride_ms": window_stride_ms,
-            "num_channels": X.shape[2] if X.ndim > 2 else 1,
-            "window_samples": X.shape[1] if X.ndim > 1 else len(X),
+            "sampling_rate": sessions[0].metadata.sampling_rate if sessions else 2000,
+            "num_channels": raw_num_channels,
+            "window_samples": raw_window_samples,
             "label_names": label_names,
-            "sessions_used": [s.metadata.session_id for s in sessions]
+            "sessions_used": [s.metadata.session_id for s in sessions],
+            "calibration_applied": calibration is not None or use_per_session_rotation,
+            "calibration_rotation_offset": (
+                calibration.rotation_offset if calibration is not None else 0
+            ),
+            "per_session_rotation": use_per_session_rotation,
+            "session_rotation_offsets": per_session_rotations,
+            "features_extracted": features_extracted,
+            "feature_config": feature_config if feature_config else None,
+            "feature_dim": feature_dim,
         }
 
         dataset = {
             "X": X,
             "y": y,
-            "trial_ids": np.array(trial_ids),
+            "trial_ids": np.array(trial_id_list),
             "metadata": metadata
         }
 
@@ -247,12 +372,19 @@ class DataManager:
 
         return dataset_path
 
-    def load_dataset(self, name: str) -> Dict[str, Any]:
+    def load_dataset(
+        self,
+        name: str,
+        mmap: bool = False,
+    ) -> Dict[str, Any]:
         """
         Load a dataset from disk.
 
         Args:
             name: Name of the dataset
+            mmap: If True, memory-map the X array so only the pages
+                  that are actually accessed are loaded into RAM.
+                  Useful for very large datasets.
 
         Returns:
             Dataset dictionary
@@ -262,8 +394,10 @@ class DataManager:
         with open(dataset_path / "metadata.json", 'r') as f:
             metadata = json.load(f)
 
+        mmap_mode = "r" if mmap else None
+
         return {
-            "X": np.load(dataset_path / "X.npy"),
+            "X": np.load(dataset_path / "X.npy", mmap_mode=mmap_mode),
             "y": np.load(dataset_path / "y.npy"),
             "trial_ids": np.load(dataset_path / "trial_ids.npy"),
             "metadata": metadata
@@ -272,6 +406,23 @@ class DataManager:
     def list_datasets(self) -> List[str]:
         """List all available datasets."""
         return [d.name for d in self.datasets_dir.iterdir() if d.is_dir()]
+
+    def delete_dataset(self, name: str) -> bool:
+        """
+        Delete a dataset by name.
+
+        Args:
+            name: Name of the dataset to delete
+
+        Returns:
+            True if successfully deleted
+        """
+        import shutil
+        dataset_path = self.datasets_dir / name
+        if dataset_path.exists() and dataset_path.is_dir():
+            shutil.rmtree(dataset_path)
+            return True
+        return False
 
     def get_train_test_split(
         self,

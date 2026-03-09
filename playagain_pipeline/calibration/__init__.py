@@ -3,11 +3,13 @@
 from playagain_pipeline.calibration.calibrator import (
     CalibrationResult,
     CalibrationProcessor,
-    AutoCalibrator
+    AutoCalibrator,
+    backfill_session_rotations
 )
 
 __all__ = [
     "CalibrationResult",
     "CalibrationProcessor",
-    "AutoCalibrator"
+    "AutoCalibrator",
+    "backfill_session_rotations"
 ]

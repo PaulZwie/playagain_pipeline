@@ -231,7 +231,7 @@ def create_default_gesture_set() -> GestureSet:
     gesture_set.add_gesture(Gesture(
         name="tripod",
         display_name="Tripod",
-        description="Touch index, middle, and ring finger tips to your thumb tip.",
+        description="Touch index and middle finger to your thumb tip.",
         category=GestureCategory.FINGER,
         emoji="🤌🏻",
         duration_hint=3.0

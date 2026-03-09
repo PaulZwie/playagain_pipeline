@@ -12,13 +12,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional
 
+# Resolve local packages (device_interfaces, gui_custom_elements) via automatic
+# sibling-directory search so hard-coded Mac paths are no longer needed.
+from playagain_pipeline.utils.platform_utils import inject_local_packages, print_platform_info
+inject_local_packages()
+print_platform_info()
+
 import numpy as np
 from PySide6.QtCore import Qt, Slot, QTimer, QThread, Signal, QMutex, QMutexLocker
 from PySide6.QtGui import QFont, QAction
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QPushButton, QComboBox,
                                QLineEdit, QLabel, QGroupBox, QFormLayout, QSpinBox, QMessageBox, QFileDialog, QTextEdit,
                                QSplitter, QStatusBar, QListWidget, QScrollArea, QCheckBox,
-                               QGridLayout, QApplication, QMenuBar, QMenu, QDialog, QListWidgetItem)
+                               QGridLayout, QApplication, QDialog, QListWidgetItem)
 
 from playagain_pipeline.calibration.calibrator import AutoCalibrator
 from playagain_pipeline.config.config import get_default_config, PipelineConfig
@@ -26,13 +32,15 @@ from playagain_pipeline.core.data_manager import DataManager
 from playagain_pipeline.core.gesture import (create_default_gesture_set)
 from playagain_pipeline.core.session import RecordingSession
 from playagain_pipeline.devices.emg_device import (DeviceManager, DeviceType, SyntheticEMGDevice)
-from playagain_pipeline.gui.widgets.emg_plot import EMGPlotWindow
+from playagain_pipeline.gui.widgets.emg_plot import EMGPlotWidget
+from playagain_pipeline.gui.widgets.performance_tab import PerformanceReviewTab
 from playagain_pipeline.gui.widgets.protocol_widget import ProtocolWidget
 from playagain_pipeline.models.classifier import ModelManager, BaseClassifier
 from playagain_pipeline.protocols.protocol import (RecordingProtocol, ProtocolPhase,
                                                    create_quick_protocol, create_standard_protocol,
                                                    create_extended_protocol)
-from playagain_pipeline.prediction_server import PredictionServer
+from playagain_pipeline.prediction_server import PredictionServer, PredictionSmoother
+from playagain_pipeline.game_recorder import GameRecorder
 
 
 class PredictionWorker(QThread):
@@ -72,8 +80,11 @@ class PredictionWorker(QThread):
                     pred = self._model.predict(X)[0]
                     proba = self._model.predict_proba(X)[0]
                     self.prediction_ready.emit(pred, proba)
-                except Exception:
-                    pass
+                except Exception as e:
+                    # Log prediction errors (throttled to avoid spam)
+                    if not hasattr(self, '_last_error') or str(e) != self._last_error:
+                        self._last_error = str(e)
+                        print(f"[PredictionWorker] Prediction error: {e}")
 
             self.msleep(100)  # Cap at ~10 predictions/sec
 
@@ -86,6 +97,9 @@ class MainWindow(QMainWindow):
     """
     Main application window for gesture recording and prediction.
     """
+
+    # Thread-safe signal for prediction updates from the server's background thread
+    _server_prediction_signal = Signal(str, float)  # display_name, confidence
 
     def __init__(self):
         super().__init__()
@@ -119,15 +133,34 @@ class MainWindow(QMainWindow):
         # Unity prediction server
         self._prediction_server: Optional[PredictionServer] = None
 
-        # Plot window
-        self._plot_window: Optional[EMGPlotWindow] = None
+        # Game recorder for capturing gameplay data (EMG + predictions + ground truth)
+        self._game_recorder: Optional[GameRecorder] = None
+
+        # GUI-side prediction smoother (for display only; server has its own)
+        self._gui_smoother: Optional[PredictionSmoother] = None
+
+        # Plot widget
+        self._plot_widget: Optional[EMGPlotWidget] = None
 
         # Ground truth label for session replay
         self._current_ground_truth_label: Optional[str] = None
 
+        # Live quick calibration state
+        self._live_cal_active = False
+        self._live_cal_gestures: list = []
+        self._live_cal_current_idx = 0
+        self._live_cal_buffer: list = []        # accumulated EMG chunks for current gesture
+        self._live_cal_collected: dict = {}     # gesture -> np.ndarray
+        self._live_cal_timer: Optional[QTimer] = None
+        self._live_cal_countdown = 0
+        self._live_cal_remaining = 0
+
         # Setup UI
         self._setup_ui()
         self._setup_connections()
+
+        # Connect thread-safe server prediction signal to UI update
+        self._server_prediction_signal.connect(self._apply_server_prediction)
 
         # Status update timer
         self._status_timer = QTimer(self)
@@ -184,6 +217,10 @@ class MainWindow(QMainWindow):
         prediction_tab = self._create_prediction_tab()
         self.mode_tabs.addTab(prediction_tab, "Prediction")
 
+        # Performance Review tab
+        self._performance_tab = PerformanceReviewTab(self.data_manager)
+        self.mode_tabs.addTab(self._performance_tab, "Performance Review")
+
         left_layout.addWidget(self.mode_tabs)
 
         # Log area
@@ -191,7 +228,13 @@ class MainWindow(QMainWindow):
         log_layout = QVBoxLayout(log_group)
         self.log_text = QTextEdit()
         self.log_text.setReadOnly(True)
-        self.log_text.setMaximumHeight(150)
+        self.log_text.setMinimumHeight(200)
+        self.log_text.setMaximumHeight(300)
+        self.log_text.setStyleSheet(
+            "QTextEdit { font-family: monospace; font-size: 11px; "
+            "background-color: #1e1e1e; color: #d4d4d4; "
+            "border: 1px solid #444; border-radius: 3px; padding: 4px; }"
+        )
         log_layout.addWidget(self.log_text)
         left_layout.addWidget(log_group)
 
@@ -201,22 +244,16 @@ class MainWindow(QMainWindow):
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
 
-        # Button to open plot window
-        plot_btn_group = QGroupBox("EMG Visualization")
-        plot_btn_layout = QVBoxLayout(plot_btn_group)
+        # EMG Visualization Widget
+        plot_group = QGroupBox("EMG Visualization")
+        plot_layout = QVBoxLayout(plot_group)
 
-        self.open_plot_btn = QPushButton("Open Plot Window")
-        self.open_plot_btn.clicked.connect(self._on_open_plot_window)
-        self.open_plot_btn.setMinimumHeight(50)
-        plot_btn_layout.addWidget(self.open_plot_btn)
+        # Initialize with default settings, will be updated when device connects
+        self._plot_widget = EMGPlotWidget(num_channels=32, sampling_rate=2000)
+        self._plot_widget.bad_channels_updated.connect(self._on_bad_channels_updated)
+        plot_layout.addWidget(self._plot_widget)
 
-        plot_info = QLabel(
-            "Opens a separate window with real-time EMG signals\nand channel controls for easy toggling.")
-        plot_info.setWordWrap(True)
-        plot_info.setStyleSheet("color: gray; font-size: 11px;")
-        plot_btn_layout.addWidget(plot_info)
-
-        right_layout.addWidget(plot_btn_group)
+        right_layout.addWidget(plot_group, stretch=3)
 
         # Protocol display
         self.protocol_widget = ProtocolWidget()
@@ -288,38 +325,34 @@ class MainWindow(QMainWindow):
         self.session_id_combo.setEnabled(False)
         device_layout.addRow("Session:", self.session_id_combo)
 
-        # Excluded channels with checkboxes
-        # channels_group = QGroupBox("Channel Status (Uncheck to exclude)")
-        # channels_layout = QVBoxLayout(channels_group)
+        # Note: channel enable/disable is done via the checkboxes in the EMG plot
+        channel_note = QLabel("Channel Status: Use checkboxes in EMG plot to enable/disable channels")
+        channel_note.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
+        channel_note.setWordWrap(True)
+        device_layout.addRow(channel_note)
 
-        # Scrollable area for channel checkboxes
-        self._channels_scroll = QScrollArea()
-        self._channels_scroll.setWidgetResizable(True)
-        self._channels_scroll.setMaximumHeight(150)
+        # Bad channel handling mode
+        self.bad_channel_mode_combo = QComboBox()
+        self.bad_channel_mode_combo.addItems(["Zero bad channels", "Remove bad channels"])
+        self.bad_channel_mode_combo.setToolTip(
+            "Zero: keeps all channels but sets bad ones to 0 (preserves dimensionality).\n"
+            "Remove: physically drops bad channels from the data stream.\n"
+            "  Use Remove + a pretrained model with the MLP projection layer option\n"
+            "  in the Prediction tab to handle dimension mismatches."
+        )
+        device_layout.addRow("Bad Ch. Handling:", self.bad_channel_mode_combo)
 
-        self._channels_scroll_widget = QWidget()
-        self._channels_grid_layout = QGridLayout(self._channels_scroll_widget)
-        self._channels_grid_layout.setSpacing(5)
-
-        self.channel_checks = []
-        for i in range(32):  # Default 32 channels
-            check = QCheckBox(f"Ch {i + 1}")
-            check.setChecked(True)
-            self._channels_grid_layout.addWidget(check, i // 8, i % 8)
-            self.channel_checks.append(check)
-
-        # Add stretch to bottom of grid layout
-        self._channels_grid_layout.setRowStretch(4, 1)
-        self._channels_scroll.setWidget(self._channels_scroll_widget)
-        # channels_layout.addWidget(self._channels_scroll)
-        # device_layout.addRow(channels_group)
+        # Internal state for excluded channels (updated by plot widget signal)
+        self._excluded_channels: list[int] = []
 
         device_btn_layout = QHBoxLayout()
         self.connect_btn = QPushButton("Connect")
+        self.connect_btn.setFixedHeight(36)
         self.connect_btn.clicked.connect(self._on_connect_device)
         device_btn_layout.addWidget(self.connect_btn)
 
         self.disconnect_btn = QPushButton("Disconnect")
+        self.disconnect_btn.setFixedHeight(36)
         self.disconnect_btn.setEnabled(False)
         self.disconnect_btn.clicked.connect(self._on_disconnect_device)
         device_btn_layout.addWidget(self.disconnect_btn)
@@ -352,10 +385,12 @@ class MainWindow(QMainWindow):
         control_layout = QHBoxLayout(control_group)
 
         self.start_recording_btn = QPushButton("Start Recording")
+        self.start_recording_btn.setFixedHeight(36)
         self.start_recording_btn.clicked.connect(self._on_start_recording)
         control_layout.addWidget(self.start_recording_btn)
 
         self.stop_recording_btn = QPushButton("Stop Recording")
+        self.stop_recording_btn.setFixedHeight(36)
         self.stop_recording_btn.setEnabled(False)
         self.stop_recording_btn.clicked.connect(self._on_stop_recording)
         control_layout.addWidget(self.stop_recording_btn)
@@ -370,20 +405,28 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
+        # Create scroll area to prevent cramping on small screens
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+
         # Information about calibration
         info_group = QGroupBox("About Calibration")
         info_layout = QVBoxLayout(info_group)
 
         info_label = QLabel(
             "Calibration determines the electrode bracelet orientation by analyzing\n"
-            "EMG patterns from individual finger movements.\n\n"
-            "Single finger gestures produce distinct, localized muscle activation\n"
-            "patterns that help accurately detect electrode positioning."
+            "EMG activation patterns from your recorded sessions.\n\n"
+            "No separate calibration recording is needed — just select a\n"
+            "recording session and calibrate from its gesture data.\n\n"
+            "Save a calibration as reference, then future sessions can detect\n"
+            "how much the bracelet has rotated since the reference."
         )
         info_label.setWordWrap(True)
         info_label.setStyleSheet("color: #555; font-size: 11px;")
         info_layout.addWidget(info_label)
-        layout.addWidget(info_group)
+        scroll_layout.addWidget(info_group)
 
         # Calibration status
         status_group = QGroupBox("Calibration Status")
@@ -398,37 +441,177 @@ class MainWindow(QMainWindow):
         self.cal_rotation_label = QLabel("-")
         status_layout.addRow("Rotation Offset:", self.cal_rotation_label)
 
-        layout.addWidget(status_group)
+        # Sub-score breakdown (populated from calibration metadata)
+        self.cal_subscores_label = QLabel("-")
+        self.cal_subscores_label.setStyleSheet("color: #555; font-size: 10px;")
+        self.cal_subscores_label.setWordWrap(True)
+        status_layout.addRow("Score breakdown:", self.cal_subscores_label)
 
-        # Calibration controls
+        scroll_layout.addWidget(status_group)
+
+        # Calibrate from session
+        session_cal_group = QGroupBox("Calibrate from Recording Session")
+        session_cal_layout = QVBoxLayout(session_cal_group)
+
+        session_cal_info = QLabel(
+            "Select a recorded session to extract calibration patterns.\n"
+            "Multiple trials of each gesture are averaged for robustness."
+        )
+        session_cal_info.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
+        session_cal_layout.addWidget(session_cal_info)
+
+        session_select_layout = QFormLayout()
+        self.cal_subject_combo = QComboBox()
+        self.cal_subject_combo.currentTextChanged.connect(self._on_cal_subject_changed)
+        session_select_layout.addRow("Subject:", self.cal_subject_combo)
+
+        self.cal_session_combo = QComboBox()
+        session_select_layout.addRow("Session:", self.cal_session_combo)
+        session_cal_layout.addLayout(session_select_layout)
+
+        self.calibrate_from_session_btn = QPushButton("Calibrate from Session")
+        self.calibrate_from_session_btn.clicked.connect(self._on_calibrate_from_session)
+        self.calibrate_from_session_btn.setFixedHeight(36)
+        session_cal_layout.addWidget(self.calibrate_from_session_btn)
+
+        # Refresh button to reload subjects/sessions
+        self.cal_refresh_btn = QPushButton("Refresh Sessions")
+        self.cal_refresh_btn.setFixedHeight(36)
+        self.cal_refresh_btn.clicked.connect(self._refresh_cal_sessions)
+        session_cal_layout.addWidget(self.cal_refresh_btn)
+
+        scroll_layout.addWidget(session_cal_group)
+
+        # ── Live Quick Calibration (pretrained model workflow) ─────────────────
+        live_cal_group = QGroupBox("Live Quick Calibration (for pretrained models)")
+        live_cal_layout = QVBoxLayout(live_cal_group)
+
+        live_cal_info = QLabel(
+            "Detect bracelet rotation live without recording a session.\n"
+            "Hold each gesture for ~3 seconds when prompted.\n"
+            "Requires: device connected and streaming.\n\n"
+            "Optimal workflow:\n"
+            "  Connect Muovi → Live Calibrate → Load Model → Predict"
+        )
+        live_cal_info.setStyleSheet("color: #555; font-size: 10px;")
+        live_cal_info.setWordWrap(True)
+        live_cal_layout.addWidget(live_cal_info)
+
+        # Gesture list for live calibration
+        live_cal_gesture_layout = QFormLayout()
+        self.live_cal_gestures_edit = QLineEdit("open_hand, fist, index_point, rest")
+        self.live_cal_gestures_edit.setToolTip(
+            "Comma-separated list of gesture names to use for live calibration.\n"
+            "Must match the gestures the reference calibration was built from."
+        )
+        live_cal_gesture_layout.addRow("Gestures:", self.live_cal_gestures_edit)
+
+        self.live_cal_duration_spin = QSpinBox()
+        self.live_cal_duration_spin.setRange(1, 10)
+        self.live_cal_duration_spin.setValue(3)
+        self.live_cal_duration_spin.setSuffix(" s")
+        self.live_cal_duration_spin.setToolTip("How long to hold each gesture")
+        live_cal_gesture_layout.addRow("Hold duration:", self.live_cal_duration_spin)
+        live_cal_layout.addLayout(live_cal_gesture_layout)
+
+        # Progress label and start button
+        self.live_cal_status_label = QLabel("Ready")
+        self.live_cal_status_label.setStyleSheet("font-weight: bold; color: #333;")
+        live_cal_layout.addWidget(self.live_cal_status_label)
+
+        live_cal_btn_row = QHBoxLayout()
+        self.start_live_cal_btn = QPushButton("▶  Start Live Calibration")
+        self.start_live_cal_btn.setFixedHeight(36)
+        self.start_live_cal_btn.clicked.connect(self._on_start_live_calibration)
+        live_cal_btn_row.addWidget(self.start_live_cal_btn)
+
+        self.cancel_live_cal_btn = QPushButton("✕  Cancel")
+        self.cancel_live_cal_btn.setFixedHeight(36)
+        self.cancel_live_cal_btn.setEnabled(False)
+        self.cancel_live_cal_btn.clicked.connect(self._on_cancel_live_calibration)
+        live_cal_btn_row.addWidget(self.cancel_live_cal_btn)
+        live_cal_layout.addLayout(live_cal_btn_row)
+
+        scroll_layout.addWidget(live_cal_group)
         control_group = QGroupBox("Calibration Actions")
         control_layout = QVBoxLayout(control_group)
 
-        # Info about gestures used
-        gesture_info = QLabel(
-            "Gestures used: Rest, Index/Middle/Ring/Pinky/Thumb flex,\n"
-            "Index extend, Wrist flex"
-        )
-        gesture_info.setStyleSheet("color: #666; font-size: 10px; font-style: italic;")
-        control_layout.addWidget(gesture_info)
-
-        self.start_cal_btn = QPushButton("Start Calibration")
-        self.start_cal_btn.clicked.connect(self._on_start_calibration)
-        self.start_cal_btn.setMinimumHeight(40)
-        control_layout.addWidget(self.start_cal_btn)
-
         self.save_ref_btn = QPushButton("Save as Reference")
+        self.save_ref_btn.setFixedHeight(36)
         self.save_ref_btn.setEnabled(False)
         self.save_ref_btn.clicked.connect(self._on_save_reference)
         control_layout.addWidget(self.save_ref_btn)
 
+        self.save_ref_recompute_btn = QPushButton("Set as Reference && Recompute All Rotations")
+        self.save_ref_recompute_btn.setFixedHeight(36)
+        self.save_ref_recompute_btn.setEnabled(False)
+        self.save_ref_recompute_btn.setToolTip(
+            "Save this calibration as the new reference and re-detect\n"
+            "bracelet rotation for ALL existing sessions relative to it."
+        )
+        self.save_ref_recompute_btn.clicked.connect(self._on_save_reference_and_recompute)
+        control_layout.addWidget(self.save_ref_recompute_btn)
+
         self.load_cal_btn = QPushButton("Load Calibration...")
+        self.load_cal_btn.setFixedHeight(36)
         self.load_cal_btn.clicked.connect(self._on_load_calibration)
         control_layout.addWidget(self.load_cal_btn)
 
-        layout.addWidget(control_group)
+        scroll_layout.addWidget(control_group)
 
-        layout.addStretch()
+        # Manual rotation override (use pretrained model without recording)
+        manual_group = QGroupBox("Manual Rotation Override")
+        manual_layout = QVBoxLayout(manual_group)
+
+        manual_info = QLabel(
+            "Set a rotation offset manually when using a pretrained model\n"
+            "without recording. Set to 0 for no rotation correction.\n"
+            "Recording sessions will still auto-detect rotation."
+        )
+        manual_info.setWordWrap(True)
+        manual_info.setStyleSheet("color: #555; font-size: 10px;")
+        manual_layout.addWidget(manual_info)
+
+        manual_form = QFormLayout()
+        self.manual_rotation_spin = QSpinBox()
+        self.manual_rotation_spin.setRange(-16, 16)
+        self.manual_rotation_spin.setValue(0)
+        self.manual_rotation_spin.setSuffix(" ch")
+        manual_form.addRow("Rotation Offset:", self.manual_rotation_spin)
+        manual_layout.addLayout(manual_form)
+
+        self.apply_manual_rot_btn = QPushButton("Apply Manual Rotation")
+        self.apply_manual_rot_btn.setFixedHeight(36)
+        self.apply_manual_rot_btn.clicked.connect(self._on_apply_manual_rotation)
+        manual_layout.addWidget(self.apply_manual_rot_btn)
+
+        self.clear_cal_btn = QPushButton("Clear Calibration (No Rotation)")
+        self.clear_cal_btn.setFixedHeight(36)
+        self.clear_cal_btn.clicked.connect(self._on_clear_calibration)
+        manual_layout.addWidget(self.clear_cal_btn)
+
+        scroll_layout.addWidget(manual_group)
+
+        # Bracelet orientation graphic
+        from playagain_pipeline.gui.widgets.bracelet_graphic import BraceletGraphicWidget
+        bracelet_group = QGroupBox("Bracelet Orientation")
+        bracelet_layout = QVBoxLayout(bracelet_group)
+        self.bracelet_graphic = BraceletGraphicWidget(
+            num_electrodes=self.channels_spin.value(),
+            rotation_offset=0,
+        )
+        # Set minimum height for bracelet graphic to ensure it doesn't get squashed
+        self.bracelet_graphic.setMinimumHeight(200)
+        bracelet_layout.addWidget(self.bracelet_graphic)
+        scroll_layout.addWidget(bracelet_group)
+
+        scroll_layout.addStretch()
+        scroll.setWidget(scroll_content)
+        layout.addWidget(scroll)
+
+        # Populate session combos on first show
+        QTimer.singleShot(100, self._refresh_cal_sessions)
+
         return tab
 
     def _create_training_tab(self) -> QWidget:
@@ -441,15 +624,24 @@ class MainWindow(QMainWindow):
         dataset_layout = QVBoxLayout(dataset_group)
 
         self.refresh_datasets_btn = QPushButton("Refresh")
+        self.refresh_datasets_btn.setFixedHeight(36)
         self.refresh_datasets_btn.clicked.connect(self._refresh_datasets)
         dataset_layout.addWidget(self.refresh_datasets_btn)
 
         self.dataset_list = QListWidget()
+        self.dataset_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         dataset_layout.addWidget(self.dataset_list)
 
         self.create_dataset_btn = QPushButton("Create Dataset from Sessions...")
+        self.create_dataset_btn.setFixedHeight(36)
         self.create_dataset_btn.clicked.connect(self._on_create_dataset)
         dataset_layout.addWidget(self.create_dataset_btn)
+
+        self.delete_dataset_btn = QPushButton("Delete Selected Dataset(s)")
+        self.delete_dataset_btn.setFixedHeight(36)
+        self.delete_dataset_btn.clicked.connect(self._on_delete_dataset)
+        self.delete_dataset_btn.setStyleSheet("QPushButton { color: red; }")
+        dataset_layout.addWidget(self.delete_dataset_btn)
 
         layout.addWidget(dataset_group)
 
@@ -458,11 +650,12 @@ class MainWindow(QMainWindow):
         model_layout = QFormLayout(model_group)
 
         self.model_type_combo = QComboBox()
-        self.model_type_combo.addItems(["SVM", "Random Forest", "LDA", "CatBoost", "MLP", "CNN", "AttentionNet"])
+        self.model_type_combo.addItems(["SVM", "Random Forest", "LDA", "CatBoost", "MLP", "CNN", "AttentionNet", "MSTNet"])
         model_layout.addRow("Model Type:", self.model_type_combo)
 
         train_btn_layout = QHBoxLayout()
         self.train_btn = QPushButton("Train Model")
+        self.train_btn.setFixedHeight(36)
         self.train_btn.clicked.connect(self._on_train_model)
         train_btn_layout.addWidget(self.train_btn)
         model_layout.addRow(train_btn_layout)
@@ -474,11 +667,19 @@ class MainWindow(QMainWindow):
         models_layout = QVBoxLayout(models_group)
 
         self.models_list = QListWidget()
+        self.models_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         models_layout.addWidget(self.models_list)
 
         self.refresh_models_btn = QPushButton("Refresh")
+        self.refresh_models_btn.setFixedHeight(36)
         self.refresh_models_btn.clicked.connect(self._refresh_models)
         models_layout.addWidget(self.refresh_models_btn)
+
+        self.delete_model_btn = QPushButton("Delete Selected Model(s)")
+        self.delete_model_btn.setFixedHeight(36)
+        self.delete_model_btn.clicked.connect(self._on_delete_model)
+        self.delete_model_btn.setStyleSheet("QPushButton { color: red; }")
+        models_layout.addWidget(self.delete_model_btn)
 
         layout.addWidget(models_group)
 
@@ -490,6 +691,12 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
+        # Wrap everything in a scroll area so it fits
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+
         # Model selection
         model_group = QGroupBox("Model")
         model_layout = QFormLayout(model_group)
@@ -498,10 +705,36 @@ class MainWindow(QMainWindow):
         model_layout.addRow("Model:", self.pred_model_combo)
 
         self.load_model_btn = QPushButton("Load Model")
+        self.load_model_btn.setFixedHeight(36)
         self.load_model_btn.clicked.connect(self._on_load_model)
         model_layout.addRow(self.load_model_btn)
 
-        layout.addWidget(model_group)
+        # MLP projection layer for channel mismatch (used with "Remove bad channels" mode)
+        self.use_mlp_projection_cb = QCheckBox("Use MLP projection layer for channel mismatch")
+        self.use_mlp_projection_cb.setChecked(True)
+        self.use_mlp_projection_cb.setToolTip(
+            "When 'Remove bad channels' mode is active, the input to the model\n"
+            "may have fewer channels than it was trained on. This option inserts\n"
+            "a small MLP layer that projects from the reduced channel count back\n"
+            "to the expected input size, enabling pretrained models to be used\n"
+            "even when some channels are excluded."
+        )
+        model_layout.addRow(self.use_mlp_projection_cb)
+
+        # Pretrained model workflow guide
+        pretrained_info = QLabel(
+            "Pretrained model workflow:\n"
+            "  1. Connect device (Recording tab)\n"
+            "  2. Calibrate or set manual rotation (Calibration tab)\n"
+            "  3. Load a pretrained model here\n"
+            "  4. Start Prediction — no recording needed"
+        )
+        pretrained_info.setStyleSheet("color: #555; font-size: 10px; background: #f5f5f5; "
+                                      "padding: 4px; border-radius: 3px;")
+        pretrained_info.setWordWrap(True)
+        model_layout.addRow(pretrained_info)
+
+        scroll_layout.addWidget(model_group)
 
         # Prediction display
         pred_group = QGroupBox("Prediction")
@@ -519,24 +752,61 @@ class MainWindow(QMainWindow):
         self.confidence_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         pred_layout.addWidget(self.confidence_label)
 
-        layout.addWidget(pred_group)
+        scroll_layout.addWidget(pred_group)
 
         # Prediction controls
         control_group = QGroupBox("Controls")
         control_layout = QHBoxLayout(control_group)
 
         self.start_pred_btn = QPushButton("Start Prediction")
+        self.start_pred_btn.setFixedHeight(36)
         self.start_pred_btn.clicked.connect(self._on_start_prediction)
         control_layout.addWidget(self.start_pred_btn)
 
         self.stop_pred_btn = QPushButton("Stop Prediction")
+        self.stop_pred_btn.setFixedHeight(36)
         self.stop_pred_btn.setEnabled(False)
         self.stop_pred_btn.clicked.connect(self._on_stop_prediction)
         control_layout.addWidget(self.stop_pred_btn)
 
-        layout.addWidget(control_group)
+        scroll_layout.addWidget(control_group)
 
-        # Unity TCP Server
+        # ── Prediction Smoothing ──────────────────────────────────────────
+        smoothing_group = QGroupBox("Prediction Smoothing")
+        smoothing_layout = QFormLayout(smoothing_group)
+
+        self.smoothing_enabled_cb = QCheckBox("Enable Smoothing")
+        self.smoothing_enabled_cb.setChecked(True)
+        self.smoothing_enabled_cb.toggled.connect(self._on_smoothing_toggled)
+        smoothing_layout.addRow(self.smoothing_enabled_cb)
+
+        self.smoothing_alpha_spin = QSpinBox()
+        self.smoothing_alpha_spin.setRange(5, 100)
+        self.smoothing_alpha_spin.setValue(30)
+        self.smoothing_alpha_spin.setSuffix("%")
+        self.smoothing_alpha_spin.setToolTip(
+            "EMA weight for new predictions (lower = smoother, slower response)")
+        self.smoothing_alpha_spin.valueChanged.connect(self._on_smoothing_params_changed)
+        smoothing_layout.addRow("Alpha:", self.smoothing_alpha_spin)
+
+        self.smoothing_stability_spin = QSpinBox()
+        self.smoothing_stability_spin.setRange(0, 2000)
+        self.smoothing_stability_spin.setValue(300)
+        self.smoothing_stability_spin.setSuffix(" ms")
+        self.smoothing_stability_spin.setToolTip(
+            "Minimum time a new gesture must be predicted before switching (Grace Time)")
+        self.smoothing_stability_spin.valueChanged.connect(self._on_smoothing_params_changed)
+        smoothing_layout.addRow("Stability Window:", self.smoothing_stability_spin)
+
+        smoothing_info = QLabel(
+            "Smoothing prevents brief misclassifications from affecting\n"
+            "the game. Increase stability for more robust predictions.")
+        smoothing_info.setStyleSheet("color: gray; font-size: 10px;")
+        smoothing_layout.addRow(smoothing_info)
+
+        scroll_layout.addWidget(smoothing_group)
+
+        # ── Unity TCP Server ──────────────────────────────────────────────
         server_group = QGroupBox("Unity TCP Server")
         server_layout = QVBoxLayout(server_group)
 
@@ -554,10 +824,12 @@ class MainWindow(QMainWindow):
 
         server_btn_layout = QHBoxLayout()
         self.start_server_btn = QPushButton("Start Server")
+        self.start_server_btn.setFixedHeight(36)
         self.start_server_btn.clicked.connect(self._on_start_server)
         server_btn_layout.addWidget(self.start_server_btn)
 
         self.stop_server_btn = QPushButton("Stop Server")
+        self.stop_server_btn.setFixedHeight(36)
         self.stop_server_btn.setEnabled(False)
         self.stop_server_btn.clicked.connect(self._on_stop_server)
         server_btn_layout.addWidget(self.stop_server_btn)
@@ -566,9 +838,52 @@ class MainWindow(QMainWindow):
         self.server_status_label = QLabel("Server: Not running")
         server_layout.addWidget(self.server_status_label)
 
-        layout.addWidget(server_group)
+        scroll_layout.addWidget(server_group)
 
-        layout.addStretch()
+        # ── Game Recording ────────────────────────────────────────────────
+        game_rec_group = QGroupBox("Game Recording")
+        game_rec_layout = QVBoxLayout(game_rec_group)
+
+        game_rec_info = QLabel(
+            "Record EMG data, model predictions, and game ground truth\n"
+            "(requested gesture, camera state) to CSV during gameplay.\n"
+            "Requires Unity TCP Server to be running.")
+        game_rec_info.setStyleSheet("color: #555; font-size: 10px;")
+        game_rec_info.setWordWrap(True)
+        game_rec_layout.addWidget(game_rec_info)
+
+        game_rec_config = QFormLayout()
+        self.game_rec_subject_edit = QLineEdit()
+        self.game_rec_subject_edit.setPlaceholderText("e.g., VP_01")
+        game_rec_config.addRow("Subject ID:", self.game_rec_subject_edit)
+
+        self.game_rec_session_edit = QLineEdit()
+        self.game_rec_session_edit.setPlaceholderText("Optional session name")
+        game_rec_config.addRow("Session Name:", self.game_rec_session_edit)
+        game_rec_layout.addLayout(game_rec_config)
+
+        game_rec_btn_layout = QHBoxLayout()
+        self.start_game_rec_btn = QPushButton("Start Game Recording")
+        self.start_game_rec_btn.setFixedHeight(36)
+        self.start_game_rec_btn.clicked.connect(self._on_start_game_recording)
+        game_rec_btn_layout.addWidget(self.start_game_rec_btn)
+
+        self.stop_game_rec_btn = QPushButton("Stop Game Recording")
+        self.stop_game_rec_btn.setFixedHeight(36)
+        self.stop_game_rec_btn.setEnabled(False)
+        self.stop_game_rec_btn.clicked.connect(self._on_stop_game_recording)
+        game_rec_btn_layout.addWidget(self.stop_game_rec_btn)
+        game_rec_layout.addLayout(game_rec_btn_layout)
+
+        self.game_rec_status_label = QLabel("Game Recording: Idle")
+        self.game_rec_status_label.setStyleSheet("font-weight: bold;")
+        game_rec_layout.addWidget(self.game_rec_status_label)
+
+        scroll_layout.addWidget(game_rec_group)
+
+        scroll_layout.addStretch()
+        scroll.setWidget(scroll_content)
+        layout.addWidget(scroll)
         return tab
 
     def _setup_menu_bar(self):
@@ -626,39 +941,32 @@ class MainWindow(QMainWindow):
         self.protocol_widget.protocol_completed.connect(self._on_protocol_completed)
 
     def _log(self, message: str):
-        """Add message to log."""
+        """Add message to log with color coding."""
         timestamp = datetime.now().strftime("%H:%M:%S")
-        self.log_text.append(f"[{timestamp}] {message}")
-
-    @Slot()
-    def _on_open_plot_window(self):
-        """Open the plot window."""
-        if self._plot_window is None or not self._plot_window.isVisible():
-            device = self.device_manager.device
-            num_channels = device.num_channels if device else 32
-            sampling_rate = device.sampling_rate if device else 2000
-
-            self._plot_window = EMGPlotWindow(num_channels=num_channels, sampling_rate=sampling_rate, parent=None)
-            self._plot_window.closed.connect(self._on_plot_window_closed)
-            self._plot_window.show()
-
-            # If we have a current ground truth (session replay), set it
-            if hasattr(self, '_current_ground_truth_label') and self._current_ground_truth_label:
-                self._plot_window.set_ground_truth(self._current_ground_truth_label)
-
-            self._log("Opened plot window")
+        # Color-code by content keywords for quick visual scanning
+        if any(k in message.lower() for k in ("error", "failed", "critical")):
+            color = "#f48771"   # red-ish
+        elif any(k in message.lower() for k in ("warning", "mismatch", "skipped")):
+            color = "#e5c07b"   # amber
+        elif any(k in message.lower() for k in ("complete", "success", "loaded", "saved", "started", "connected")):
+            color = "#98c379"   # green
         else:
-            self._plot_window.raise_()
-            self._plot_window.activateWindow()
+            color = "#d4d4d4"   # default light grey
+        ts_html = f'<span style="color:#858585;">[{timestamp}]</span>'
+        msg_html = f'<span style="color:{color};">{message}</span>'
+        self.log_text.append(f"{ts_html} {msg_html}")
 
-    @Slot()
-    def _on_plot_window_closed(self):
-        """Handle plot window close."""
-        self._log("Plot window closed")
-        self._plot_window = None
+
+
+
 
     def closeEvent(self, event):
         """Handle window close."""
+        # Stop game recording if active
+        if self._game_recorder and self._game_recorder.is_recording:
+            self._game_recorder.stop_recording()
+            self._game_recorder = None
+
         # Stop prediction server if running
         if self._prediction_server:
             self._prediction_server.stop()
@@ -802,7 +1110,7 @@ class MainWindow(QMainWindow):
             from playagain_pipeline.gui.widgets.training_dialog import TrainingProgressDialog
 
             # Get available model types
-            available_models = ["SVM", "CatBoost", "Random Forest", "LDA", "MLP", "CNN", "AttentionNet"]
+            available_models = ["SVM", "CatBoost", "Random Forest", "LDA", "MLP", "CNN", "AttentionNet", "MSTNet"]
 
             # Create dialog without pre-selected dataset/model to enable selection
             dialog = TrainingProgressDialog(
@@ -845,18 +1153,23 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_bracelet_visualization(self):
         """Open standalone bracelet visualization."""
-        from playagain_pipeline.gui.widgets.config_dialog import BraceletVisualizationWidget
+        from playagain_pipeline.gui.widgets.bracelet_graphic import BraceletGraphicWidget
 
         # Create a simple dialog container
         dialog = QDialog(self)
         dialog.setWindowTitle("Bracelet Visualization")
-        dialog.setMinimumSize(400, 400)
+        dialog.setMinimumSize(450, 450)
 
         layout = QVBoxLayout(dialog)
 
-        viz = BraceletVisualizationWidget(num_electrodes=self.channels_spin.value())
-        if self.calibrator and self.calibrator.current_calibration:
-            viz.set_rotation(self.calibrator.current_calibration.rotation_offset)
+        viz = BraceletGraphicWidget(
+            num_electrodes=self.channels_spin.value(),
+            rotation_offset=(
+                self.calibrator.current_calibration.rotation_offset
+                if self.calibrator and self.calibrator.current_calibration
+                else 0
+            ),
+        )
 
         layout.addWidget(viz)
 
@@ -892,6 +1205,10 @@ class MainWindow(QMainWindow):
                     "session_id": self.session_id_combo.currentText(), "data_dir": str(self.data_dir)})
 
             device = self.device_manager.create_device(device_type, **kwargs)
+
+            # Update calibrator to use the actual device channel count (adaptive)
+            # This fixes the issue when bad channels are removed and fewer channels are available
+            self.calibrator.processor.num_channels = device.num_channels
 
             # Update channel checkboxes based on device channel count
             self._update_channel_checkboxes(device.num_channels)
@@ -972,9 +1289,9 @@ class MainWindow(QMainWindow):
         # Store the current ground truth for when plot window opens
         self._current_ground_truth_label = label
 
-        # Forward to plot window if open
-        if self._plot_window and self._plot_window.isVisible():
-            self._plot_window.set_ground_truth(label)
+        # Forward to plot widget
+        if self._plot_widget and self._plot_widget.isVisible():
+            self._plot_widget.set_ground_truth(label)
 
     @Slot()
     def _on_disconnect_device(self):
@@ -987,36 +1304,76 @@ class MainWindow(QMainWindow):
     @Slot(np.ndarray)
     def _on_data_received(self, data: np.ndarray):
         """Handle incoming EMG data."""
-        # Filter out excluded channels (keep only checked channels)
-        excluded = self._get_excluded_channels()
-        if excluded:
-            # Create mask for channels to keep (inverse of excluded)
-            keep_mask = np.ones(data.shape[1], dtype=bool)
-            for ch_idx in excluded:
-                if ch_idx < len(keep_mask):
-                    keep_mask[ch_idx] = False
-            data = data[:, keep_mask]
+        bad_channels = self._get_excluded_channels()
+        remove_mode = self.bad_channel_mode_combo.currentText() == "Remove bad channels"
+        original_channels = data.shape[1]
 
-        # Update plot window if open
-        if self._plot_window and self._plot_window.isVisible():
-            # Update plot channel count if changed
-            if data.shape[1] != self._plot_window.num_channels:
-                self._plot_window.set_num_channels(data.shape[1])
+        # Always show ALL channels in the plot (including bad ones) so the
+        # checkbox state is not reset by reconfiguring the plot widget.
+        # Bad-channel removal only affects downstream consumers (prediction,
+        # recording, server).
+        if self._plot_widget and self._plot_widget.isVisible():
+            if data.shape[1] != self._plot_widget.num_channels:
+                old_ch = self._plot_widget.num_channels
+                self._plot_widget.set_num_channels(data.shape[1])
+                self._log(f"Plot display reconfigured: {old_ch} -> {data.shape[1]} channels")
+            self._plot_widget.update_data(data)
 
-            # Update plot
-            self._plot_window.update_data(data)
+        # Build downstream data with bad channels handled
+        downstream_data = data
+        if bad_channels:
+            downstream_data = data.copy()
+            if remove_mode:
+                # Physically remove bad channels for downstream consumers only
+                keep_mask = [i for i in range(data.shape[1]) if i not in bad_channels]
+                downstream_data = downstream_data[:, keep_mask] if keep_mask else downstream_data
+                # Log channel removal for user awareness (throttled to avoid spam)
+                if not hasattr(self, '_last_channel_warning'):
+                    self._last_channel_warning = 0
+                from time import time
+                if time() - self._last_channel_warning > 5.0:  # Log every 5 seconds max
+                    self._log(f"Removed {len(bad_channels)} bad channel(s): {bad_channels}. "
+                             f"Downstream data has {downstream_data.shape[1]}/{original_channels} channels.")
+                    self._last_channel_warning = time()
+            else:
+                # Zero-out bad channels (keep all channels to preserve dimensionality)
+                for ch_idx in bad_channels:
+                    if ch_idx < downstream_data.shape[1]:
+                        downstream_data[:, ch_idx] = 0.0
 
-        # Record if session is active
+        # Apply calibration channel reordering for prediction/server
+        # (not for raw plot or session recording — those stay in physical order)
+        calibrated_data = downstream_data
+        if self.calibrator.current_calibration is not None:
+            try:
+                calibrated_data = self.calibrator.current_calibration.apply_to_data(downstream_data)
+            except ValueError:
+                calibrated_data = downstream_data  # Channel mismatch — skip
+
+        # Record if session is active (raw data — calibration applied at dataset creation)
         if self._current_session and self._current_session.is_recording:
             self._current_session.add_data(data)
 
-        # Predict if enabled
-        if self._is_predicting and self._current_model:
-            self._update_prediction_buffer(data)
+        # Feed calibrated data to Unity TCP server if running.
+        # The server now runs prediction on its own background thread,
+        # so this call returns immediately without blocking the GUI.
+        server_active = (self._prediction_server is not None
+                         and self._prediction_server.is_running)
+        if server_active:
+            self._prediction_server.on_emg_data(calibrated_data)
 
-        # Feed data to Unity TCP server if running
-        if self._prediction_server and self._prediction_server.is_running:
-            self._prediction_server.on_emg_data(data)
+        # Only use the separate PredictionWorker when the server is NOT running
+        # to avoid running inference twice on the same data.
+        if self._is_predicting and self._current_model and not server_active:
+            self._update_prediction_buffer(calibrated_data)
+
+        # Feed raw data to game recorder (records physical channels)
+        if self._game_recorder and self._game_recorder.is_recording:
+            self._game_recorder.on_emg_data(data)
+
+        # Accumulate raw data for live calibration (uses physical channel order)
+        if self._live_cal_active:
+            self._live_cal_buffer.append(data.copy())
 
     # Recording handlers
     @Slot()
@@ -1050,14 +1407,16 @@ class MainWindow(QMainWindow):
         n_rep = protocol_config.repetitions_per_gesture
         session_id = f"{timestamp}_{n_rep}rep"
 
-        # Determine actual number of channels after exclusion
-        excluded = self._get_excluded_channels()
-        actual_channels = device.num_channels - len(excluded)
+        # Determine actual number of channels (all channels kept, bad ones zeroed)
+        bad_channels = self._get_excluded_channels()
+        actual_channels = device.num_channels
 
         self._current_session = RecordingSession(session_id=session_id, subject_id=self.subject_id_edit.text(),
             device_name=device.config.device_type.name, num_channels=actual_channels,
             sampling_rate=device.sampling_rate, gesture_set=gesture_set, protocol_name=protocol_config.name)
         self._current_session.metadata.notes = self.session_notes_edit.text()
+        # Store bad channels in session metadata from the start
+        self._current_session.metadata.bad_channels = bad_channels
 
         # Setup protocol widget
         self.protocol_widget.set_protocol(self._current_protocol)
@@ -1077,7 +1436,31 @@ class MainWindow(QMainWindow):
             self._current_session.stop_recording()
             self.protocol_widget.stop()
 
-            # Save session
+            # Store bad channels in session metadata
+            bad_channels = self._get_excluded_channels()
+            if bad_channels:
+                self._current_session.metadata.bad_channels = bad_channels
+                self._log(f"Marked {len(bad_channels)} bad channels: {bad_channels}")
+
+            # Auto-detect bracelet rotation before saving
+            try:
+                cal_result = self.calibrator.detect_session_rotation(
+                    self._current_session, save_to_metadata=True
+                )
+                if cal_result is not None:
+                    rot = cal_result.rotation_offset
+                    conf = cal_result.confidence
+                    self._log(f"Auto-detected rotation: {rot} channels "
+                              f"(confidence: {conf:.0%})")
+                    if not self.calibrator.has_reference:
+                        self.calibrator.save_as_reference(cal_result)
+                        self._log("Saved as reference calibration (first session)")
+                else:
+                    self._log("Rotation detection skipped (not enough gesture data)")
+            except Exception as e:
+                self._log(f"Rotation detection failed: {e}")
+
+            # Save session (now includes rotation metadata)
             path = self.data_manager.save_session(self._current_session)
             self._log(f"Saved session to {path}")
 
@@ -1095,6 +1478,12 @@ class MainWindow(QMainWindow):
                 self._current_session.end_trial()
                 self._log(f"Trial recorded: {step.gesture.display_name}")
 
+        # End rest trial when REST phase completes
+        if step.phase == ProtocolPhase.REST and step.is_recording:
+            if self._current_session:
+                self._current_session.end_trial()
+                self._log(f"Rest trial recorded (between gestures)")
+
         # Update synthetic device gesture during CUE
         if step.phase == ProtocolPhase.CUE and step.gesture:
             device = self.device_manager.device
@@ -1109,6 +1498,12 @@ class MainWindow(QMainWindow):
             if self._current_session:
                 self._current_session.start_trial(step.gesture.name)
 
+        # Start rest trial at beginning of REST phase
+        # This automatically uses the pause between gestures as rest training data
+        if step.phase == ProtocolPhase.REST and step.is_recording:
+            if self._current_session:
+                self._current_session.start_trial("rest")
+
     @Slot()
     def _on_protocol_completed(self):
         """Handle protocol completion."""
@@ -1117,30 +1512,106 @@ class MainWindow(QMainWindow):
         QMessageBox.information(self, "Complete", "Recording protocol completed!")
 
     # Calibration handlers
+    def _refresh_cal_sessions(self):
+        """Refresh the subject and session combos in the calibration tab."""
+        self.cal_subject_combo.blockSignals(True)
+        self.cal_subject_combo.clear()
+        subjects = self.data_manager.list_subjects()
+        self.cal_subject_combo.addItems(subjects)
+        self.cal_subject_combo.blockSignals(False)
+
+        # Trigger session reload for current subject
+        if subjects:
+            self._on_cal_subject_changed(self.cal_subject_combo.currentText())
+
+    def _on_cal_subject_changed(self, subject: str):
+        """Load sessions for the selected calibration subject."""
+        self.cal_session_combo.clear()
+        if not subject:
+            return
+        sessions = self.data_manager.list_sessions(subject)
+        self.cal_session_combo.addItems(sessions)
+        if sessions:
+            self.cal_session_combo.setCurrentText(sessions[-1])
+
     @Slot()
-    def _on_start_calibration(self):
-        """Start calibration protocol."""
-        if not self.device_manager.device or not self.device_manager.device.is_streaming:
-            QMessageBox.warning(self, "Warning", "Please connect a device and start streaming first.")
+    def _on_calibrate_from_session(self):
+        """Calibrate from a normal recording session (no separate recording needed)."""
+        subject = self.cal_subject_combo.currentText()
+        session_id = self.cal_session_combo.currentText()
+
+        if not subject or not session_id:
+            QMessageBox.warning(self, "Warning",
+                                "Please select a subject and session to calibrate from.\n"
+                                "Record a session first if none are available.")
             return
 
-        # Show calibration dialog
-        from playagain_pipeline.gui.widgets.calibration_dialog import CalibrationDialog
+        try:
+            self._log(f"Loading session {subject}/{session_id} for calibration...")
+            session = self.data_manager.load_session(subject, session_id)
 
-        dialog = CalibrationDialog(
-            calibrator=self.calibrator,
-            device=self.device_manager.device,
-            parent=self
-        )
+            if not session.trials:
+                QMessageBox.warning(self, "Warning",
+                                    "Selected session has no recorded trials.\n"
+                                    "Please select a session with gesture recordings.")
+                return
 
-        if dialog.exec():
-            # Get the calibration result
-            result = dialog.get_calibration_result()
-            if result:
-                self.calibrator._current_calibration = result
-                self._update_calibration_display()
-                self._log(f"✓ Calibration completed - Rotation offset: {result.rotation_offset} channels, "
-                         f"Confidence: {result.confidence:.2%}")
+            # Update calibrator to use the session's actual channel count (adaptive)
+            # This ensures it works correctly even when bad channels were removed
+            self.calibrator.processor.num_channels = session.metadata.num_channels
+
+            # Show which gestures were found
+            gesture_names = set(t.gesture_name for t in session.get_valid_trials())
+            self._log(f"Found gestures: {', '.join(sorted(gesture_names))}")
+            self._log(f"Total valid trials: {len(session.get_valid_trials())}")
+
+            # Run calibration from the session data
+            result = self.calibrator.calibrate_from_session(session)
+
+            self._update_calibration_display()
+            self._log(f"Calibration completed from session '{session_id}'")
+            self._log(f"  Rotation offset: {result.rotation_offset} channels")
+            self._log(f"  Confidence: {result.confidence:.2%}")
+
+            # Show per-gesture confidence if available
+            per_gesture = result.metadata.get("per_gesture_confidence", {})
+            if per_gesture:
+                for gesture, conf in sorted(per_gesture.items()):
+                    self._log(f"  {gesture}: {conf:.2%}")
+
+            # Check if reference was incompatible
+            incompat = result.metadata.get("reference_incompatible")
+            if incompat:
+                self._log(f"  Warning - Reference was incompatible: {incompat}")
+                self._log(f"  Saving this session as the new reference.")
+                # Auto-save as new reference since the old one is useless
+                self.calibrator.save_as_reference(result)
+                QMessageBox.information(self, "New Reference Saved",
+                    f"Calibration from session '{session_id}' complete!\n\n"
+                    f"The previous reference calibration was incompatible:\n"
+                    f"{incompat}\n\n"
+                    f"This session has been saved as the new reference.\n"
+                    f"Future sessions with the same gestures will detect\n"
+                    f"bracelet rotation relative to this recording.")
+            elif not self.calibrator.has_reference:
+                self._log(f"  No reference found. Saving as reference.")
+                self.calibrator.save_as_reference(result)
+                QMessageBox.information(self, "Reference Saved",
+                    f"Calibration from session '{session_id}' complete!\n\n"
+                    f"No existing reference was found, so this session has\n"
+                    f"been saved as the new reference calibration.\n\n"
+                    f"Future sessions will detect bracelet rotation\n"
+                    f"relative to this recording.")
+            else:
+                QMessageBox.information(self, "Calibration Complete",
+                    f"Calibration from session '{session_id}' complete!\n\n"
+                    f"Rotation offset: {result.rotation_offset} channels\n"
+                    f"Confidence: {result.confidence:.2%}\n\n"
+                    f"Save as reference to use for future sessions.")
+
+        except Exception as e:
+            self._log(f"Calibration error: {e}")
+            QMessageBox.critical(self, "Error", f"Calibration failed: {e}")
 
     @Slot()
     def _on_save_reference(self):
@@ -1148,6 +1619,26 @@ class MainWindow(QMainWindow):
         if self.calibrator.current_calibration:
             self.calibrator.save_as_reference(self.calibrator.current_calibration)
             self._log("Saved calibration as reference")
+
+    @Slot()
+    def _on_save_reference_and_recompute(self):
+        """Save current calibration as reference and recompute all session rotations."""
+        if self.calibrator.current_calibration:
+            self._log("Setting new reference and recomputing all session rotations...")
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                from playagain_pipeline.calibration.calibrator import backfill_session_rotations
+                self.calibrator.save_as_reference(
+                    self.calibrator.current_calibration,
+                    recompute_all=True,
+                    data_dir=self.data_dir,
+                )
+                self._log("All session rotations recomputed relative to new reference")
+                self._update_calibration_display()
+            except Exception as e:
+                self._log(f"Error recomputing rotations: {e}")
+            finally:
+                QApplication.restoreOverrideCursor()
 
     @Slot()
     def _on_load_calibration(self):
@@ -1161,6 +1652,250 @@ class MainWindow(QMainWindow):
             self._update_calibration_display()
             self._log(f"Loaded calibration: {file_path}")
 
+    @Slot()
+    def _on_apply_manual_rotation(self):
+        """Apply a manually configured rotation offset (for pretrained model usage)."""
+        from playagain_pipeline.calibration.calibrator import CalibrationResult
+        offset = self.manual_rotation_spin.value()
+        num_ch = self.channels_spin.value()
+        mapping = [(i - offset) % num_ch for i in range(num_ch)]
+        cal = CalibrationResult(
+            created_at=datetime.now(),
+            device_name="manual",
+            num_channels=num_ch,
+            rotation_offset=offset,
+            channel_mapping=mapping,
+            confidence=1.0,
+            reference_patterns={},
+            metadata={"source": "manual_override"}
+        )
+        self.calibrator._current_calibration = cal
+        self._update_calibration_display()
+        self._log(f"Applied manual rotation offset: {offset} channels")
+
+    @Slot()
+    def _on_clear_calibration(self):
+        """Clear calibration so no rotation correction is applied."""
+        self.calibrator._current_calibration = None
+        self._update_calibration_display()
+        self._log("Calibration cleared — no rotation correction active")
+
+    # ── Live Quick Calibration ────────────────────────────────────────────────
+
+    @Slot()
+    def _on_start_live_calibration(self):
+        """Start the live gesture-by-gesture calibration sequence."""
+        device = self.device_manager.device
+        if not device or not device.is_streaming:
+            QMessageBox.warning(self, "Warning",
+                                "Please connect and start the device before live calibration.")
+            return
+
+        # Update calibrator to use the actual device channel count (adaptive)
+        # This ensures it works correctly even when bad channels are removed
+        self.calibrator.processor.num_channels = device.num_channels
+
+        gestures_text = self.live_cal_gestures_edit.text()
+        gestures = [g.strip() for g in gestures_text.split(",") if g.strip()]
+        if not gestures:
+            QMessageBox.warning(self, "Warning", "Please enter at least one gesture name.")
+            return
+
+        self._live_cal_gestures = gestures
+        self._live_cal_current_idx = 0
+        self._live_cal_buffer = []
+        self._live_cal_collected = {}
+        self._live_cal_active = False   # will be set True when countdown reaches 0
+        self._live_cal_countdown = 3    # 3-second countdown before first gesture
+
+        self.start_live_cal_btn.setEnabled(False)
+        self.cancel_live_cal_btn.setEnabled(True)
+
+        # Start the per-second tick timer
+        self._live_cal_timer = QTimer(self)
+        self._live_cal_timer.timeout.connect(self._live_cal_tick)
+        self._live_cal_timer.start(1000)
+
+        self._live_cal_update_status(f"Get ready… starting in {self._live_cal_countdown}s")
+        self._log("Live calibration started")
+
+    # Gesture emoji lookup for live calibration visual prompts
+    _GESTURE_EMOJIS = {
+        "rest": "🖐🏻", "open_hand": "🖐🏻", "fist": "🤛🏻", "pinch": "👌🏻",
+        "tripod": "🤌🏻", "index_point": "👆🏻", "thumb_out": "👍🏻",
+        "pinky_out": "🤙🏻", "extension": "🖐🏻",
+    }
+
+    def _live_cal_tick(self):
+        """Called every second to advance the live calibration sequence."""
+        if self._live_cal_countdown > 0:
+            self._live_cal_countdown -= 1
+            if self._live_cal_countdown > 0:
+                msg = f"Get ready… {self._live_cal_countdown}s"
+                self._live_cal_update_status(msg)
+                self._live_cal_show_gesture_prompt(
+                    "GET READY",
+                    self._live_cal_gestures[self._live_cal_current_idx],
+                    f"Next gesture in {self._live_cal_countdown}s",
+                    color="#FFA500"
+                )
+            else:
+                # Countdown finished — begin collecting the current gesture
+                self._live_cal_active = True
+                self._live_cal_buffer = []
+                hold = self.live_cal_duration_spin.value()
+                gesture = self._live_cal_gestures[self._live_cal_current_idx]
+                self._live_cal_remaining = hold
+                self._live_cal_update_status(
+                    f"RECORDING: Hold '{gesture}'  ({hold}s remaining)")
+                self._live_cal_show_gesture_prompt(
+                    "HOLD NOW",
+                    gesture,
+                    f"{hold}s remaining",
+                    color="#F44336"
+                )
+            return
+
+        # Already in collection phase — count down hold duration
+        self._live_cal_remaining -= 1
+        gesture = self._live_cal_gestures[self._live_cal_current_idx]
+
+        if self._live_cal_remaining > 0:
+            self._live_cal_update_status(
+                f"RECORDING: Hold '{gesture}'  ({self._live_cal_remaining}s remaining)")
+            self._live_cal_show_gesture_prompt(
+                "HOLD NOW",
+                gesture,
+                f"{self._live_cal_remaining}s remaining",
+                color="#F44336"
+            )
+        else:
+            # Collection done for this gesture
+            self._live_cal_active = False
+            if self._live_cal_buffer:
+                self._live_cal_collected[gesture] = np.concatenate(
+                    self._live_cal_buffer, axis=0)
+                self._log(f"  Collected '{gesture}': "
+                          f"{self._live_cal_collected[gesture].shape[0]} samples")
+            else:
+                self._log(f"  No data received for '{gesture}' — skipped")
+
+            self._live_cal_current_idx += 1
+
+            if self._live_cal_current_idx >= len(self._live_cal_gestures):
+                # All gestures done — run calibration
+                self._live_cal_show_gesture_prompt(
+                    "COMPUTING", "", "Analyzing patterns…", color="#2196F3"
+                )
+                self._live_cal_finish()
+            else:
+                # Prepare for next gesture with a short 2-second pause
+                self._live_cal_countdown = 2
+                next_gesture = self._live_cal_gestures[self._live_cal_current_idx]
+                self._live_cal_update_status(
+                    f"Done. Next: '{next_gesture}' in {self._live_cal_countdown}s...")
+                self._live_cal_show_gesture_prompt(
+                    "NEXT UP",
+                    next_gesture,
+                    f"Get ready… {self._live_cal_countdown}s",
+                    color="#2196F3"
+                )
+
+    def _live_cal_finish(self):
+        """Compute calibration from collected live gesture data."""
+        self._live_cal_timer.stop()
+        self._live_cal_timer = None
+        self._live_cal_active = False
+
+        self.start_live_cal_btn.setEnabled(True)
+        self.cancel_live_cal_btn.setEnabled(False)
+
+        if not self._live_cal_collected:
+            self._live_cal_update_status("No data collected — calibration aborted")
+            self.protocol_widget.gesture_display.clear()
+            return
+
+        self._live_cal_update_status("Computing calibration…")
+        try:
+            result = self.calibrator.calibrate(
+                calibration_data=self._live_cal_collected,
+                device_name=self.device_combo.currentText(),
+            )
+            self.calibrator._current_calibration = result
+            self._update_calibration_display()
+
+            self._log(f"Live calibration complete!")
+            self._log(f"  Rotation offset: {result.rotation_offset} channels")
+            self._log(f"  Confidence: {result.confidence:.2%}")
+
+            status = (f"✅ Done!  Rotation: {result.rotation_offset} ch  "
+                      f"Confidence: {result.confidence:.0%}")
+            self._live_cal_update_status(status)
+            self._live_cal_show_gesture_prompt(
+                "COMPLETE", "", f"Rotation: {result.rotation_offset} ch, "
+                f"Confidence: {result.confidence:.0%}", color="#4CAF50"
+            )
+
+            QMessageBox.information(self, "Live Calibration Complete",
+                f"Rotation offset: {result.rotation_offset} channels\n"
+                f"Confidence: {result.confidence:.2%}\n\n"
+                f"Calibration applied. You can now load a pretrained model\n"
+                f"and start prediction.")
+        except Exception as e:
+            self._live_cal_update_status(f"Error: {e}")
+            self._log(f"Live calibration error: {e}")
+
+    @Slot()
+    def _on_cancel_live_calibration(self):
+        """Cancel an in-progress live calibration."""
+        if self._live_cal_timer:
+            self._live_cal_timer.stop()
+            self._live_cal_timer = None
+        self._live_cal_active = False
+        self._live_cal_buffer = []
+        self.start_live_cal_btn.setEnabled(True)
+        self.cancel_live_cal_btn.setEnabled(False)
+        self._live_cal_update_status("Cancelled")
+        self.protocol_widget.gesture_display.clear()
+        self._log("Live calibration cancelled")
+
+    def _live_cal_update_status(self, text: str):
+        """Update the live calibration status label safely."""
+        if hasattr(self, 'live_cal_status_label'):
+            self.live_cal_status_label.setText(text)
+
+    def _live_cal_show_gesture_prompt(self, phase: str, gesture_name: str,
+                                      detail: str, color: str = "#333"):
+        """Show a large visual prompt in the protocol widget during live calibration.
+
+        This makes the requested gesture clearly visible alongside the EMG plot,
+        using the same gesture display area used during recording protocols.
+        """
+        display = self.protocol_widget.gesture_display
+
+        # Phase label (GET READY / HOLD NOW / NEXT UP / etc.)
+        display.phase_label.setText(phase)
+        display.phase_label.setStyleSheet(f"color: {color};")
+
+        # Gesture name (human-readable)
+        pretty_name = gesture_name.replace("_", " ").title()
+        display.gesture_label.setText(pretty_name)
+
+        # Emoji for the gesture
+        emoji = self._GESTURE_EMOJIS.get(gesture_name.lower(), "")
+        if emoji:
+            display.emoji_label.setText(emoji)
+            display.emoji_label.setStyleSheet("")
+        else:
+            display.emoji_label.setText(pretty_name[:2].upper() if pretty_name else "")
+            display.emoji_label.setStyleSheet(
+                "background-color: #e0e0e0; border-radius: 10px; "
+                "font-size: 48px; font-weight: bold; color: #666;"
+            )
+
+        # Detail text (countdown, instruction)
+        display.description_label.setText(detail)
+
     def _update_calibration_display(self):
         """Update calibration status display."""
         cal = self.calibrator.current_calibration
@@ -1169,10 +1904,41 @@ class MainWindow(QMainWindow):
             self.cal_confidence_label.setText(f"{cal.confidence:.2%}")
             self.cal_rotation_label.setText(f"{cal.rotation_offset} channels")
             self.save_ref_btn.setEnabled(True)
+            self.save_ref_recompute_btn.setEnabled(True)
+            # Update bracelet graphic
+            if hasattr(self, 'bracelet_graphic'):
+                self.bracelet_graphic.set_num_electrodes(cal.num_channels)
+                self.bracelet_graphic.set_rotation_offset(cal.rotation_offset)
+            # Show sub-score breakdown if available
+            if hasattr(self, 'cal_subscores_label'):
+                pg = cal.metadata.get("per_gesture_confidence", {})
+                if pg:
+                    margin = pg.get("__margin_score__", None)
+                    agreement = pg.get("__agreement_score__", None)
+                    corr = pg.get("__correlation_score__", None)
+                    sharpness = pg.get("__sharpness__", None)
+                    parts = []
+                    if margin is not None:
+                        parts.append(f"margin={margin:.0%}")
+                    if sharpness is not None:
+                        parts.append(f"sharpness={sharpness:.0%}")
+                    if agreement is not None:
+                        parts.append(f"agreement={agreement:.0%}")
+                    if corr is not None:
+                        parts.append(f"correlation={corr:.0%}")
+                    self.cal_subscores_label.setText("  ".join(parts) if parts else "-")
+                else:
+                    self.cal_subscores_label.setText("-")
         else:
             self.cal_status_label.setText("No calibration loaded")
             self.cal_confidence_label.setText("-")
             self.cal_rotation_label.setText("-")
+            if hasattr(self, 'cal_subscores_label'):
+                self.cal_subscores_label.setText("-")
+            self.save_ref_btn.setEnabled(False)
+            self.save_ref_recompute_btn.setEnabled(False)
+            if hasattr(self, 'bracelet_graphic'):
+                self.bracelet_graphic.set_rotation_offset(0)
 
     # Training handlers
     @Slot()
@@ -1190,6 +1956,79 @@ class MainWindow(QMainWindow):
         for name in self.model_manager.list_models():
             self.models_list.addItem(name)
             self.pred_model_combo.addItem(name)
+
+    @Slot()
+    def _on_delete_dataset(self):
+        """Delete the selected dataset(s)."""
+        selected_items = self.dataset_list.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "Warning", "Please select one or more datasets to delete.")
+            return
+
+        names = [item.text() for item in selected_items]
+        if len(names) == 1:
+            msg = f"Are you sure you want to permanently delete the dataset '{names[0]}'?\n\nThis action cannot be undone."
+        else:
+            name_list = "\n".join(f"  • {n}" for n in names)
+            msg = f"Are you sure you want to permanently delete {len(names)} datasets?\n\n{name_list}\n\nThis action cannot be undone."
+
+        reply = QMessageBox.question(
+            self, "Confirm Delete", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            for dataset_name in names:
+                try:
+                    if self.data_manager.delete_dataset(dataset_name):
+                        self._log(f"Dataset '{dataset_name}' deleted successfully.")
+                    else:
+                        QMessageBox.warning(self, "Warning", f"Dataset '{dataset_name}' not found.")
+                except Exception as e:
+                    self._log(f"Error deleting dataset '{dataset_name}': {e}")
+            self._refresh_datasets()
+
+    @Slot()
+    def _on_delete_model(self):
+        """Delete the selected model(s)."""
+        selected_items = self.models_list.selectedItems()
+        if not selected_items:
+            QMessageBox.warning(self, "Warning", "Please select one or more models to delete.")
+            return
+
+        names = [item.text() for item in selected_items]
+        if len(names) == 1:
+            msg = f"Are you sure you want to permanently delete the model '{names[0]}'?\n\nThis action cannot be undone."
+        else:
+            name_list = "\n".join(f"  • {n}" for n in names)
+            msg = f"Are you sure you want to permanently delete {len(names)} models?\n\n{name_list}\n\nThis action cannot be undone."
+
+        reply = QMessageBox.question(
+            self, "Confirm Delete", msg,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No
+        )
+
+        if reply == QMessageBox.StandardButton.Yes:
+            for model_name in names:
+                try:
+                    # If this model is currently loaded, unload it
+                    if (self._current_model is not None and
+                            hasattr(self._current_model, 'name') and
+                            self._current_model.name == model_name):
+                        self._current_model = None
+                        self.prediction_label.setText("No prediction")
+                        self.confidence_label.setText("Confidence: -")
+                        self._log("Unloaded current model before deletion.")
+
+                    if self.model_manager.delete_model(model_name):
+                        self._log(f"Model '{model_name}' deleted successfully.")
+                    else:
+                        QMessageBox.warning(self, "Warning", f"Model '{model_name}' not found.")
+                except Exception as e:
+                    self._log(f"Error deleting model '{model_name}': {e}")
+            self._refresh_models()
 
     @Slot()
     def _on_create_dataset(self):
@@ -1227,7 +2066,7 @@ class MainWindow(QMainWindow):
         session_layout = QFormLayout(session_tab)
 
         session_list = QListWidget()
-        session_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        session_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
 
         # Populate with all sessions from all subjects
         for subject in subjects:
@@ -1268,7 +2107,7 @@ class MainWindow(QMainWindow):
                     new_name = f"{selected_items[0].text()}"
                 else:
                     new_name = f"{len(selected_items)}_subjects"
-            else:  # Session tab
+            else: # Session tab
                 selected_items = session_list.selectedItems()
                 if not selected_items:
                     new_name = "dataset_no_session"
@@ -1319,6 +2158,91 @@ class MainWindow(QMainWindow):
         include_invalid_cb.setChecked(False)
         params_layout.addRow("Include Invalid Trials:", include_invalid_cb)
 
+        # Per-session rotation alignment (recommended for multi-session datasets)
+        per_session_rot_cb = QCheckBox()
+        per_session_rot_cb.setChecked(True)  # Default ON — best for combining sessions
+        per_session_rot_cb.setText(
+            "Use each session's detected rotation offset to align channels"
+        )
+        per_session_rot_cb.setToolTip(
+            "Recommended when combining recordings from different occasions.\n"
+            "Each session's bracelet rotation is detected during recording and\n"
+            "stored in its metadata. This option applies each session's own\n"
+            "rotation correction so channels are aligned to a common reference."
+        )
+        params_layout.addRow("Per-Session Rotation:", per_session_rot_cb)
+
+        # Apply single global calibration (alternative to per-session)
+        apply_cal_cb = QCheckBox()
+        has_cal = self.calibrator.current_calibration is not None
+        apply_cal_cb.setChecked(False)  # Off by default when per-session is on
+        apply_cal_cb.setEnabled(has_cal and not per_session_rot_cb.isChecked())
+        cal_label_text = "Global Calibration:"
+        if has_cal:
+            cal = self.calibrator.current_calibration
+            apply_cal_cb.setText(
+                f"Rotate all sessions by {cal.rotation_offset} "
+                f"(confidence: {cal.confidence:.0%})"
+            )
+        else:
+            apply_cal_cb.setText("No calibration loaded")
+        params_layout.addRow(cal_label_text, apply_cal_cb)
+
+        # Mutual exclusion: per-session rotation disables global calibration
+        def _on_per_session_toggled(checked):
+            if checked:
+                apply_cal_cb.setChecked(False)
+                apply_cal_cb.setEnabled(False)
+            else:
+                apply_cal_cb.setEnabled(has_cal)
+        per_session_rot_cb.toggled.connect(_on_per_session_toggled)
+
+        # ── Feature extraction options ─────────────────────────────────────
+        feature_group = QGroupBox("Feature Extraction (Optional)")
+        feature_group_layout = QVBoxLayout(feature_group)
+
+        extract_features_cb = QCheckBox("Pre-extract features at dataset creation time")
+        extract_features_cb.setChecked(False)
+        extract_features_cb.setToolTip(
+            "If enabled, features are computed and stored in the dataset.\n"
+            "Training will skip the feature extraction step, making it faster."
+        )
+        feature_group_layout.addWidget(extract_features_cb)
+
+        from PySide6.QtWidgets import QRadioButton, QButtonGroup, QListWidget as QListWidgetD, QListWidgetItem as QListWidgetItemD
+        feat_btn_group = QButtonGroup(dialog)
+        feat_radio_default = QRadioButton("All Features (Default)")
+        feat_radio_default.setChecked(True)
+        feat_btn_group.addButton(feat_radio_default)
+        feature_group_layout.addWidget(feat_radio_default)
+
+        feat_radio_custom = QRadioButton("Custom Feature Selection")
+        feat_btn_group.addButton(feat_radio_custom)
+        feature_group_layout.addWidget(feat_radio_custom)
+
+        feat_list = QListWidgetD()
+        feat_list.setMaximumHeight(100)
+        feat_list.setEnabled(False)
+        from playagain_pipeline.models.feature_pipeline import get_registered_features
+        for feat_name in sorted(get_registered_features().keys()):
+            item = QListWidgetItemD(feat_name)
+            item.setCheckState(Qt.CheckState.Checked)
+            feat_list.addItem(item)
+        feature_group_layout.addWidget(feat_list)
+
+        def _on_feat_mode_changed():
+            feat_list.setEnabled(feat_radio_custom.isChecked())
+        feat_radio_custom.toggled.connect(lambda: _on_feat_mode_changed())
+        extract_features_cb.toggled.connect(lambda checked: (
+            feat_radio_default.setEnabled(checked),
+            feat_radio_custom.setEnabled(checked),
+            feat_list.setEnabled(checked and feat_radio_custom.isChecked()),
+        ))
+        feat_radio_default.setEnabled(False)
+        feat_radio_custom.setEnabled(False)
+
+        main_layout.addWidget(feature_group)
+
         main_layout.addLayout(params_layout)
 
         # Buttons
@@ -1367,12 +2291,44 @@ class MainWindow(QMainWindow):
                     self._log(f"Using {len(sessions_to_use)} specifically selected session(s)")
 
                 # Create dataset with selected sessions
+                # Determine rotation correction mode
+                use_per_session = per_session_rot_cb.isChecked()
+                cal_to_apply = None
+
+                if use_per_session:
+                    # Log per-session rotation offsets
+                    sessions_with_rot = sum(
+                        1 for s in sessions_to_use if s.metadata.rotation_offset != 0
+                    )
+                    self._log(f"Using per-session rotation alignment "
+                              f"({sessions_with_rot}/{len(sessions_to_use)} sessions have non-zero rotation)")
+                elif apply_cal_cb.isChecked() and self.calibrator.current_calibration:
+                    cal_to_apply = self.calibrator.current_calibration
+                    self._log(f"Applying global calibration (rotation offset: {cal_to_apply.rotation_offset})")
+
+                # Build feature config if extraction is enabled
+                ds_feature_config = None
+                if extract_features_cb.isChecked():
+                    if feat_radio_custom.isChecked():
+                        selected_feats = []
+                        for fi in range(feat_list.count()):
+                            item = feat_list.item(fi)
+                            if item.checkState() == Qt.CheckState.Checked:
+                                selected_feats.append(item.text())
+                        ds_feature_config = {"mode": "custom", "features": selected_feats}
+                    else:
+                        ds_feature_config = {"mode": "default", "features": []}
+                    self._log(f"Pre-extracting features (mode: {ds_feature_config['mode']})")
+
                 dataset = self.data_manager.create_dataset(
                     name=name_edit.text(),
                     sessions=sessions_to_use,
                     window_size_ms=window_size_spin.value(),
                     window_stride_ms=stride_spin.value(),
-                    include_invalid=include_invalid_cb.isChecked()
+                    include_invalid=include_invalid_cb.isChecked(),
+                    calibration=cal_to_apply,
+                    use_per_session_rotation=use_per_session,
+                    feature_config=ds_feature_config,
                 )
 
                 self.data_manager.save_dataset(dataset)
@@ -1403,7 +2359,7 @@ class MainWindow(QMainWindow):
             num_channels = dataset['metadata']['num_channels']
             window_samples = dataset['metadata']['window_samples']
 
-            self._log(f"✓ Dataset loaded: {num_samples} samples, {num_classes} classes, "
+            self._log(f"Dataset loaded: {num_samples} samples, {num_classes} classes, "
                      f"{num_channels} channels, {window_samples} samples/window")
 
             # Create model
@@ -1411,14 +2367,17 @@ class MainWindow(QMainWindow):
             # Convert UI display names to internal model type names
             if model_type_text == "AttentionNet":
                 model_type = "attention_net"
+            elif model_type_text == "MSTNet":
+                model_type = "mstnet"
             else:
                 model_type = model_type_text.lower().replace(" ", "_")
             self._log(f"Creating {model_type} model...")
 
-            # Build model name: type_datasetname
+            # Build model name: type_datasetname_timestamp
             safe_dataset_name = dataset_name.replace(":", "-").replace(" ", "_")
             safe_dataset_name = safe_dataset_name.replace("/", "_").replace("\\\\", "_")
-            model_name = f"{model_type}_{safe_dataset_name}"
+            timestamp = datetime.now().strftime("%H%M%S")
+            model_name = f"{model_type}_{safe_dataset_name}_{timestamp}"
 
             model = self.model_manager.create_model(model_type, name=model_name)
             self._log(f"Model created: {model.name}")
@@ -1440,14 +2399,14 @@ class MainWindow(QMainWindow):
 
             # Log detailed results
             self._log(f"Training complete!")
-            self._log(f"  • Training accuracy: {results['training_accuracy']:.2%}")
-            self._log(f"  • Validation accuracy: {results['validation_accuracy']:.2%}")
+            self._log(f"  Training accuracy: {results['training_accuracy']:.2%}")
+            self._log(f"  Validation accuracy: {results['validation_accuracy']:.2%}")
 
             if 'training_time' in results:
-                self._log(f"  • Training time: {results['training_time']:.2f}s")
+                self._log(f"  Training time: {results['training_time']:.2f}s")
 
             if 'feature_count' in results:
-                self._log(f"  • Features extracted: {results['feature_count']}")
+                self._log(f"  Features extracted: {results['feature_count']}")
 
             self._refresh_models()
             self._log(f"Model saved successfully")
@@ -1467,9 +2426,28 @@ class MainWindow(QMainWindow):
             self._current_model = self.model_manager.load_model(model_name)
             self._log(f"Loaded model: {model_name}")
 
-            # Initialize prediction buffer
+            # Initialize prediction buffer using actual device channel count.
+            # Model metadata num_channels may be wrong for pre-extracted feature
+            # datasets (it gets set to the feature dim instead of raw channels).
+            # The buffer receives raw EMG data, so always use device channels.
+            device = self.device_manager.device
+            num_ch = device.num_channels if device else self.channels_spin.value()
             window_samples = int(self._prediction_window_ms * self._current_model.metadata.sampling_rate / 1000)
-            self._prediction_buffer = np.zeros((window_samples, self._current_model.metadata.num_channels))
+            self._prediction_buffer = np.zeros((window_samples, num_ch))
+
+            # Warn if channel count differs from model's trained channel count
+            model_ch = self._current_model.metadata.num_channels
+            if model_ch > 0 and num_ch != model_ch:
+                if self.use_mlp_projection_cb.isChecked():
+                    self._log(
+                        f"  Channel mismatch: device has {num_ch} ch, model trained on {model_ch} ch. "
+                        f"MLP projection layer will be used automatically."
+                    )
+                else:
+                    self._log(
+                        f"  Channel mismatch: device has {num_ch} ch, model trained on {model_ch} ch. "
+                        f"Enable 'MLP projection layer' option to allow prediction."
+                    )
 
         except Exception as e:
             self._log(f"Error loading model: {e}")
@@ -1486,11 +2464,23 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please connect and start device")
             return
 
+        # Create GUI-side smoother for display
+        if self.smoothing_enabled_cb.isChecked():
+            alpha = self.smoothing_alpha_spin.value() / 100.0
+            stability = self.smoothing_stability_spin.value()
+            self._gui_smoother = PredictionSmoother(alpha=alpha, min_stable_ms=stability)
+        else:
+            self._gui_smoother = None
+
         # Create and start prediction worker thread
         self._prediction_worker = PredictionWorker(self)
         self._prediction_worker.set_model(self._current_model)
         self._prediction_worker.prediction_ready.connect(self._on_prediction_ready)
         self._prediction_worker.start()
+
+        # Resume prediction server if it was paused
+        if self._prediction_server and self._prediction_server.is_running and self._prediction_server.is_paused:
+            self._prediction_server.resume()
 
         self._is_predicting = True
         self.start_pred_btn.setEnabled(False)
@@ -1500,12 +2490,22 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_stop_prediction(self):
         """Stop real-time prediction."""
+        # Immediately set flag to prevent any queued signals from updating display
         self._is_predicting = False
 
         if self._prediction_worker:
+            # Disconnect the signal BEFORE stopping to prevent race conditions
+            # where pending signals are still processed after stop() is called
+            self._prediction_worker.prediction_ready.disconnect(self._on_prediction_ready)
             self._prediction_worker.stop()
             self._prediction_worker = None
 
+        # Pause the prediction server if running — keeps TCP connection to Unity alive
+        # but stops running inference on incoming EMG data
+        if self._prediction_server and self._prediction_server.is_running:
+            self._prediction_server.pause()
+
+        # Clear GUI immediately (not waiting for signal disconnect to propagate)
         self.start_pred_btn.setEnabled(True)
         self.stop_pred_btn.setEnabled(False)
         self.prediction_label.setText("No prediction")
@@ -1519,11 +2519,35 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please load a model first")
             return
 
+        # Stop standalone PredictionWorker if running — the server does its own
+        # predictions, so running both wastes CPU and can cause stalls.
+        if self._prediction_worker:
+            self._prediction_worker.stop()
+            self._prediction_worker = None
+            self._is_predicting = False
+            self.start_pred_btn.setEnabled(True)
+            self.stop_pred_btn.setEnabled(False)
+            self._log("Standalone prediction stopped (server takes over)")
+
         host = self.server_host_edit.text().strip()
         port = self.server_port_spin.value()
 
         self._prediction_server = PredictionServer(host=host, port=port)
         self._prediction_server.set_model(self._current_model)
+
+        # Register a callback so server predictions update the GUI labels.
+        # The callback runs on the prediction worker thread, so we use
+        # QTimer.singleShot to marshal the UI update to the main thread.
+        self._prediction_server.add_prediction_callback(self._on_server_prediction)
+
+        # Apply smoothing settings to server
+        smoothing_on = self.smoothing_enabled_cb.isChecked()
+        self._prediction_server.set_smoothing_enabled(smoothing_on)
+        if smoothing_on:
+            alpha = self.smoothing_alpha_spin.value() / 100.0
+            stability = self.smoothing_stability_spin.value()
+            self._prediction_server.set_smoothing_params(alpha=alpha, min_stable_ms=stability)
+
         self._prediction_server.start()
 
         self.start_server_btn.setEnabled(False)
@@ -1534,7 +2558,13 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_stop_server(self):
         """Stop the Unity TCP prediction server."""
+        # Stop game recording first if active (it depends on the server)
+        if self._game_recorder and self._game_recorder.is_recording:
+            self._on_stop_game_recording()
+
         if self._prediction_server:
+            # Remove our GUI prediction callback before stopping
+            self._prediction_server.remove_prediction_callback(self._on_server_prediction)
             self._prediction_server.stop()
             self._prediction_server = None
 
@@ -1548,6 +2578,11 @@ class MainWindow(QMainWindow):
         if self._prediction_buffer is None or self._current_model is None:
             return
 
+        # Guard: re-create buffer if channel count changed (e.g. device reconnect)
+        if data.shape[1] != self._prediction_buffer.shape[1]:
+            window_samples = self._prediction_buffer.shape[0]
+            self._prediction_buffer = np.zeros((window_samples, data.shape[1]))
+
         # Roll buffer and add new data
         n_samples = min(data.shape[0], len(self._prediction_buffer))
         self._prediction_buffer = np.roll(self._prediction_buffer, -n_samples, axis=0)
@@ -1559,7 +2594,7 @@ class MainWindow(QMainWindow):
 
     @Slot(object, object)
     def _on_prediction_ready(self, pred, proba):
-        """Handle prediction result from worker thread (updates UI)."""
+        """Handle prediction result from worker thread (updates UI with optional smoothing)."""
         if not self._is_predicting or self._current_model is None:
             return
 
@@ -1572,42 +2607,209 @@ class MainWindow(QMainWindow):
             except (IndexError, KeyError):
                 confidence = np.max(proba)
 
+            # Apply GUI-side smoothing if enabled
+            if self._gui_smoother is not None:
+                # Build probabilities dict for smoother
+                prob_dict = {}
+                for idx, p in enumerate(proba):
+                    name = class_names.get(idx, class_names.get(str(idx), f"class_{idx}"))
+                    prob_dict[name] = float(p)
+
+                class_name, _, confidence, _ = self._gui_smoother.smooth(
+                    class_name, int(pred), float(confidence), prob_dict
+                )
+
             display_name = class_name.replace("_", " ").title()
             self.prediction_label.setText(display_name)
             self.confidence_label.setText(f"Confidence: {confidence:.1%}")
         except Exception:
             pass
 
+    def _on_server_prediction(self, gesture: str, gesture_id: int,
+                              confidence: float, probabilities: dict):
+        """
+        Callback from PredictionServer (runs on its background thread).
+        Emits a Qt Signal to safely marshal the UI update onto the main thread.
+
+        Throttled to ~20 Hz to prevent flooding the Qt event loop.
+        """
+        import time as _time
+        now = _time.monotonic()
+        # Throttle: skip update if less than 50 ms since last one
+        if hasattr(self, '_last_server_pred_time') and now - self._last_server_pred_time < 0.05:
+            return
+        self._last_server_pred_time = now
+
+        display_name = gesture.replace("_", " ").title()
+
+        # Emit signal — Qt guarantees cross-thread delivery via event queue
+        self._server_prediction_signal.emit(display_name, confidence)
+
+    @Slot(str, float)
+    def _apply_server_prediction(self, display_name: str, confidence: float):
+        """Update prediction labels on the main thread."""
+        # Guard against stale signals from server after it has been stopped
+        if not self._prediction_server or not self._prediction_server.is_running:
+            return
+
+        self.prediction_label.setText(display_name)
+        self.confidence_label.setText(f"Confidence: {confidence:.1%}")
+
+    # ─── Smoothing Handlers ───────────────────────────────────────────────
+
+    @Slot(bool)
+    def _on_smoothing_toggled(self, enabled: bool):
+        """Handle smoothing checkbox toggle."""
+        # Update server smoother if running
+        if self._prediction_server:
+            self._prediction_server.set_smoothing_enabled(enabled)
+
+        # Update GUI smoother
+        if enabled:
+            alpha = self.smoothing_alpha_spin.value() / 100.0
+            stability = self.smoothing_stability_spin.value()
+            self._gui_smoother = PredictionSmoother(alpha=alpha, min_stable_ms=stability)
+        else:
+            self._gui_smoother = None
+
+        self._log(f"Smoothing {'enabled' if enabled else 'disabled'}")
+
+    @Slot(int)
+    def _on_smoothing_params_changed(self, _value=None):
+        """Handle smoothing parameter changes."""
+        alpha = self.smoothing_alpha_spin.value() / 100.0
+        stability = self.smoothing_stability_spin.value()
+
+        # Update server smoother
+        if self._prediction_server:
+            self._prediction_server.set_smoothing_params(alpha=alpha, min_stable_ms=stability)
+
+        # Update GUI smoother
+        if self._gui_smoother:
+            self._gui_smoother.alpha = alpha
+            self._gui_smoother.min_stable_ms = stability
+
+    # ─── Game Recording Handlers ──────────────────────────────────────────
+
+    @Slot()
+    def _on_start_game_recording(self):
+        """Start recording gameplay data (EMG + predictions + ground truth)."""
+        if not self._prediction_server or not self._prediction_server.is_running:
+            QMessageBox.warning(self, "Warning",
+                                "Please start the Unity TCP Server first.\n"
+                                "Game recording requires the server to receive ground truth from Unity.")
+            return
+
+        if not self._current_model:
+            QMessageBox.warning(self, "Warning", "Please load a model first.")
+            return
+
+        device = self.device_manager.device
+        if not device or not device.is_streaming:
+            QMessageBox.warning(self, "Warning", "Please connect and start device first.")
+            return
+
+        # Create game recorder
+        self._game_recorder = GameRecorder(output_dir=self.data_dir)
+
+        # Set class names from model metadata
+        if self._current_model.metadata and self._current_model.metadata.class_names:
+            self._game_recorder.set_class_names(self._current_model.metadata.class_names)
+
+        # Set model metadata for config.json
+        if self._current_model.metadata:
+            self._game_recorder.set_model_metadata(self._current_model.metadata)
+
+        # Set calibration/rotation info for the game recording
+        if self.calibrator.current_calibration:
+            cal = self.calibrator.current_calibration
+            self._game_recorder.set_calibration_info(
+                rotation_offset=cal.rotation_offset,
+                confidence=cal.confidence,
+                channel_mapping=cal.channel_mapping
+            )
+
+        # Register callbacks with the prediction server
+        self._prediction_server.add_prediction_callback(self._game_recorder.on_prediction)
+        self._prediction_server.add_game_state_callback(self._game_recorder.on_game_state)
+
+        # Determine number of channels (all channels kept, bad ones zeroed)
+        num_channels = device.num_channels
+
+        # Start recording
+        subject_id = self.game_rec_subject_edit.text().strip() or None
+        session_name = self.game_rec_session_edit.text().strip() or None
+
+        file_path = self._game_recorder.start_recording(
+            num_channels=num_channels,
+            session_name=session_name,
+            subject_id=subject_id,
+            sampling_rate=device.sampling_rate
+        )
+
+        # Update UI
+        self.start_game_rec_btn.setEnabled(False)
+        self.stop_game_rec_btn.setEnabled(True)
+        self.game_rec_status_label.setText("Game Recording: ACTIVE")
+        self.game_rec_status_label.setStyleSheet("font-weight: bold; color: red;")
+        self._log(f"Game recording started: {file_path}")
+
+        # Start a timer to update recording stats in the UI
+        if not hasattr(self, '_game_rec_timer'):
+            self._game_rec_timer = QTimer(self)
+            self._game_rec_timer.timeout.connect(self._update_game_rec_status)
+        self._game_rec_timer.start(1000)
+
+    @Slot()
+    def _on_stop_game_recording(self):
+        """Stop recording gameplay data."""
+        if self._game_recorder and self._game_recorder.is_recording:
+            file_path = self._game_recorder.stop_recording()
+
+            # Remove callbacks from server
+            if self._prediction_server:
+                self._prediction_server.remove_prediction_callback(self._game_recorder.on_prediction)
+                self._prediction_server.remove_game_state_callback(self._game_recorder.on_game_state)
+
+            self._log(f"Game recording saved: {file_path}")
+
+        self._game_recorder = None
+
+        # Update UI
+        self.start_game_rec_btn.setEnabled(True)
+        self.stop_game_rec_btn.setEnabled(False)
+        self.game_rec_status_label.setText("Game Recording: Idle")
+        self.game_rec_status_label.setStyleSheet("font-weight: bold; color: black;")
+
+        # Stop stats timer
+        if hasattr(self, '_game_rec_timer'):
+            self._game_rec_timer.stop()
+
+    def _update_game_rec_status(self):
+        """Update game recording status label with live stats."""
+        if self._game_recorder and self._game_recorder.is_recording:
+            samples = self._game_recorder.sample_count
+            duration = self._game_recorder.duration
+            self.game_rec_status_label.setText(
+                f"Game Recording: ACTIVE — {samples:,} samples, {duration:.0f}s"
+            )
+
     def _get_excluded_channels(self) -> list[int]:
-        """Get list of excluded channel indices (0-based) from unchecked boxes."""
-        excluded = []
-        for i, check in enumerate(self.channel_checks):
-            if not check.isChecked():
-                excluded.append(i)
-        return excluded
+        """Get list of excluded channel indices (0-based) from the EMG plot checkboxes."""
+        return list(self._excluded_channels)
+
+    @Slot(np.ndarray)
+    def _on_bad_channels_updated(self, lines_enabled: np.ndarray):
+        """Handle channel toggle from the EMG plot's built-in checkboxes.
+
+        Args:
+            lines_enabled: Bool array — True means channel is enabled, False means bad/excluded.
+        """
+        self._excluded_channels = [i for i, enabled in enumerate(lines_enabled) if not enabled]
 
     def _update_channel_checkboxes(self, num_channels: int):
-        """Update the number of channel checkboxes."""
-        # Clear existing checkboxes
-        for check in self.channel_checks:
-            check.deleteLater()
-        self.channel_checks.clear()
-
-        # Clear grid layout
-        while self._channels_grid_layout.count():
-            item = self._channels_grid_layout.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-
-        # Create new checkboxes
-        for i in range(num_channels):
-            check = QCheckBox(f"Ch {i + 1}")
-            check.setChecked(True)
-            self._channels_grid_layout.addWidget(check, i // 8, i % 8)
-            self.channel_checks.append(check)
-
-        # Add stretch to bottom
-        self._channels_grid_layout.setRowStretch(max(4, (num_channels + 7) // 8), 1)
+        """Reset excluded channels when device channel count changes."""
+        self._excluded_channels = []
 
     def _on_session_data_toggled(self, checked: bool):
         """Handle toggling of session data checkbox."""
@@ -1648,23 +2850,11 @@ class MainWindow(QMainWindow):
 
 
 def main():
-    """Run the application."""
-    import os
-    # Suppress harmless Qt pointer dispatch warnings on macOS
-    # (caused by pyqtgraph plots receiving touch/pointer events without target windows)
-    os.environ.setdefault(
-        "QT_LOGGING_RULES",
-        "qt.pointer.dispatch=false"
-    )
+    """Entry point for the GUI application."""
+    import sys
+    from PySide6.QtWidgets import QApplication
 
-    app = QApplication(sys.argv)
-    app.setStyle("Fusion")
-
+    app = QApplication.instance() or QApplication(sys.argv)
     window = MainWindow()
     window.show()
-
     sys.exit(app.exec())
-
-
-if __name__ == "__main__":
-    main()

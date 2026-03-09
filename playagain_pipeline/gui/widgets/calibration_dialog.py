@@ -221,9 +221,9 @@ class CalibrationDialog(QDialog):
             # Concatenate all recorded data
             data = np.vstack(self._recording_buffer)
             self._gesture_data[gesture_name] = data
-            self._log(f"✓ Recorded {gesture_name}: {data.shape[0]} samples")
+            self._log(f"Recorded {gesture_name}: {data.shape[0]} samples")
         else:
-            self._log(f"✗ No data recorded for {gesture_name}")
+            self._log(f"No data recorded for {gesture_name}")
 
         # Move to next gesture
         self._current_gesture_idx += 1
@@ -271,7 +271,7 @@ class CalibrationDialog(QDialog):
                 metadata={"gesture_count": len(self._gesture_data)}
             )
 
-            self._log(f"✓ Calibration complete!")
+            self._log(f"Calibration complete!")
             self._log(f"  Rotation offset: {offset} channels")
             self._log(f"  Confidence: {confidence:.2%}")
 
@@ -281,7 +281,7 @@ class CalibrationDialog(QDialog):
             self.finish_btn.setEnabled(True)
 
         except Exception as e:
-            self._log(f"✗ Calibration failed: {e}")
+            self._log(f"Calibration failed: {e}")
             self.status_label.setText(f"Error: {e}")
             self.start_btn.setEnabled(True)
 

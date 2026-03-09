@@ -7,6 +7,11 @@ from playagain_pipeline.models.classifier import (
     SVMClassifier,
     RandomForestClassifier,
     LDAClassifier,
+    MLPClassifier,
+    CNNClassifier,
+    AttentionNetClassifier,
+    MSTNetClassifier,
+    CatBoostClassifier,
     ModelManager
 )
 
@@ -25,6 +30,11 @@ __all__ = [
     "SVMClassifier",
     "RandomForestClassifier",
     "LDAClassifier",
+    "MLPClassifier",
+    "CNNClassifier",
+    "AttentionNetClassifier",
+    "MSTNetClassifier",
+    "CatBoostClassifier",
     "ModelManager",
     "FeaturePipeline",
     "BaseFeatureExtractor",
