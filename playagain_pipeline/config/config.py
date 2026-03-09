@@ -41,6 +41,37 @@ class CalibrationConfig:
 
 
 @dataclass
+class ProtocolSettings:
+    """Configuration for recording protocols."""
+    # Standard protocol settings
+    std_preparation_time: float = 3.0
+    std_cue_time: float = 1.0
+    std_hold_time: float = 9.0
+    std_release_time: float = 0.5
+    std_rest_time: float = 6.0
+    std_repetitions: int = 5
+    std_randomize: bool = True
+
+    # Quick protocol settings
+    quick_preparation_time: float = 1.0
+    quick_cue_time: float = 0.5
+    quick_hold_time: float = 4.0
+    quick_release_time: float = 0.3
+    quick_rest_time: float = 3.0
+    quick_repetitions: int = 3
+    quick_randomize: bool = True
+
+    # Calibration protocol settings
+    cal_preparation_time: float = 2.0
+    cal_cue_time: float = 0.5
+    cal_hold_time: float = 2.0
+    cal_release_time: float = 0.3
+    cal_rest_time: float = 1.5
+    cal_repetitions: int = 3
+    cal_randomize: bool = False
+
+
+@dataclass
 class ModelConfig:
     """Configuration for ML models."""
     default_model_type: str = "svm"
@@ -77,28 +108,48 @@ class ModelConfig:
     mlp_early_stopping: bool = True
     mlp_patience: int = 20
     mlp_dropout: float = 0.2
+    mlp_weight_decay: float = 0.0
+    mlp_scheduler: str = "none"  # "none", "cosine", "plateau", "step"
 
     # CNN parameters
     cnn_filters: str = "32, 64, 128"
-    cnn_kernels: str = "5, 3, 3"
+    cnn_kernels: str = "7, 5, 3"
     cnn_fc_layers: str = "128"
-    cnn_epochs: int = 100
+    cnn_epochs: int = 200
     cnn_batch_size: int = 32
-    cnn_learning_rate: float = 0.0005
+    cnn_learning_rate: float = 0.0001
     cnn_optimizer: str = "adam"
     cnn_early_stopping: bool = True
-    cnn_patience: int = 5
+    cnn_patience: int = 8
+    cnn_weight_decay: float = 0.0
+    cnn_scheduler: str = "none"
 
-    # Inception parameters
-    inception_filters: str = "32, 64, 128"
-    inception_kernels: str = "1, 3, 5"
+    # Inception / AttentionNet parameters
+    inception_filters: str = "32"
+    inception_kernels: str = "3, 15, 39"
     inception_fc_layers: str = "128"
-    inception_epochs: int = 100
-    inception_batch_size: int = 32
+    inception_epochs: int = 200
+    inception_batch_size: int = 64
     inception_learning_rate: float = 0.0005
     inception_optimizer: str = "adam"
     inception_early_stopping: bool = True
     inception_patience: int = 8
+    inception_weight_decay: float = 0.0001
+    inception_scheduler: str = "none"
+
+    # MSTNet parameters
+    mstnet_base_filters: int = 48
+    mstnet_kernels: str = "3, 7, 15"
+    mstnet_num_blocks: int = 3
+    mstnet_epochs: int = 200
+    mstnet_batch_size: int = 32
+    mstnet_learning_rate: float = 0.00001
+    mstnet_optimizer: str = "adam"
+    mstnet_early_stopping: bool = True
+    mstnet_patience: int = 8
+    mstnet_weight_decay: float = 0.0
+    mstnet_scheduler: str = "none"
+    mstnet_dropout: float = 0.25
 
 
 @dataclass
@@ -112,6 +163,7 @@ class PipelineConfig:
     recording: RecordingConfig = field(default_factory=RecordingConfig)
     calibration: CalibrationConfig = field(default_factory=CalibrationConfig)
     model: ModelConfig = field(default_factory=ModelConfig)
+    protocol: ProtocolSettings = field(default_factory=ProtocolSettings)
 
     # GUI settings
     display_time: float = 5.0
@@ -184,7 +236,44 @@ class PipelineConfig:
                 "inception_learning_rate": self.model.inception_learning_rate,
                 "inception_optimizer": self.model.inception_optimizer,
                 "inception_early_stopping": self.model.inception_early_stopping,
-                "inception_patience": self.model.inception_patience
+                "inception_patience": self.model.inception_patience,
+                "inception_weight_decay": self.model.inception_weight_decay,
+                "inception_scheduler": self.model.inception_scheduler,
+                "mstnet_base_filters": self.model.mstnet_base_filters,
+                "mstnet_kernels": self.model.mstnet_kernels,
+                "mstnet_num_blocks": self.model.mstnet_num_blocks,
+                "mstnet_epochs": self.model.mstnet_epochs,
+                "mstnet_batch_size": self.model.mstnet_batch_size,
+                "mstnet_learning_rate": self.model.mstnet_learning_rate,
+                "mstnet_optimizer": self.model.mstnet_optimizer,
+                "mstnet_early_stopping": self.model.mstnet_early_stopping,
+                "mstnet_patience": self.model.mstnet_patience,
+                "mstnet_weight_decay": self.model.mstnet_weight_decay,
+                "mstnet_scheduler": self.model.mstnet_scheduler,
+                "mstnet_dropout": self.model.mstnet_dropout
+            },
+            "protocol": {
+                "std_preparation_time": self.protocol.std_preparation_time,
+                "std_cue_time": self.protocol.std_cue_time,
+                "std_hold_time": self.protocol.std_hold_time,
+                "std_release_time": self.protocol.std_release_time,
+                "std_rest_time": self.protocol.std_rest_time,
+                "std_repetitions": self.protocol.std_repetitions,
+                "std_randomize": self.protocol.std_randomize,
+                "quick_preparation_time": self.protocol.quick_preparation_time,
+                "quick_cue_time": self.protocol.quick_cue_time,
+                "quick_hold_time": self.protocol.quick_hold_time,
+                "quick_release_time": self.protocol.quick_release_time,
+                "quick_rest_time": self.protocol.quick_rest_time,
+                "quick_repetitions": self.protocol.quick_repetitions,
+                "quick_randomize": self.protocol.quick_randomize,
+                "cal_preparation_time": self.protocol.cal_preparation_time,
+                "cal_cue_time": self.protocol.cal_cue_time,
+                "cal_hold_time": self.protocol.cal_hold_time,
+                "cal_release_time": self.protocol.cal_release_time,
+                "cal_rest_time": self.protocol.cal_rest_time,
+                "cal_repetitions": self.protocol.cal_repetitions,
+                "cal_randomize": self.protocol.cal_randomize
             },
             "display_time": self.display_time,
             "update_rate_hz": self.update_rate_hz
@@ -271,7 +360,47 @@ class PipelineConfig:
                 inception_learning_rate=m.get("inception_learning_rate", config.model.inception_learning_rate),
                 inception_optimizer=m.get("inception_optimizer", config.model.inception_optimizer),
                 inception_early_stopping=m.get("inception_early_stopping", config.model.inception_early_stopping),
-                inception_patience=m.get("inception_patience", config.model.inception_patience)
+                inception_patience=m.get("inception_patience", config.model.inception_patience),
+                inception_weight_decay=m.get("inception_weight_decay", config.model.inception_weight_decay),
+                inception_scheduler=m.get("inception_scheduler", config.model.inception_scheduler),
+                mstnet_base_filters=m.get("mstnet_base_filters", config.model.mstnet_base_filters),
+                mstnet_kernels=m.get("mstnet_kernels", config.model.mstnet_kernels),
+                mstnet_num_blocks=m.get("mstnet_num_blocks", config.model.mstnet_num_blocks),
+                mstnet_epochs=m.get("mstnet_epochs", config.model.mstnet_epochs),
+                mstnet_batch_size=m.get("mstnet_batch_size", config.model.mstnet_batch_size),
+                mstnet_learning_rate=m.get("mstnet_learning_rate", config.model.mstnet_learning_rate),
+                mstnet_optimizer=m.get("mstnet_optimizer", config.model.mstnet_optimizer),
+                mstnet_early_stopping=m.get("mstnet_early_stopping", config.model.mstnet_early_stopping),
+                mstnet_patience=m.get("mstnet_patience", config.model.mstnet_patience),
+                mstnet_weight_decay=m.get("mstnet_weight_decay", config.model.mstnet_weight_decay),
+                mstnet_scheduler=m.get("mstnet_scheduler", config.model.mstnet_scheduler),
+                mstnet_dropout=m.get("mstnet_dropout", config.model.mstnet_dropout)
+            )
+
+        if "protocol" in data:
+            p = data["protocol"]
+            config.protocol = ProtocolSettings(
+                std_preparation_time=p.get("std_preparation_time", config.protocol.std_preparation_time),
+                std_cue_time=p.get("std_cue_time", config.protocol.std_cue_time),
+                std_hold_time=p.get("std_hold_time", config.protocol.std_hold_time),
+                std_release_time=p.get("std_release_time", config.protocol.std_release_time),
+                std_rest_time=p.get("std_rest_time", config.protocol.std_rest_time),
+                std_repetitions=p.get("std_repetitions", config.protocol.std_repetitions),
+                std_randomize=p.get("std_randomize", config.protocol.std_randomize),
+                quick_preparation_time=p.get("quick_preparation_time", config.protocol.quick_preparation_time),
+                quick_cue_time=p.get("quick_cue_time", config.protocol.quick_cue_time),
+                quick_hold_time=p.get("quick_hold_time", config.protocol.quick_hold_time),
+                quick_release_time=p.get("quick_release_time", config.protocol.quick_release_time),
+                quick_rest_time=p.get("quick_rest_time", config.protocol.quick_rest_time),
+                quick_repetitions=p.get("quick_repetitions", config.protocol.quick_repetitions),
+                quick_randomize=p.get("quick_randomize", config.protocol.quick_randomize),
+                cal_preparation_time=p.get("cal_preparation_time", config.protocol.cal_preparation_time),
+                cal_cue_time=p.get("cal_cue_time", config.protocol.cal_cue_time),
+                cal_hold_time=p.get("cal_hold_time", config.protocol.cal_hold_time),
+                cal_release_time=p.get("cal_release_time", config.protocol.cal_release_time),
+                cal_rest_time=p.get("cal_rest_time", config.protocol.cal_rest_time),
+                cal_repetitions=p.get("cal_repetitions", config.protocol.cal_repetitions),
+                cal_randomize=p.get("cal_randomize", config.protocol.cal_randomize)
             )
 
         config.display_time = data.get("display_time", config.display_time)

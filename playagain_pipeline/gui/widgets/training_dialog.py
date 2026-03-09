@@ -10,12 +10,14 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
     QLabel, QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox,
     QPushButton, QProgressBar, QTabWidget, QWidget, QTextEdit,
-    QTableWidget, QTableWidgetItem, QHeaderView
+    QTableWidget, QTableWidgetItem, QHeaderView, QRadioButton,
+    QButtonGroup, QListWidget, QListWidgetItem, QMessageBox
 )
-from PySide6.QtCore import Signal, Slot, QThread
+from PySide6.QtCore import Signal, Slot, QThread, Qt
 import pyqtgraph as pg
 
 from playagain_pipeline.config.config import PipelineConfig, ModelConfig
+from playagain_pipeline.models.feature_pipeline import get_registered_features
 
 
 class TrainingWorker(QThread):
@@ -43,17 +45,48 @@ class TrainingWorker(QThread):
     def run(self):
         """Run the training in background thread."""
         try:
-            self.progress.emit(10, "Extracting features...")
+            self.progress.emit(5, "Loading data...")
 
-            # Define callback for iterative models (e.g. MLP)
+            # Determine total epochs for iterative models
+            total_epochs = self.kwargs.get("epochs", 0)
+            if total_epochs == 0:
+                # Try to get from the model's hyperparameters
+                if hasattr(self.model, 'hyperparameters'):
+                    total_epochs = self.model.hyperparameters.get("epochs", 0)
+
+            self.progress.emit(10, "Extracting features & preparing data...")
+
+            # Define callback for iterative models (e.g. MLP, CNN)
             def progress_callback(epoch, train_loss, val_loss, train_acc=0.0, val_acc=0.0):
                 self.iteration_update.emit(epoch, train_loss, val_loss, train_acc, val_acc)
-                # Keep progress between 10 and 90 during training
-                # This is approximate since we don't know total epochs easily here without parsing kwargs
-                # Removed explicit log emission as requested, data is in plots and table
+                # Scale progress from 20% to 95% based on epoch/total_epochs
+                if total_epochs > 0:
+                    pct = 20 + int(75 * epoch / total_epochs)
+                    pct = min(pct, 95)
+                    self.progress.emit(pct, f"Training epoch {epoch}/{total_epochs}...")
 
             # Add callback to kwargs
             self.kwargs['callback'] = progress_callback
+
+            # For non-iterative models, use a background timer to simulate progress
+            is_iterative = hasattr(self.model, 'hyperparameters') and \
+                           self.model.hyperparameters.get("epochs", 0) > 0
+
+            if not is_iterative:
+                self.progress.emit(15, "Extracting features...")
+                # Start a simulated progress thread that advances 20% → 90%
+                import threading, time as _time
+                _sim_stop = threading.Event()
+
+                def _simulate_progress():
+                    pct = 20
+                    while not _sim_stop.is_set() and pct < 90:
+                        self.progress.emit(pct, "Training model...")
+                        _sim_stop.wait(timeout=0.5)
+                        pct = min(pct + 3, 90)
+
+                sim_thread = threading.Thread(target=_simulate_progress, daemon=True)
+                sim_thread.start()
 
             # Train model
             results = self.model.train(
@@ -62,10 +95,16 @@ class TrainingWorker(QThread):
                 **self.kwargs
             )
 
+            if not is_iterative:
+                _sim_stop.set()
+                sim_thread.join(timeout=1.0)
+
             self.progress.emit(100, "Training complete!")
             self.finished.emit(results)
 
         except Exception as e:
+            if not is_iterative and '_sim_stop' in dir():
+                _sim_stop.set()
             self.error.emit(str(e))
 
 
@@ -95,6 +134,8 @@ class HyperparameterWidget(QWidget):
             self._setup_cnn_params(layout)
         elif self.model_type == "attention_net":
             self._setup_inception_params(layout)
+        elif self.model_type == "mstnet":
+            self._setup_mstnet_params(layout)
         else:
             layout.addWidget(QLabel("No hyperparameters for this model type"))
 
@@ -248,7 +289,7 @@ class HyperparameterWidget(QWidget):
         # Optimizer
         grid.addWidget(QLabel("Optimizer:"), 4, 0)
         self.optimizer_combo = QComboBox()
-        self.optimizer_combo.addItems(["Adam", "RMSprop", "SGD"])
+        self.optimizer_combo.addItems(["Adam", "AdamW", "RMSprop", "SGD"])
         self.optimizer_combo.setCurrentText(self.config.model.mlp_optimizer.capitalize())
         grid.addWidget(self.optimizer_combo, 4, 1)
 
@@ -263,6 +304,25 @@ class HyperparameterWidget(QWidget):
         self.patience_spin.setRange(1, 100)
         self.patience_spin.setValue(self.config.model.mlp_patience)
         grid.addWidget(self.patience_spin, 5, 2)
+
+        # Weight Decay
+        grid.addWidget(QLabel("Weight Decay:"), 6, 0)
+        self.weight_decay_spin = QDoubleSpinBox()
+        self.weight_decay_spin.setDecimals(5)
+        self.weight_decay_spin.setRange(0.0, 1.0)
+        self.weight_decay_spin.setValue(self.config.model.mlp_weight_decay)
+        self.weight_decay_spin.setSingleStep(0.001)
+        grid.addWidget(self.weight_decay_spin, 6, 1)
+
+        # LR Scheduler
+        grid.addWidget(QLabel("LR Scheduler:"), 7, 0)
+        self.scheduler_combo = QComboBox()
+        self.scheduler_combo.addItems(["None", "Cosine Annealing", "Reduce on Plateau", "Step"])
+        self.scheduler_combo.setCurrentText(
+            {"none": "None", "cosine": "Cosine Annealing", "plateau": "Reduce on Plateau", "step": "Step"}
+            .get(self.config.model.mlp_scheduler, "None")
+        )
+        grid.addWidget(self.scheduler_combo, 7, 1)
 
         layout.addLayout(grid)
 
@@ -318,7 +378,7 @@ class HyperparameterWidget(QWidget):
         # Optimizer
         grid.addWidget(QLabel("Optimizer:"), 6, 0)
         self.optimizer_combo = QComboBox()
-        self.optimizer_combo.addItems(["Adam", "RMSprop", "SGD"])
+        self.optimizer_combo.addItems(["Adam", "AdamW", "RMSprop", "SGD"])
         self.optimizer_combo.setCurrentText(self.config.model.cnn_optimizer.capitalize())
         grid.addWidget(self.optimizer_combo, 6, 1)
 
@@ -336,6 +396,25 @@ class HyperparameterWidget(QWidget):
         self.patience_spin.setValue(self.config.model.cnn_patience)
         grid.addWidget(self.patience_spin, row_es, 2)
 
+        # Weight Decay
+        grid.addWidget(QLabel("Weight Decay:"), 8, 0)
+        self.weight_decay_spin = QDoubleSpinBox()
+        self.weight_decay_spin.setDecimals(5)
+        self.weight_decay_spin.setRange(0.0, 1.0)
+        self.weight_decay_spin.setValue(self.config.model.cnn_weight_decay)
+        self.weight_decay_spin.setSingleStep(0.001)
+        grid.addWidget(self.weight_decay_spin, 8, 1)
+
+        # LR Scheduler
+        grid.addWidget(QLabel("LR Scheduler:"), 9, 0)
+        self.scheduler_combo = QComboBox()
+        self.scheduler_combo.addItems(["None", "Cosine Annealing", "Reduce on Plateau", "Step"])
+        self.scheduler_combo.setCurrentText(
+            {"none": "None", "cosine": "Cosine Annealing", "plateau": "Reduce on Plateau", "step": "Step"}
+            .get(self.config.model.cnn_scheduler, "None")
+        )
+        grid.addWidget(self.scheduler_combo, 9, 1)
+
         layout.addLayout(grid)
 
     def _setup_inception_params(self, layout):
@@ -345,14 +424,23 @@ class HyperparameterWidget(QWidget):
         grid.addWidget(QLabel("Base Channels:"), 0, 0)
         self.inc_base_spin = QSpinBox()
         self.inc_base_spin.setRange(8, 256)
-        self.inc_base_spin.setValue(int(self.config.model.inception_filters.split(",")[0].strip()) if self.config.model.inception_filters else 32)
+        try:
+            default_base = int(self.config.model.inception_filters.split(",")[0].strip())
+        except (ValueError, IndexError):
+            default_base = 32
+        self.inc_base_spin.setValue(default_base)
         grid.addWidget(self.inc_base_spin, 0, 1)
 
         # Inception Branch Kernel Sizes
         grid.addWidget(QLabel("Branch Kernels:"), 1, 0)
         self.inc_kernels_edit = QComboBox()
         self.inc_kernels_edit.setEditable(True)
-        self.inc_kernels_edit.addItems([self.config.model.inception_kernels, "3, 5", "3, 7", "5, 9", "3, 3"])
+        self.inc_kernels_edit.addItems([
+            self.config.model.inception_kernels,
+            "3, 5", "3, 7", "5, 9", "3, 3",
+            "3, 5, 7", "3, 5, 9", "3, 7, 15", "5, 9, 15",
+            "3", "5", "7", "3, 15, 39"
+        ])
         self.inc_kernels_edit.setCurrentText(self.config.model.inception_kernels)
         grid.addWidget(self.inc_kernels_edit, 1, 1)
 
@@ -396,7 +484,7 @@ class HyperparameterWidget(QWidget):
         # Optimizer
         grid.addWidget(QLabel("Optimizer:"), 7, 0)
         self.optimizer_combo = QComboBox()
-        self.optimizer_combo.addItems(["Adam", "RMSprop", "SGD"])
+        self.optimizer_combo.addItems(["Adam", "AdamW", "RMSprop", "SGD"])
         self.optimizer_combo.setCurrentText(self.config.model.inception_optimizer.capitalize())
         grid.addWidget(self.optimizer_combo, 7, 1)
 
@@ -413,6 +501,115 @@ class HyperparameterWidget(QWidget):
         self.patience_spin.setRange(1, 100)
         self.patience_spin.setValue(self.config.model.inception_patience)
         grid.addWidget(self.patience_spin, row_es, 2)
+
+        # Weight Decay
+        grid.addWidget(QLabel("Weight Decay:"), 9, 0)
+        self.weight_decay_spin = QDoubleSpinBox()
+        self.weight_decay_spin.setDecimals(5)
+        self.weight_decay_spin.setRange(0.0, 1.0)
+        self.weight_decay_spin.setValue(self.config.model.inception_weight_decay)
+        self.weight_decay_spin.setSingleStep(0.001)
+        grid.addWidget(self.weight_decay_spin, 9, 1)
+
+        # LR Scheduler
+        grid.addWidget(QLabel("LR Scheduler:"), 10, 0)
+        self.scheduler_combo = QComboBox()
+        self.scheduler_combo.addItems(["None", "Cosine Annealing", "Reduce on Plateau", "Step"])
+        self.scheduler_combo.setCurrentText(
+            {"none": "None", "cosine": "Cosine Annealing", "plateau": "Reduce on Plateau", "step": "Step"}
+            .get(self.config.model.inception_scheduler, "None")
+        )
+        grid.addWidget(self.scheduler_combo, 10, 1)
+
+        layout.addLayout(grid)
+
+    def _setup_mstnet_params(self, layout):
+        grid = QGridLayout()
+
+        # Base Filters
+        grid.addWidget(QLabel("Base Filters:"), 0, 0)
+        self.mst_base_spin = QSpinBox()
+        self.mst_base_spin.setRange(8, 256)
+        self.mst_base_spin.setValue(self.config.model.mstnet_base_filters)
+        grid.addWidget(self.mst_base_spin, 0, 1)
+
+        # Multi-Scale Kernels
+        grid.addWidget(QLabel("MS Kernels:"), 1, 0)
+        self.mst_kernels_edit = QComboBox()
+        self.mst_kernels_edit.setEditable(True)
+        self.mst_kernels_edit.addItems([
+            self.config.model.mstnet_kernels,
+            "3, 7, 15", "3, 5, 11", "5, 11, 21", "3, 7"
+        ])
+        self.mst_kernels_edit.setCurrentText(self.config.model.mstnet_kernels)
+        grid.addWidget(self.mst_kernels_edit, 1, 1)
+
+        # Number of Blocks
+        grid.addWidget(QLabel("Num Blocks:"), 2, 0)
+        self.mst_blocks_spin = QSpinBox()
+        self.mst_blocks_spin.setRange(1, 6)
+        self.mst_blocks_spin.setValue(self.config.model.mstnet_num_blocks)
+        grid.addWidget(self.mst_blocks_spin, 2, 1)
+
+        # Epochs
+        grid.addWidget(QLabel("Epochs:"), 3, 0)
+        self.epochs_spin = QSpinBox()
+        self.epochs_spin.setRange(1, 10000)
+        self.epochs_spin.setValue(self.config.model.mstnet_epochs)
+        grid.addWidget(self.epochs_spin, 3, 1)
+
+        # Batch Size
+        grid.addWidget(QLabel("Batch Size:"), 4, 0)
+        self.batch_spin = QSpinBox()
+        self.batch_spin.setRange(1, 1024)
+        self.batch_spin.setValue(self.config.model.mstnet_batch_size)
+        grid.addWidget(self.batch_spin, 4, 1)
+
+        # Learning Rate
+        grid.addWidget(QLabel("Learning Rate:"), 5, 0)
+        self.lr_spin = QDoubleSpinBox()
+        self.lr_spin.setDecimals(5)
+        self.lr_spin.setRange(0.00001, 1.0)
+        self.lr_spin.setValue(self.config.model.mstnet_learning_rate)
+        grid.addWidget(self.lr_spin, 5, 1)
+
+        # Optimizer
+        grid.addWidget(QLabel("Optimizer:"), 6, 0)
+        self.optimizer_combo = QComboBox()
+        self.optimizer_combo.addItems(["Adam", "AdamW", "RMSprop", "SGD"])
+        self.optimizer_combo.setCurrentText(self.config.model.mstnet_optimizer.capitalize())
+        grid.addWidget(self.optimizer_combo, 6, 1)
+
+        # Early Stopping
+        self.early_stop_check = QCheckBox("Early Stopping")
+        self.early_stop_check.setChecked(self.config.model.mstnet_early_stopping)
+        grid.addWidget(self.early_stop_check, 7, 0)
+
+        # Patience
+        grid.addWidget(QLabel("Patience:"), 7, 1) # Reuse row if possible or new row
+        self.patience_spin = QSpinBox()
+        self.patience_spin.setRange(1, 100)
+        self.patience_spin.setValue(self.config.model.mstnet_patience)
+        grid.addWidget(self.patience_spin, 7, 2)
+
+        # Weight Decay
+        grid.addWidget(QLabel("Weight Decay:"), 8, 0)
+        self.weight_decay_spin = QDoubleSpinBox()
+        self.weight_decay_spin.setDecimals(5)
+        self.weight_decay_spin.setRange(0.0, 1.0)
+        self.weight_decay_spin.setValue(self.config.model.mstnet_weight_decay)
+        self.weight_decay_spin.setSingleStep(0.001)
+        grid.addWidget(self.weight_decay_spin, 8, 1)
+
+        # LR Scheduler
+        grid.addWidget(QLabel("LR Scheduler:"), 9, 0)
+        self.scheduler_combo = QComboBox()
+        self.scheduler_combo.addItems(["None", "Cosine Annealing", "Reduce on Plateau", "Step"])
+        self.scheduler_combo.setCurrentText(
+            {"none": "None", "cosine": "Cosine Annealing", "plateau": "Reduce on Plateau", "step": "Step"}
+            .get(self.config.model.mstnet_scheduler, "None")
+        )
+        grid.addWidget(self.scheduler_combo, 9, 1)
 
         layout.addLayout(grid)
 
@@ -462,7 +659,11 @@ class HyperparameterWidget(QWidget):
                 "optimizer": self.optimizer_combo.currentText().lower(),
                 "early_stopping": self.early_stop_check.isChecked(),
                 "patience": self.patience_spin.value(),
-                "dropout": 0.2
+                "dropout": 0.2,
+                "weight_decay": self.weight_decay_spin.value(),
+                "scheduler": {"None": "none", "Cosine Annealing": "cosine",
+                              "Reduce on Plateau": "plateau", "Step": "step"}
+                             .get(self.scheduler_combo.currentText(), "none"),
             }
         elif self.model_type == "cnn":
             # Parse filters
@@ -495,21 +696,20 @@ class HyperparameterWidget(QWidget):
                 "learning_rate": self.lr_spin.value(),
                 "optimizer": self.optimizer_combo.currentText().lower(),
                 "early_stopping": self.early_stop_check.isChecked(),
-                "patience": self.patience_spin.value()
+                "patience": self.patience_spin.value(),
+                "weight_decay": self.weight_decay_spin.value(),
+                "scheduler": {"None": "none", "Cosine Annealing": "cosine",
+                              "Reduce on Plateau": "plateau", "Step": "step"}
+                             .get(self.scheduler_combo.currentText(), "none"),
             }
 
         elif self.model_type == "attention_net":
-            # Parse branch kernel sizes
+            # Parse branch kernel sizes (variable number supported)
             try:
                 kernels_str = self.inc_kernels_edit.currentText()
-                kernels_list = [int(x.strip()) for x in kernels_str.split(",") if x.strip()]
-                if not kernels_list:
-                    kernels_list = [3, 5]
-                # Ensure exactly two kernel sizes: repeat last if only one provided, or take first two
-                if len(kernels_list) == 1:
-                    kernels = [kernels_list[0], kernels_list[0]]
-                else:
-                    kernels = kernels_list[:2]
+                kernels = [int(x.strip()) for x in kernels_str.split(",") if x.strip()]
+                if not kernels:
+                    kernels = [3, 5]
             except ValueError:
                 kernels = [3, 5]
 
@@ -523,6 +723,37 @@ class HyperparameterWidget(QWidget):
                 "optimizer": self.optimizer_combo.currentText().lower(),
                 "early_stopping": self.early_stop_check.isChecked(),
                 "patience": self.patience_spin.value(),
+                "weight_decay": self.weight_decay_spin.value(),
+                "scheduler": {"None": "none", "Cosine Annealing": "cosine",
+                              "Reduce on Plateau": "plateau", "Step": "step"}
+                             .get(self.scheduler_combo.currentText(), "none"),
+            }
+
+        elif self.model_type == "mstnet":
+            # Parse multi-scale kernels
+            try:
+                kernels_str = self.mst_kernels_edit.currentText()
+                ms_kernels = [int(x.strip()) for x in kernels_str.split(",") if x.strip()]
+                if not ms_kernels:
+                    ms_kernels = [3, 7, 15]
+            except ValueError:
+                ms_kernels = [3, 7, 15]
+
+            params = {
+                "base_filters": self.mst_base_spin.value(),
+                "ms_kernels": ms_kernels,
+                "num_blocks": self.mst_blocks_spin.value(),
+                "epochs": self.epochs_spin.value(),
+                "batch_size": self.batch_spin.value(),
+                "learning_rate": self.lr_spin.value(),
+                "optimizer": self.optimizer_combo.currentText().lower(),
+                "early_stopping": self.early_stop_check.isChecked(),
+                "patience": self.patience_spin.value(),
+                "dropout": self.config.model.mstnet_dropout,
+                "weight_decay": self.weight_decay_spin.value(),
+                "scheduler": {"None": "none", "Cosine Annealing": "cosine",
+                              "Reduce on Plateau": "plateau", "Step": "step"}
+                             .get(self.scheduler_combo.currentText(), "none"),
             }
 
         return params
@@ -627,6 +858,11 @@ class TrainingProgressDialog(QDialog):
         self.hyperparam_widget = HyperparameterWidget(self.model_type, self.config)
         self.tabs.addTab(self.hyperparam_widget, "Hyperparameters")
 
+        # Feature Selection Tab
+        self.features_widget = QWidget()
+        self._setup_features_tab()
+        self.tabs.addTab(self.features_widget, "Features")
+
         # Progress tab
         progress_widget = QWidget()
         progress_layout = QVBoxLayout(progress_widget)
@@ -696,7 +932,7 @@ class TrainingProgressDialog(QDialog):
 
         self.save_btn = QPushButton("Save Model")
         self.save_btn.setEnabled(False)
-        self.save_btn.clicked.connect(self.accept)
+        self.save_btn.clicked.connect(self._on_save_model)
         button_layout.addWidget(self.save_btn)
 
         layout.addLayout(button_layout)
@@ -751,6 +987,83 @@ class TrainingProgressDialog(QDialog):
             self.info_layout.addWidget(QLabel(f"Classes: {metadata.get('num_classes', 0)}"), 1, 0)
             self.info_layout.addWidget(QLabel(f"Channels: {metadata.get('num_channels', 0)}"), 1, 1)
 
+    def _setup_features_tab(self):
+        """Setup the features selection tab."""
+        layout = QVBoxLayout(self.features_widget)
+
+        # Mode Selection
+        mode_group = QGroupBox("Feature Mode")
+        mode_layout = QVBoxLayout(mode_group)
+
+        self.btn_group = QButtonGroup(self)
+        self.btn_group.setExclusive(True)
+
+        self.radio_default = QRadioButton("Use All Features (Default)")
+        self.radio_default.setChecked(True)
+        self.btn_group.addButton(self.radio_default)
+        mode_layout.addWidget(self.radio_default)
+
+        self.radio_raw = QRadioButton("Use Raw EMG Only")
+        self.btn_group.addButton(self.radio_raw)
+        mode_layout.addWidget(self.radio_raw)
+
+        self.radio_custom = QRadioButton("Custom Selection")
+        self.btn_group.addButton(self.radio_custom)
+        mode_layout.addWidget(self.radio_custom)
+
+        self.btn_group.buttonClicked.connect(self._on_feature_mode_changed)
+
+        layout.addWidget(mode_group)
+
+        # Feature List
+        list_group = QGroupBox("Available Features")
+        list_layout = QVBoxLayout(list_group)
+
+        self.feature_list = QListWidget()
+        self.feature_list.setSelectionMode(QListWidget.SelectionMode.MultiSelection)
+        self.feature_list.setEnabled(False)
+
+        # Populate features
+        features = get_registered_features()
+        for name in sorted(features.keys()):
+            item = QListWidgetItem(name)
+            item.setCheckState(Qt.CheckState.Unchecked)
+            self.feature_list.addItem(item)
+
+        list_layout.addWidget(self.feature_list)
+
+        # Selection buttons
+        btn_layout = QHBoxLayout()
+        self.select_all_btn = QPushButton("Select All")
+        self.select_all_btn.clicked.connect(self._on_select_all_features)
+        self.select_all_btn.setEnabled(False)
+        btn_layout.addWidget(self.select_all_btn)
+
+        self.deselect_all_btn = QPushButton("Deselect All")
+        self.deselect_all_btn.clicked.connect(self._on_deselect_all_features)
+        self.deselect_all_btn.setEnabled(False)
+        btn_layout.addWidget(self.deselect_all_btn)
+
+        list_layout.addLayout(btn_layout)
+        layout.addWidget(list_group)
+
+    def _on_feature_mode_changed(self, button):
+        """Handle feature mode change."""
+        is_custom = self.radio_custom.isChecked()
+        self.feature_list.setEnabled(is_custom)
+        self.select_all_btn.setEnabled(is_custom)
+        self.deselect_all_btn.setEnabled(is_custom)
+
+    def _on_select_all_features(self):
+        """Select all features in the list."""
+        for i in range(self.feature_list.count()):
+            self.feature_list.item(i).setCheckState(Qt.CheckState.Checked)
+
+    def _on_deselect_all_features(self):
+        """Deselect all features in the list."""
+        for i in range(self.feature_list.count()):
+            self.feature_list.item(i).setCheckState(Qt.CheckState.Unchecked)
+
     @Slot()
     def _on_start_training(self):
         """Start the training process."""
@@ -797,7 +1110,19 @@ class TrainingProgressDialog(QDialog):
                 models_dir = pipeline_dir / "data" / "models"
                 model_manager = ModelManager(models_dir)
             hyperparams = self.hyperparam_widget.get_hyperparameters()
+
+            # Add feature configuration to hyperparameters
+            feature_config = self.get_feature_config()
+            hyperparams["feature_config"] = feature_config
+
             model = model_manager.create_model(self.model_type, **hyperparams)
+
+            if feature_config["mode"] == "raw":
+                self._log("Using RAW EMG signals (no feature extraction)")
+            elif feature_config["mode"] == "custom":
+                self._log(f"Using custom features: {', '.join(feature_config['features'])}")
+            else:
+                self._log("Using default feature set")
 
             self._log(f"Training {self.model_type} model...")
 
@@ -817,7 +1142,8 @@ class TrainingProgressDialog(QDialog):
             # Start training in background
             kwargs = {
                 "window_size_ms": self.dataset["metadata"].get("window_size_ms", 200),
-                "sampling_rate": self.dataset["metadata"].get("sampling_rate", 2000)
+                "sampling_rate": self.dataset["metadata"].get("sampling_rate", 2000),
+                "num_channels": self.dataset["metadata"].get("num_channels", 0),
             }
 
             self._worker = TrainingWorker(model, X_train, y_train, X_val, y_val, kwargs)
@@ -887,6 +1213,11 @@ class TrainingProgressDialog(QDialog):
         if self._model.metadata and "label_names" in self.dataset["metadata"]:
             self._model.metadata.class_names = self.dataset["metadata"]["label_names"]
 
+        # Store feature extraction info so prediction path knows what to expect
+        if self._model.metadata:
+            self._model.metadata.features_extracted = self.dataset["metadata"].get("features_extracted", False)
+            self._model.metadata.feature_config = self.dataset["metadata"].get("feature_config", None)
+
         self._results = results
 
         # -- New: set model name to the requested scheme: model_<datasetname>
@@ -907,7 +1238,10 @@ class TrainingProgressDialog(QDialog):
 
             # Use model type if available
             prefix = self.model_type if self.model_type else "model"
-            model_name = f"{prefix}_{safe_name}"
+            # Add time stamp so re-training doesn't overwrite previous runs
+            from datetime import datetime as _dt
+            ts = _dt.now().strftime("%H%M%S")
+            model_name = f"{prefix}_{safe_name}_{ts}"
 
             if hasattr(self, '_model') and self._model:
                 # Set model.name so callers that save by model.name use the desired scheme
@@ -942,3 +1276,54 @@ class TrainingProgressDialog(QDialog):
     def get_results(self) -> Dict[str, Any]:
         """Get training results."""
         return getattr(self, '_results', {})
+
+    @Slot()
+    def _on_save_model(self):
+        """Save the trained model without closing."""
+        if self._model:
+            try:
+                # Use parent window's model_manager if available
+                if hasattr(self.parent(), 'model_manager'):
+                    model_manager = self.parent().model_manager
+                    # The model name is already set in _on_training_finished
+                    model_manager._current_model = self._model
+                    self._model.save(model_manager.models_dir / self._model.name)
+                    self._log(f"Model saved: {self._model.name}")
+
+                    # Refresh parent model list if possible
+                    if hasattr(self.parent(), '_refresh_models'):
+                        self.parent()._refresh_models()
+
+                    QMessageBox.information(self, "Success", f"Model saved as '{self._model.name}'")
+                else:
+                    # Fallback save
+                    from pathlib import Path
+                    save_dir = Path("data/models") / self._model.name
+                    self._model.save(save_dir)
+                    self._log(f"Model saved to: {save_dir}")
+                    QMessageBox.information(self, "Success", f"Model saved to '{save_dir}'")
+            except Exception as e:
+                self._log(f"Error saving model: {e}")
+                QMessageBox.critical(self, "Error", f"Failed to save model: {e}")
+
+    def get_feature_config(self) -> Dict[str, Any]:
+        """Get the feature configuration based on UI selection."""
+        config = {
+            "mode": "default",
+            "features": []
+        }
+
+        if self.radio_raw.isChecked():
+            config["mode"] = "raw"
+        elif self.radio_default.isChecked():
+            config["mode"] = "default"
+        elif self.radio_custom.isChecked():
+            config["mode"] = "custom"
+            selected_features = []
+            for i in range(self.feature_list.count()):
+                item = self.feature_list.item(i)
+                if item.checkState() == Qt.CheckState.Checked:
+                    selected_features.append(item.text())
+            config["features"] = selected_features
+
+        return config
