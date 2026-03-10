@@ -14,6 +14,23 @@ from PySide6.QtCore import Slot, Signal, QMutex, QMutexLocker, QTimer, Qt
 from gui_custom_elements.vispy.biosignal_plot import VispyBiosignalPlot
 
 
+def _send_ordered_data_to_plot(plot_widget, ordered_data: np.ndarray) -> None:
+    """Send buffered EMG data to the plotting backend.
+
+    Internal buffers store data as ``(samples, channels)``, while
+    ``VispyBiosignalPlot`` expects ``(channels, samples)`` via
+    ``update_plot(...)``.
+    """
+    if ordered_data.size == 0:
+        return
+
+    plot_data = ordered_data.T
+    if hasattr(plot_widget, 'update_plot'):
+        plot_widget.update_plot(plot_data)
+    elif hasattr(plot_widget, 'update_data'):
+        plot_widget.update_data(ordered_data)
+
+
 class EMGPlotWidget(QWidget):
     """
     Widget for displaying real-time EMG signals.
@@ -196,8 +213,7 @@ class EMGPlotWidget(QWidget):
         with QMutexLocker(self._data_mutex):
             ordered_data = self._get_ordered_data()
 
-        if hasattr(self.plot_widget, 'update_data') and ordered_data.size > 0:
-            self.plot_widget.update_data(ordered_data)
+        _send_ordered_data_to_plot(self.plot_widget, ordered_data)
 
     def set_channel_visible(self, channel: int, visible: bool):
         """Set visibility of a specific channel."""
@@ -441,9 +457,7 @@ class EMGPlotWindow(QMainWindow):
         with QMutexLocker(self._data_mutex):
             ordered_data = self._get_ordered_data()
 
-        # Update plot with the data
-        if hasattr(self.plot_widget, 'update_data') and ordered_data.size > 0:
-            self.plot_widget.update_data(ordered_data)
+        _send_ordered_data_to_plot(self.plot_widget, ordered_data)
 
     def set_num_channels(self, num_channels: int):
         """Update the number of channels."""
@@ -500,4 +514,3 @@ class EMGPlotWindow(QMainWindow):
         self._update_timer.stop()
         self.closed.emit()
         event.accept()
-
