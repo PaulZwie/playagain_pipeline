@@ -331,16 +331,13 @@ class MainWindow(QMainWindow):
         channel_note.setWordWrap(True)
         device_layout.addRow(channel_note)
 
-        # Bad channel handling mode
-        self.bad_channel_mode_combo = QComboBox()
-        self.bad_channel_mode_combo.addItems(["Zero bad channels", "Remove bad channels"])
-        self.bad_channel_mode_combo.setToolTip(
-            "Zero: keeps all channels but sets bad ones to 0 (preserves dimensionality).\n"
-            "Remove: physically drops bad channels from the data stream.\n"
-            "  Use Remove + a pretrained model with the MLP projection layer option\n"
-            "  in the Prediction tab to handle dimension mismatches."
+        # Bad channel handling info
+        bad_ch_label = QLabel("Interpolate from neighbors")
+        bad_ch_label.setToolTip(
+            "Bad channels are replaced by the average of their two\n"
+            "circular neighbors, preserving channel dimensionality."
         )
-        device_layout.addRow("Bad Ch. Handling:", self.bad_channel_mode_combo)
+        device_layout.addRow("Bad Ch. Handling:", bad_ch_label)
 
         # Internal state for excluded channels (updated by plot widget signal)
         self._excluded_channels: list[int] = []
@@ -709,17 +706,7 @@ class MainWindow(QMainWindow):
         self.load_model_btn.clicked.connect(self._on_load_model)
         model_layout.addRow(self.load_model_btn)
 
-        # MLP projection layer for channel mismatch (used with "Remove bad channels" mode)
-        self.use_mlp_projection_cb = QCheckBox("Use MLP projection layer for channel mismatch")
-        self.use_mlp_projection_cb.setChecked(True)
-        self.use_mlp_projection_cb.setToolTip(
-            "When 'Remove bad channels' mode is active, the input to the model\n"
-            "may have fewer channels than it was trained on. This option inserts\n"
-            "a small MLP layer that projects from the reduced channel count back\n"
-            "to the expected input size, enabling pretrained models to be used\n"
-            "even when some channels are excluded."
-        )
-        model_layout.addRow(self.use_mlp_projection_cb)
+
 
         # Pretrained model workflow guide
         pretrained_info = QLabel(
@@ -1305,13 +1292,9 @@ class MainWindow(QMainWindow):
     def _on_data_received(self, data: np.ndarray):
         """Handle incoming EMG data."""
         bad_channels = self._get_excluded_channels()
-        remove_mode = self.bad_channel_mode_combo.currentText() == "Remove bad channels"
-        original_channels = data.shape[1]
 
         # Always show ALL channels in the plot (including bad ones) so the
         # checkbox state is not reset by reconfiguring the plot widget.
-        # Bad-channel removal only affects downstream consumers (prediction,
-        # recording, server).
         if self._plot_widget and self._plot_widget.isVisible():
             if data.shape[1] != self._plot_widget.num_channels:
                 old_ch = self._plot_widget.num_channels
@@ -1319,27 +1302,16 @@ class MainWindow(QMainWindow):
                 self._log(f"Plot display reconfigured: {old_ch} -> {data.shape[1]} channels")
             self._plot_widget.update_data(data)
 
-        # Build downstream data with bad channels handled
+        # Interpolate bad channels from circular neighbors
         downstream_data = data
         if bad_channels:
             downstream_data = data.copy()
-            if remove_mode:
-                # Physically remove bad channels for downstream consumers only
-                keep_mask = [i for i in range(data.shape[1]) if i not in bad_channels]
-                downstream_data = downstream_data[:, keep_mask] if keep_mask else downstream_data
-                # Log channel removal for user awareness (throttled to avoid spam)
-                if not hasattr(self, '_last_channel_warning'):
-                    self._last_channel_warning = 0
-                from time import time
-                if time() - self._last_channel_warning > 5.0:  # Log every 5 seconds max
-                    self._log(f"Removed {len(bad_channels)} bad channel(s): {bad_channels}. "
-                             f"Downstream data has {downstream_data.shape[1]}/{original_channels} channels.")
-                    self._last_channel_warning = time()
-            else:
-                # Zero-out bad channels (keep all channels to preserve dimensionality)
-                for ch_idx in bad_channels:
-                    if ch_idx < downstream_data.shape[1]:
-                        downstream_data[:, ch_idx] = 0.0
+            n_ch = downstream_data.shape[1]
+            for ch_idx in bad_channels:
+                if ch_idx < n_ch:
+                    left = (ch_idx - 1) % n_ch
+                    right = (ch_idx + 1) % n_ch
+                    downstream_data[:, ch_idx] = 0.5 * (downstream_data[:, left] + downstream_data[:, right])
 
         # Apply calibration channel reordering for prediction/server
         # (not for raw plot or session recording — those stay in physical order)
@@ -2438,15 +2410,8 @@ class MainWindow(QMainWindow):
             # Warn if channel count differs from model's trained channel count
             model_ch = self._current_model.metadata.num_channels
             if model_ch > 0 and num_ch != model_ch:
-                if self.use_mlp_projection_cb.isChecked():
                     self._log(
-                        f"  Channel mismatch: device has {num_ch} ch, model trained on {model_ch} ch. "
-                        f"MLP projection layer will be used automatically."
-                    )
-                else:
-                    self._log(
-                        f"  Channel mismatch: device has {num_ch} ch, model trained on {model_ch} ch. "
-                        f"Enable 'MLP projection layer' option to allow prediction."
+                        f"  Channel mismatch: device has {num_ch} ch, model trained on {model_ch} ch."
                     )
 
         except Exception as e:

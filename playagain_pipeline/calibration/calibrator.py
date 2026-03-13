@@ -5,17 +5,24 @@ This module provides robust algorithms to detect the orientation of EMG
 electrodes and create channel mappings that correct for different bracelet
 positions.
 
-Calibration can be performed directly from normal recording sessions —
-no separate calibration recording is required. The system extracts
-per-gesture activation patterns from the annotated trial data and uses
-circular cross-correlation against a reference to find the rotation offset.
+Uses the Maximum Energy Channel (MEC) method based on:
+  Barona López et al., "An Energy-Based Method for Orientation Correction
+  of EMG Bracelet Sensors in Hand Gesture Recognition Systems",
+  Sensors 2020, 20, 6327.
 
-Improvements:
-- Works directly from normal recording sessions (no separate calibration step)
-- Bandpass filtering (20-450 Hz) for cleaner EMG signals
-- Multi-feature spatial patterns (RMS + MAV + spectral power)
-- Multiple trial repetitions averaged with outlier rejection
-- Confidence scoring with margin-based validation
+The algorithm works as follows:
+  1. A synchronization gesture is recorded (e.g. fist or waveOut).
+  2. Per-channel energy is computed using the EMG energy formula:
+       E_ch = sum_{i=2}^{L} |x_i * |x_i| - x_{i-1} * |x_{i-1}||
+  3. The channel with the maximum average energy (MEC) is identified.
+  4. Channels are circularly rearranged so the MEC becomes channel 0.
+
+The MEC from the reference recording is stored. Subsequent recordings
+find *their* MEC, and the rotation offset is the circular distance
+between the two MECs.
+
+Calibration can be performed directly from normal recording sessions —
+no separate calibration recording is required.
 """
 
 from dataclasses import dataclass, field
@@ -24,7 +31,6 @@ from pathlib import Path
 import json
 import numpy as np
 from scipy import signal as scipy_signal
-from scipy.stats import pearsonr
 from datetime import datetime
 
 
@@ -102,17 +108,22 @@ class CalibrationResult:
 
 class CalibrationProcessor:
     """
-    Processes calibration data to determine electrode orientation.
+    Processes calibration data to determine electrode orientation using the
+    Maximum Energy Channel (MEC) method.
 
-    Uses robust multi-feature activation patterns from specific gestures
-    to identify which muscles are under which electrodes, allowing
-    correction for different bracelet orientations.
+    The energy of each channel is computed using the formula from
+    Barona López et al. (Sensors 2020):
+        E_ch = sum_{i=2}^{L} |x_i * |x_i| - x_{i-1} * |x_{i-1}||
+
+    The channel with the highest average energy across repetitions of a
+    synchronization gesture is the MEC. The rotation offset is the circular
+    distance between the current MEC and the reference MEC.
 
     Features:
     - Bandpass filtering to remove noise and motion artifacts
-    - Multi-feature patterns (RMS + MAV + spectral) for richer representation
-    - Multiple repetitions with outlier rejection for robust averaging
-    - Confidence scoring per gesture and overall
+    - Energy computation per channel following the paper's formula
+    - Multiple repetitions averaged with outlier rejection
+    - Confidence scoring based on energy peak prominence
     """
 
     def __init__(self, num_channels: int = 32, sampling_rate: int = 2000):
@@ -209,459 +220,197 @@ class CalibrationProcessor:
 
         return envelope
 
-    def compute_activation_pattern(
-        self,
-        data: np.ndarray,
-        normalize: bool = True
-    ) -> np.ndarray:
+    def compute_channel_energy(self, data: np.ndarray) -> np.ndarray:
         """
-        Compute a robust spatial activation pattern from EMG trial data.
+        Compute per-channel energy using the formula from Barona López et al.
 
-        Uses multiple complementary features to build a rich spatial fingerprint
-        that is robust to amplitude variation but preserves channel-to-channel
-        differences critical for rotation detection.
+        E_ch = sum_{i=2}^{L} |x_i * |x_i| - x_{i-1} * |x_{i-1}||
 
         Args:
-            data: EMG data for a single gesture (samples, channels)
-            normalize: Whether to normalize the pattern
+            data: EMG data for a single gesture trial (samples, channels)
 
         Returns:
-            Activation pattern (6 * num_channels,)
-            Features: [RMS | MAV | waveform_length | log_power | spectral_entropy | peak_frequency]
+            Energy vector (num_channels,)
         """
-        # Apply bandpass filtering
         filtered = self._bandpass_filter(data)
 
         # Trim 15% from start and end to remove transition artifacts
         trim = max(1, int(filtered.shape[0] * 0.15))
         trimmed = filtered[trim:-trim] if filtered.shape[0] > 2 * trim + 20 else filtered
 
-        # Feature 1: RMS activation per channel
-        rms_pattern = np.sqrt(np.mean(trimmed ** 2, axis=0))
+        n_channels = min(trimmed.shape[1], self.num_channels)
+        energy = np.zeros(self.num_channels)
+        for ch in range(n_channels):
+            x = trimmed[:, ch]
+            # E = sum |x_i * |x_i| - x_{i-1} * |x_{i-1}||
+            term = x * np.abs(x)
+            energy[ch] = np.sum(np.abs(term[1:] - term[:-1]))
 
-        # Feature 2: MAV (Mean Absolute Value) per channel
-        mav_pattern = np.mean(np.abs(trimmed), axis=0)
+        return energy
 
-        # Feature 3: Waveform Length per channel (captures signal complexity)
-        wl_pattern = np.mean(np.abs(np.diff(trimmed, axis=0)), axis=0)
-
-        # Feature 4: Log power — compresses dynamic range while preserving ratios
-        log_power = np.log1p(rms_pattern ** 2)
-
-        # Feature 5: Spectral entropy per channel — captures frequency distribution
-        # shape. Different muscles have different frequency characteristics, making
-        # this a strong discriminator for rotation detection.
-        spectral_entropy = np.zeros(self.num_channels)
-        for ch in range(min(trimmed.shape[1], self.num_channels)):
-            if trimmed.shape[0] >= 32:
-                freqs = np.abs(np.fft.rfft(trimmed[:, ch]))
-                freqs = freqs[1:]  # Remove DC
-                psd = freqs ** 2
-                psd_norm = psd / (np.sum(psd) + 1e-12)
-                psd_norm = psd_norm[psd_norm > 1e-12]
-                spectral_entropy[ch] = -np.sum(psd_norm * np.log2(psd_norm + 1e-12))
-            else:
-                spectral_entropy[ch] = 0.0
-
-        # Feature 6: Peak frequency per channel (normalized to [0, 1])
-        peak_freq = np.zeros(self.num_channels)
-        for ch in range(min(trimmed.shape[1], self.num_channels)):
-            if trimmed.shape[0] >= 32:
-                freqs = np.abs(np.fft.rfft(trimmed[:, ch]))
-                freqs = freqs[1:]  # Remove DC
-                if len(freqs) > 0:
-                    peak_freq[ch] = np.argmax(freqs) / (len(freqs) + 1e-12)
-
-        # Combine features into a single pattern vector
-        pattern = np.concatenate([rms_pattern, mav_pattern, wl_pattern,
-                                  log_power, spectral_entropy, peak_freq])
-
-        if normalize and np.max(pattern) > 0:
-            # Hybrid normalization per feature group:
-            # 1. Rank-based normalization (robust to amplitude differences)
-            # 2. Z-score normalization (preserves relative magnitude info)
-            # Final pattern = 0.7 * rank + 0.3 * zscore (both scaled to [0,1])
-            n = self.num_channels
-            for start in range(0, len(pattern), n):
-                group = pattern[start:start + n]
-                # Rank-based: argsort of argsort gives ranks
-                ranks = np.argsort(np.argsort(group)).astype(float)
-                if n > 1:
-                    ranks /= (n - 1)
-
-                # Z-score scaled to [0, 1] via min-max
-                std = np.std(group)
-                if std > 1e-12:
-                    zscore = (group - np.mean(group)) / std
-                    zmin, zmax = zscore.min(), zscore.max()
-                    if zmax - zmin > 1e-12:
-                        zscore_01 = (zscore - zmin) / (zmax - zmin)
-                    else:
-                        zscore_01 = np.full_like(zscore, 0.5)
-                else:
-                    zscore_01 = np.full_like(group, 0.5)
-
-                pattern[start:start + n] = 0.7 * ranks + 0.3 * zscore_01
-
-        return pattern
-
-    def average_patterns_with_outlier_rejection(
+    def compute_energy_pattern(
         self,
-        patterns: List[np.ndarray],
-        threshold: float = 1.5
-    ) -> np.ndarray:
+        calibration_data: Dict[str, Union[np.ndarray, List[np.ndarray]]],
+    ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
         """
-        Average multiple pattern repetitions with outlier rejection.
+        Compute a combined energy pattern across all gestures.
 
-        Uses median-based outlier detection: discard any repetition whose
-        correlation with the median is below (Q1 - threshold * IQR).
+        For each gesture, the per-channel energy is computed and averaged
+        across multiple trials (with outlier rejection). The overall energy
+        pattern sums contributions from all active (non-rest) gestures.
 
         Args:
-            patterns: List of pattern arrays from multiple repetitions
+            calibration_data: Gesture name -> EMG data or list of EMG data arrays
+
+        Returns:
+            (combined_energy, per_gesture_energy)
+            combined_energy: (num_channels,) sum across gestures
+            per_gesture_energy: dict of gesture -> (num_channels,)
+        """
+        per_gesture: Dict[str, np.ndarray] = {}
+
+        for gesture_name, data in calibration_data.items():
+            if isinstance(data, list):
+                trial_energies = [self.compute_channel_energy(d) for d in data]
+                per_gesture[gesture_name] = self._average_with_outlier_rejection(trial_energies)
+            else:
+                per_gesture[gesture_name] = self.compute_channel_energy(data)
+
+        # Combine: sum active gesture energies (exclude rest)
+        active_gestures = {g: e for g, e in per_gesture.items() if "rest" not in g.lower()}
+        if not active_gestures:
+            active_gestures = per_gesture
+
+        combined = np.zeros(self.num_channels)
+        for e in active_gestures.values():
+            combined += e
+
+        return combined, per_gesture
+
+    def _average_with_outlier_rejection(
+        self,
+        energies: List[np.ndarray],
+        threshold: float = 1.5,
+    ) -> np.ndarray:
+        """
+        Average multiple energy vectors with outlier rejection.
+
+        Uses median-based outlier detection: a trial whose total energy
+        deviates by more than threshold * IQR from the median is discarded.
+
+        Args:
+            energies: List of per-channel energy arrays
             threshold: IQR multiplier for outlier detection
 
         Returns:
-            Averaged pattern with outliers removed
+            Averaged energy vector
         """
-        if len(patterns) <= 1:
-            return patterns[0] if patterns else np.zeros(1)
+        if len(energies) <= 1:
+            return energies[0] if energies else np.zeros(self.num_channels)
 
-        patterns_arr = np.array(patterns)
+        arr = np.array(energies)
+        if len(energies) <= 2:
+            return np.mean(arr, axis=0)
 
-        if len(patterns) <= 2:
-            return np.mean(patterns_arr, axis=0)
-
-        # Compute median pattern as reference
-        median_pattern = np.median(patterns_arr, axis=0)
-
-        # Compute correlation of each repetition with the median
-        correlations = []
-        for p in patterns:
-            if np.std(p) > 0 and np.std(median_pattern) > 0:
-                corr, _ = pearsonr(p, median_pattern)
-                correlations.append(corr)
-            else:
-                correlations.append(0.0)
-
-        correlations = np.array(correlations)
-
-        # Outlier detection using IQR
-        q1 = np.percentile(correlations, 25)
-        q3 = np.percentile(correlations, 75)
+        # Compute total energy per trial for outlier detection
+        totals = np.sum(arr, axis=1)
+        q1 = np.percentile(totals, 25)
+        q3 = np.percentile(totals, 75)
         iqr = q3 - q1
-        lower_bound = q1 - threshold * iqr
+        lower = q1 - threshold * iqr
+        upper = q3 + threshold * iqr
+        mask = (totals >= lower) & (totals <= upper)
+        if not mask.any():
+            mask = np.ones(len(energies), dtype=bool)
 
-        inlier_mask = correlations >= lower_bound
-        if not inlier_mask.any():
-            inlier_mask = np.ones(len(patterns), dtype=bool)
-
-        return np.mean(patterns_arr[inlier_mask], axis=0)
-
-    def _check_reference_compatible(
-        self,
-        current_patterns: Dict[str, np.ndarray],
-        reference_patterns: Dict[str, np.ndarray]
-    ) -> Tuple[bool, str]:
-        """
-        Check if reference calibration is compatible with current patterns.
-
-        Returns:
-            (is_compatible, reason) — reason describes why not compatible
-        """
-        common = set(current_patterns.keys()) & set(reference_patterns.keys())
-        active = {g for g in common if "rest" not in g.lower()}
-        usable = active if active else common
-
-        if not usable:
-            return False, (f"No common gestures. "
-                          f"Current: {sorted(current_patterns.keys())}. "
-                          f"Reference: {sorted(reference_patterns.keys())}.")
-
-        # Check pattern length compatibility
-        for g in usable:
-            if len(current_patterns[g]) != len(reference_patterns[g]):
-                return False, (f"Pattern length mismatch for '{g}': "
-                              f"current={len(current_patterns[g])}, "
-                              f"reference={len(reference_patterns[g])}. "
-                              f"Reference may be from an older calibration format.")
-        return True, ""
-
-    def _fft_circular_cross_correlation(
-        self,
-        current: np.ndarray,
-        reference: np.ndarray
-    ) -> np.ndarray:
-        """
-        Compute circular cross-correlation using FFT for all rotation offsets.
-
-        This is O(N log N) instead of O(N^2) and numerically more stable
-        than brute-force Pearson at each offset.
-
-        Args:
-            current: 1D pattern array (one feature group, num_channels long)
-            reference: 1D pattern array (same length)
-
-        Returns:
-            Cross-correlation scores for each offset (normalized to [-1, 1])
-        """
-        # Zero-mean normalization for correlation
-        c = current - np.mean(current)
-        r = reference - np.mean(reference)
-
-        norm = np.sqrt(np.sum(c ** 2) * np.sum(r ** 2))
-        if norm < 1e-12:
-            return np.zeros(len(current))
-
-        # FFT-based circular cross-correlation: corr = IFFT(FFT(r)* × FFT(c))
-        cross_corr = np.real(np.fft.ifft(np.conj(np.fft.fft(r)) * np.fft.fft(c)))
-        return cross_corr / norm
-
-    def _compute_gesture_discriminability(
-        self,
-        pattern: np.ndarray
-    ) -> float:
-        """
-        Score how spatially discriminative a gesture's activation pattern is.
-
-        Gestures with uniform activation across channels (like rest) are poor
-        for rotation detection. Gestures with strong spatial peaks are better.
-
-        Uses the "peakiness" of the rank distribution: if only a few channels
-        dominate (high variance in the rank-normalised pattern), the gesture
-        is a good landmark for rotation.
-
-        Returns a weight in [0, 1] — higher means more useful for rotation.
-        """
-        n = self.num_channels
-        n_features = len(pattern) // n
-        if n_features < 1:
-            n_features = 1
-
-        scores = []
-        for fg in range(n_features):
-            group = pattern[fg * n:(fg + 1) * n]
-            if len(group) == 0:
-                continue
-
-            # For rank-normalised patterns (values in [0, 1]):
-            # A perfectly uniform pattern has std ≈ 0.29 (uniform on [0,1])
-            # A peaked pattern (one dominant channel) has higher std
-            # A flat/rest pattern where all channels are similar has lower std
-            #
-            # But since all rank patterns have the same std (they're permutations),
-            # we instead look at the top-k concentration: what fraction of the
-            # total "activation" is in the top 25% of channels?
-            sorted_vals = np.sort(group)[::-1]
-            top_k = max(1, n // 4)
-            top_sum = np.sum(sorted_vals[:top_k])
-            total_sum = np.sum(sorted_vals) + 1e-12
-            concentration = top_sum / total_sum
-
-            # For a uniform distribution, top 25% has 25% of the total → ratio ≈ 0.25
-            # For a highly peaked pattern, top 25% might have 60-80% → ratio ≈ 0.6-0.8
-            # Map [0.25, 0.65] → [0, 1]
-            score = np.clip((concentration - 0.25) / 0.4, 0.0, 1.0)
-            scores.append(score)
-
-        if not scores:
-            return 0.0
-
-        return float(np.mean(scores))
+        return np.mean(arr[mask], axis=0)
 
     def find_rotation_offset(
         self,
-        current_patterns: Dict[str, np.ndarray],
-        reference_patterns: Dict[str, np.ndarray]
-    ) -> Tuple[int, float, Dict[str, float]]:
+        current_energy: np.ndarray,
+        reference_energy: np.ndarray,
+    ) -> Tuple[int, float]:
         """
-        Find the rotation offset that best aligns current patterns with reference.
+        Find the rotation offset by comparing the MEC of the current and
+        reference energy patterns.
 
-        Uses FFT-based circular cross-correlation on rank-normalised multi-feature
-        patterns. Each gesture is weighted by spatial discriminability. The final
-        offset is chosen by weighted accumulation across all gestures and feature
-        groups.
+        The Maximum Energy Channel (MEC) is identified for both patterns.
+        The rotation offset is the circular distance between them.
 
-        Confidence is based on:
-        1. The margin ratio between the best and second-best offset scores
-        2. Per-gesture agreement (how many gestures independently pick the same offset)
-        3. Mean Spearman correlation at the chosen offset
+        Confidence is based on how prominent the energy peak is—a sharp
+        peak in a single channel means high confidence; a flat distribution
+        means low confidence.
 
         Args:
-            current_patterns: Current activation patterns by gesture
-            reference_patterns: Reference patterns to match against
+            current_energy: Current per-channel energy (num_channels,)
+            reference_energy: Reference per-channel energy (num_channels,)
 
         Returns:
-            Tuple of (rotation_offset, overall_confidence, per_gesture_confidence)
+            (rotation_offset, confidence)
         """
-        compatible, reason = self._check_reference_compatible(
-            current_patterns, reference_patterns)
-        if not compatible:
-            raise ValueError(f"Incompatible reference: {reason}")
-
-        common_gestures = set(current_patterns.keys()) & set(reference_patterns.keys())
-        active_gestures = {g for g in common_gestures if "rest" not in g.lower()}
-        if not active_gestures:
-            active_gestures = common_gestures
-        if not active_gestures:
-            raise ValueError("No common gestures between current and reference")
-
-        first_pattern = next(iter(current_patterns.values()))
-        n_features_per_channel = len(first_pattern) // self.num_channels
-        if n_features_per_channel < 1:
-            n_features_per_channel = 1
-
         n = self.num_channels
 
-        # Accumulate weighted cross-correlation scores
-        offset_scores = np.zeros(n)
-        total_weight = 0.0
+        current_mec = int(np.argmax(current_energy))
+        reference_mec = int(np.argmax(reference_energy))
 
-        # Per-gesture best offsets for consistency checking
-        per_gesture_best = {}  # gesture -> (best_offset, weight)
+        # Rotation offset: how many channels the bracelet has shifted
+        rotation_offset = (current_mec - reference_mec) % n
 
-        for gesture in active_gestures:
-            current = current_patterns[gesture]
-            reference = reference_patterns[gesture]
-            if len(current) != len(reference):
-                continue
+        # Confidence scoring based on peak prominence
+        # A good sync gesture produces a clear energy peak in one channel.
+        confidence = self._compute_energy_confidence(current_energy)
 
-            weight = self._compute_gesture_discriminability(reference)
-            weight = max(weight, 0.05)
+        return rotation_offset, confidence
 
-            gesture_scores = np.zeros(n)
-            gesture_weight = 0.0
+    def _compute_energy_confidence(self, energy: np.ndarray) -> float:
+        """
+        Compute confidence from the energy distribution.
 
-            for fg in range(n_features_per_channel):
-                s = fg * n
-                e = s + n
-                ccorr = self._fft_circular_cross_correlation(
-                    current[s:e], reference[s:e]
-                )
-                gesture_scores += ccorr * weight
-                gesture_weight += weight
+        Confidence is high when one channel clearly dominates (sharp peak),
+        and low when energy is spread uniformly.
 
-            if gesture_weight > 0:
-                gesture_scores /= gesture_weight
+        Uses two metrics:
+        1. Peak-to-second ratio: how much larger the MEC is vs the runner-up
+        2. Peak fraction: what fraction of total energy is in the MEC
 
-            offset_scores += gesture_scores * gesture_weight
-            total_weight += gesture_weight
+        Returns:
+            Confidence in [0, 1]
+        """
+        total = np.sum(energy)
+        if total < 1e-12:
+            return 0.0
 
-            per_gesture_best[gesture] = (
-                int(np.argmax(gesture_scores)),
-                gesture_weight
-            )
+        sorted_e = np.sort(energy)[::-1]
+        peak = sorted_e[0]
+        second = sorted_e[1] if len(sorted_e) > 1 else 0.0
 
-        if total_weight > 0:
-            offset_scores /= total_weight
-
-        best_offset = int(np.argmax(offset_scores))
-
-        # ── Confidence scoring ──────────────────────────────────────────
-
-        # 1. Margin ratio: how much better is the best vs second-best?
-        sorted_scores = np.sort(offset_scores)[::-1]
-        if len(sorted_scores) > 1 and sorted_scores[0] > 1e-12:
-            margin_ratio = sorted_scores[0] / max(sorted_scores[1], 1e-12)
-            # Tighter range so moderate margins score well:
-            # ratio 1.0 → 0%, 1.03 → 30%, 1.06 → 60%, 1.10+ → 100%
-            margin_score = float(np.clip((margin_ratio - 1.0) / 0.10, 0.0, 1.0))
+        # Peak-to-second ratio: ratio 1.0 → 0%, 1.5 → 50%, 2.0+ → 100%
+        if second > 1e-12:
+            ratio = peak / second
+            ratio_score = float(np.clip((ratio - 1.0) / 1.0, 0.0, 1.0))
         else:
-            margin_score = 0.5
+            ratio_score = 1.0
 
-        # 1b. Peak sharpness bonus: how concentrated is the score around the best offset?
-        #     If the best offset dominates the score distribution, boost confidence.
-        if len(offset_scores) > 1:
-            scores_shifted = offset_scores - np.min(offset_scores)
-            total_score = np.sum(scores_shifted) + 1e-12
-            peak_fraction = float(scores_shifted[best_offset] / total_score)
-            # For n channels, uniform → peak_fraction ≈ 1/n; peaked → close to 1.0
-            expected_uniform = 1.0 / max(len(offset_scores), 1)
-            sharpness = float(np.clip((peak_fraction - expected_uniform) / (1.0 - expected_uniform), 0.0, 1.0))
-        else:
-            sharpness = 1.0
+        # Peak fraction: for n channels, uniform → 1/n; peaked → close to 1
+        peak_frac = peak / total
+        expected_uniform = 1.0 / max(len(energy), 1)
+        frac_score = float(np.clip(
+            (peak_frac - expected_uniform) / (1.0 - expected_uniform),
+            0.0, 1.0
+        ))
 
-        # Blend margin and sharpness: sharpness is more reliable
-        margin_score = 0.4 * margin_score + 0.6 * sharpness
-
-        # 2. Per-gesture agreement: weighted fraction of gestures picking
-        #    the same offset (±1), weighted by gesture discriminability
-        if per_gesture_best:
-            weighted_agree = 0.0
-            weighted_near_agree = 0.0
-            total_w = 0.0
-            for g, (g_offset, g_weight) in per_gesture_best.items():
-                total_w += g_weight
-                if g_offset == best_offset:
-                    weighted_agree += g_weight
-                    weighted_near_agree += g_weight
-                else:
-                    circ_dist = min(abs(g_offset - best_offset),
-                                    n - abs(g_offset - best_offset))
-                    if circ_dist <= 1:
-                        weighted_near_agree += g_weight
-
-            if total_w > 0:
-                exact_agreement = weighted_agree / total_w
-                near_agreement = weighted_near_agree / total_w
-            else:
-                exact_agreement = 0.0
-                near_agreement = 0.0
-            agreement_score = 0.7 * exact_agreement + 0.3 * near_agreement
-        else:
-            agreement_score = 0.0
-
-        # 3. Mean per-feature-group Pearson correlation at best offset
-        #    (more spatially sensitive than whole-vector Spearman)
-        per_gesture_confidence = {}
-        pearson_scores = []
-
-        for gesture in common_gestures:
-            current = current_patterns[gesture]
-            reference = reference_patterns[gesture]
-            if len(current) != len(reference):
-                per_gesture_confidence[gesture] = 0.0
-                continue
-
-            # Roll each feature group and compute per-group Pearson
-            group_corrs = []
-            for fg in range(n_features_per_channel):
-                s = fg * n
-                e = s + n
-                rolled = np.roll(current[s:e], best_offset)
-                ref_group = reference[s:e]
-                if np.std(rolled) > 0 and np.std(ref_group) > 0:
-                    corr, _ = pearsonr(rolled, ref_group)
-                    if not np.isnan(corr):
-                        group_corrs.append(corr)
-
-            gesture_corr = float(np.mean(group_corrs)) if group_corrs else 0.0
-            per_gesture_confidence[gesture] = gesture_corr
-            if gesture in active_gestures:
-                pearson_scores.append(gesture_corr)
-
-        mean_corr = float(np.mean(pearson_scores)) if pearson_scores else 0.0
-        # Lower floor (0.1) and gentler slope so moderate correlations still score reasonably:
-        # corr 0.1 → 0%, 0.4 → ~38%, 0.6 → ~63%, 0.8 → ~88%, 1.0 → 100%
-        corr_score = float(np.clip((mean_corr - 0.1) / 0.8, 0.0, 1.0))
-
-        # Final confidence: correlation is the strongest indicator, give it most weight
-        confidence = 0.20 * margin_score + 0.30 * agreement_score + 0.50 * corr_score
-        confidence = max(0.0, min(1.0, confidence))
-
-        # Store sub-scores for diagnostics
-        per_gesture_confidence["__margin_score__"] = round(margin_score, 4)
-        per_gesture_confidence["__agreement_score__"] = round(agreement_score, 4)
-        per_gesture_confidence["__correlation_score__"] = round(corr_score, 4)
-        per_gesture_confidence["__sharpness__"] = round(sharpness, 4)
-
-        return best_offset, confidence, per_gesture_confidence
+        # Blend: fraction is more reliable
+        return 0.4 * ratio_score + 0.6 * frac_score
 
     def create_channel_mapping(self, rotation_offset: int) -> List[int]:
         """
         Create a channel mapping based on rotation offset.
 
+        Channels are rearranged so that channel[rotation_offset] becomes
+        channel[0] in the new order.
+
         Args:
-            rotation_offset: Number of channels to rotate
+            rotation_offset: Number of channels the bracelet has rotated
 
         Returns:
             List of channel indices in corrected order
@@ -673,10 +422,10 @@ class CalibrationProcessor:
         self,
         calibration_data: Dict[str, Union[np.ndarray, List[np.ndarray]]],
         device_name: str = "unknown",
-        reference_result: Optional[CalibrationResult] = None
+        reference_result: Optional[CalibrationResult] = None,
     ) -> CalibrationResult:
         """
-        Perform calibration from recorded gesture data.
+        Perform calibration from recorded gesture data using the MEC method.
 
         Args:
             calibration_data: Dictionary mapping gesture names to EMG data arrays.
@@ -688,65 +437,46 @@ class CalibrationProcessor:
         Returns:
             CalibrationResult with channel mapping
         """
-        # Compute activation patterns for each gesture
-        current_patterns = {}
+        combined_energy, per_gesture_energy = self.compute_energy_pattern(calibration_data)
+
+        # Store energy patterns as reference_patterns (serialised as dict of arrays)
+        energy_patterns = {g: e for g, e in per_gesture_energy.items()}
+        energy_patterns["__combined__"] = combined_energy
+
         per_gesture_confidence = {}
+        for g, e in per_gesture_energy.items():
+            per_gesture_confidence[g] = self._compute_energy_confidence(e)
 
-        for gesture_name, data in calibration_data.items():
-            if isinstance(data, list):
-                # Multiple trials — compute pattern per trial, average with rejection
-                rep_patterns = [self.compute_activation_pattern(d) for d in data]
-                current_patterns[gesture_name] = (
-                    self.average_patterns_with_outlier_rejection(rep_patterns)
-                )
-            else:
-                current_patterns[gesture_name] = self.compute_activation_pattern(data)
-
-        incompatible_reason = None
         if reference_result is not None:
-            # Check compatibility first
-            compatible, reason = self._check_reference_compatible(
-                current_patterns, reference_result.reference_patterns
-            )
-            if compatible:
-                offset, confidence, per_gesture_confidence = self.find_rotation_offset(
-                    current_patterns,
-                    reference_result.reference_patterns
-                )
+            ref_combined = reference_result.reference_patterns.get("__combined__")
+            if ref_combined is not None and len(ref_combined) == self.num_channels:
+                offset, confidence = self.find_rotation_offset(combined_energy, ref_combined)
             else:
-                # Reference exists but is incompatible — treat as no reference
-                incompatible_reason = reason
+                # Incompatible reference — use identity mapping
                 offset = 0
                 confidence = 1.0
         else:
-            # No reference — use identity mapping
             offset = 0
             confidence = 1.0
 
         channel_mapping = self.create_channel_mapping(offset)
 
-        result = CalibrationResult(
+        return CalibrationResult(
             created_at=datetime.now(),
             device_name=device_name,
             num_channels=self.num_channels,
             rotation_offset=offset,
             channel_mapping=channel_mapping,
             confidence=confidence,
-            reference_patterns=current_patterns,
+            reference_patterns=energy_patterns,
             metadata={
+                "method": "maximum_energy_channel",
                 "per_gesture_confidence": per_gesture_confidence,
                 "num_gestures": len(calibration_data),
                 "has_reference": reference_result is not None,
-                "reference_incompatible": incompatible_reason,
-                "confidence_breakdown": {
-                    "margin_score": per_gesture_confidence.get("__margin_score__", None),
-                    "agreement_score": per_gesture_confidence.get("__agreement_score__", None),
-                    "correlation_score": per_gesture_confidence.get("__correlation_score__", None),
-                } if reference_result is not None else {},
-            }
+                "mec_channel": int(np.argmax(combined_energy)),
+            },
         )
-
-        return result
 
     def set_reference_calibration(self, result: Optional[CalibrationResult]) -> None:
         """Set or clear the reference calibration for future calibrations."""
@@ -1040,15 +770,13 @@ def backfill_session_rotations(data_dir: Path, calibrations_dir: Optional[Path] 
     calibrator = AutoCalibrator(calibrations_dir, num_channels, sampling_rate)
 
     # Check if existing reference has compatible pattern format.
-    # If not (e.g. after a code update changed the feature count),
-    # discard it so the first processed session becomes the new reference.
+    # Energy-based patterns store per-gesture energy vectors (num_channels each)
+    # plus a "__combined__" key. Detect stale multi-feature patterns.
     if calibrator.has_reference:
         ref = calibrator.processor.get_reference_calibration()
-        expected_len = 6 * num_channels  # Current format: RMS + MAV + WL + log_power + spectral_entropy + peak_freq
-        sample_pattern = next(iter(ref.reference_patterns.values()), None)
-        if sample_pattern is not None and len(sample_pattern) != expected_len:
-            print(f"[Backfill] Reference pattern format outdated "
-                  f"({len(sample_pattern)} vs expected {expected_len}). "
+        combined = ref.reference_patterns.get("__combined__")
+        if combined is None or len(combined) != num_channels:
+            print(f"[Backfill] Reference pattern format outdated or incompatible. "
                   f"Will regenerate from first session.")
             calibrator.processor.set_reference_calibration(None)
 

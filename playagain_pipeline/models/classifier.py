@@ -88,41 +88,6 @@ def resolve_device(requested: str = "auto") -> torch.device:
     return device
 
 
-class InputProjectionMLP(nn.Module):
-    """
-    Small MLP that projects variable-dimension input to a fixed expected dimension.
-
-    Used when a model was trained with N channels but at prediction time the
-    actual number of channels differs (e.g. some channels marked as bad).
-    For feature-based models this maps (batch, actual_features) -> (batch, expected_features).
-    """
-
-    def __init__(self, actual_dim: int, expected_dim: int):
-        super().__init__()
-        mid = max(min(actual_dim, expected_dim), 32)
-        self.net = nn.Sequential(
-            nn.Linear(actual_dim, mid),
-            nn.ReLU(),
-            nn.Linear(mid, expected_dim),
-        )
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-class ChannelProjection1D(nn.Module):
-    """
-    1x1 Conv1d projection for CNN-family models.
-
-    Maps (batch, actual_channels, time) -> (batch, expected_channels, time).
-    """
-
-    def __init__(self, actual_channels: int, expected_channels: int):
-        super().__init__()
-        self.conv = nn.Conv1d(actual_channels, expected_channels, kernel_size=1, bias=True)
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.conv(x)
 
 
 @dataclass
@@ -192,22 +157,10 @@ class BaseClassifier(ABC):
         self.metadata: Optional[ModelMetadata] = None
         self._model = None
         self._is_trained = False
-        self._feature_projections = {}  # Cache for InputProjectionMLP instances
-        self._expected_feature_dim = None  # Expected feature dimension after training
-        self._use_mlp_projection = True  # Default to True for better handling of dimension mismatches
 
     @property
     def is_trained(self) -> bool:
         return self._is_trained
-
-    def set_use_mlp_projection(self, enabled: bool):
-        """
-        Enable or disable MLP projection for dimension adaptation.
-        
-        When enabled, uses a learned MLP to adapt feature dimensions.
-        When disabled, falls back to zero-padding/truncation.
-        """
-        self._use_mlp_projection = enabled
 
     @abstractmethod
     def extract_features(self, X: np.ndarray) -> np.ndarray:
@@ -224,11 +177,8 @@ class BaseClassifier(ABC):
 
     def _adapt_features_for_scaler(self, features: np.ndarray, scaler: Any) -> np.ndarray:
         """
-        Adapt feature dimensions to match a fitted scaler when bad channels cause
-        a mismatch. Zero-pads missing features or truncates excess.
-        
-        NOTE: This is a fallback method. For better adaptation, use
-        _project_features_with_mlp() which uses a learned projection.
+        Adapt feature dimensions to match a fitted scaler when a
+        mismatch occurs. Zero-pads missing features or truncates excess.
         """
         if scaler is None or not hasattr(scaler, 'n_features_in_'):
             return features
@@ -244,75 +194,6 @@ class BaseClassifier(ABC):
         else:
             # Truncate
             return features[:, :expected]
-
-    def _ensure_feature_projection(self, actual_dim: int, expected_dim: int, device: torch.device):
-        """
-        Lazily create an InputProjectionMLP for feature dimension adaptation.
-        
-        This is used by feature-based models (SVM, RF, LDA, CatBoost) to handle
-        dimension mismatches when bad channels are removed during prediction.
-        """
-        if actual_dim == expected_dim:
-            return
-        key = f"feature_proj_{actual_dim}_{expected_dim}"
-        if key not in self._feature_projections:
-            proj = InputProjectionMLP(actual_dim, expected_dim).to(device)
-            proj.eval()
-            self._feature_projections[key] = proj
-            logger.info(
-                f"{self.name}: Feature dimension mismatch ({actual_dim} → {expected_dim}). "
-                f"Using learned MLP projection layer."
-            )
-
-    def _project_features_with_mlp(
-        self, 
-        features: np.ndarray, 
-        expected_dim: int,
-        use_projection: bool = True
-    ) -> np.ndarray:
-        """
-        Project features using a learned MLP if dimensions don't match.
-        
-        Args:
-            features: Input features (N, actual_dim)
-            expected_dim: Expected feature dimension
-            use_projection: If False, falls back to zero-padding/truncation
-            
-        Returns:
-            Projected features (N, expected_dim)
-        """
-        actual_dim = features.shape[1]
-        if actual_dim == expected_dim:
-            return features
-            
-        if not use_projection:
-            # Fallback to simple padding/truncation
-            if actual_dim < expected_dim:
-                padded = np.zeros((features.shape[0], expected_dim), dtype=features.dtype)
-                padded[:, :actual_dim] = features
-                return padded
-            else:
-                return features[:, :expected_dim]
-        
-        # Use learned projection
-        try:
-            device = torch.device("cpu")  # Feature-based models typically use CPU
-            self._ensure_feature_projection(actual_dim, expected_dim, device)
-            key = f"feature_proj_{actual_dim}_{expected_dim}"
-            
-            X_tensor = torch.FloatTensor(features).to(device)
-            with torch.inference_mode():
-                X_projected = self._feature_projections[key](X_tensor)
-            return X_projected.cpu().numpy()
-        except Exception as e:
-            logger.warning(f"MLP projection failed ({e}), falling back to padding/truncation")
-            # Fallback to simple method
-            if actual_dim < expected_dim:
-                padded = np.zeros((features.shape[0], expected_dim), dtype=features.dtype)
-                padded[:, :actual_dim] = features
-                return padded
-            else:
-                return features[:, :expected_dim]
 
     @abstractmethod
     def train(
@@ -1024,26 +905,12 @@ class MLPClassifier(BaseClassifier):
                 "feature_count": feature_count, "training_time": time.time() - start_time,
                 "epochs_trained": len(history["train_loss"])}
 
-    def _ensure_projection(self, actual_dim, device):
-        if actual_dim == self._input_dim: return
-        key = f"proj_{actual_dim}_{self._input_dim}"
-        if not hasattr(self, '_projections'): self._projections = {}
-        if key not in self._projections:
-            proj = InputProjectionMLP(actual_dim, self._input_dim).to(device); proj.eval()
-            self._projections[key] = proj
-
-    def _project_if_needed(self, X_tensor, device):
-        actual_dim = X_tensor.shape[1]
-        if actual_dim == self._input_dim: return X_tensor
-        self._ensure_projection(actual_dim, device)
-        return self._projections[f"proj_{actual_dim}_{self._input_dim}"](X_tensor)
-
     def predict(self, X):
         if not self._is_trained: raise ValueError("Model not trained")
         X_features = self.extract_features(X)
-        X_scaled = self._scaler.transform(X_features) if X_features.shape[1] == self._scaler.n_features_in_ else X_features
+        X_scaled = self._scaler.transform(self._adapt_features_for_scaler(X_features, self._scaler))
         device = resolve_device(self.hyperparameters["device"])
-        X_tensor = self._project_if_needed(torch.FloatTensor(X_scaled).to(device), device)
+        X_tensor = torch.FloatTensor(X_scaled).to(device)
         self._model.eval()
         with torch.inference_mode():
             _, predicted = self._model(X_tensor).max(1)
@@ -1052,9 +919,9 @@ class MLPClassifier(BaseClassifier):
     def predict_proba(self, X):
         if not self._is_trained: raise ValueError("Model not trained")
         X_features = self.extract_features(X)
-        X_scaled = self._scaler.transform(X_features) if X_features.shape[1] == self._scaler.n_features_in_ else X_features
+        X_scaled = self._scaler.transform(self._adapt_features_for_scaler(X_features, self._scaler))
         device = resolve_device(self.hyperparameters["device"])
-        X_tensor = self._project_if_needed(torch.FloatTensor(X_scaled).to(device), device)
+        X_tensor = torch.FloatTensor(X_scaled).to(device)
         self._model.eval()
         with torch.inference_mode():
             probs = torch.softmax(self._model(X_tensor), dim=1)
@@ -1243,21 +1110,6 @@ class CNNClassifier(BaseClassifier):
                 "feature_count": C, "training_time": time.time() - start_time,
                 "epochs_trained": len(history["train_loss"])}
 
-    def _ensure_channel_projection(self, actual_channels, device):
-        expected = self._input_shape[0] if self._input_shape else actual_channels
-        if actual_channels == expected: return
-        key = f"cnn_proj_{actual_channels}_{expected}"
-        if not hasattr(self, '_channel_projections'): self._channel_projections = {}
-        if key not in self._channel_projections:
-            proj = ChannelProjection1D(actual_channels, expected).to(device); proj.eval()
-            self._channel_projections[key] = proj
-
-    def _project_channels_if_needed(self, X_tensor, device):
-        actual = X_tensor.shape[1]; expected = self._input_shape[0] if self._input_shape else actual
-        if actual == expected: return X_tensor
-        self._ensure_channel_projection(actual, device)
-        return self._channel_projections[f"cnn_proj_{actual}_{expected}"](X_tensor)
-
     def predict(self, X):
         if not self._is_trained: raise ValueError("Model not trained")
         X_proc = self.extract_features(X); N, C, T = X_proc.shape
@@ -1266,7 +1118,7 @@ class CNNClassifier(BaseClassifier):
             X_scaled = self._scaler.transform(X_proc.transpose(0, 2, 1).reshape(-1, C)).reshape(N, T, C).transpose(0, 2, 1)
         else: X_scaled = X_proc
         device = resolve_device(self.hyperparameters["device"])
-        X_tensor = self._project_channels_if_needed(torch.FloatTensor(X_scaled).to(device), device)
+        X_tensor = torch.FloatTensor(X_scaled).to(device)
         self._model.eval()
         with torch.inference_mode(): _, predicted = self._model(X_tensor).max(1)
         return predicted.cpu().numpy()
@@ -1279,7 +1131,7 @@ class CNNClassifier(BaseClassifier):
             X_scaled = self._scaler.transform(X_proc.transpose(0, 2, 1).reshape(-1, C)).reshape(N, T, C).transpose(0, 2, 1)
         else: X_scaled = X_proc
         device = resolve_device(self.hyperparameters["device"])
-        X_tensor = self._project_channels_if_needed(torch.FloatTensor(X_scaled).to(device), device)
+        X_tensor = torch.FloatTensor(X_scaled).to(device)
         self._model.eval()
         with torch.inference_mode(): probs = torch.softmax(self._model(X_tensor), dim=1)
         return probs.cpu().numpy()

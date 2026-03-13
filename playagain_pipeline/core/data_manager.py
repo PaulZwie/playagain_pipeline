@@ -8,10 +8,14 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any, Tuple, Callable
 from datetime import datetime
 import json
+import re
+import shutil
 import numpy as np
 
 from playagain_pipeline.core.session import RecordingSession
 from playagain_pipeline.core.gesture import GestureSet
+from playagain_pipeline.models.classifier import EMGFeatureExtractor
+from sklearn.model_selection import train_test_split
 
 
 class DataManager:
@@ -88,7 +92,6 @@ class DataManager:
     @staticmethod
     def _natural_sort_key(text: str):
         """Sort key for natural ordering: VP_00 < VP_01 < VP_02 < VP_10."""
-        import re
         return [int(c) if c.isdigit() else c.lower()
                 for c in re.split(r'(\d+)', text)]
 
@@ -205,9 +208,12 @@ class DataManager:
             if hasattr(session.metadata, 'bad_channels') and session.metadata.bad_channels:
                 session_bad_chs = list(set(session_bad_chs) | set(session.metadata.bad_channels))
             if session_bad_chs:
+                n_ch = data.shape[1]
                 for ch_idx in session_bad_chs:
-                    if ch_idx < data.shape[1]:
-                        data[:, ch_idx] = 0.0
+                    if ch_idx < n_ch:
+                        left = (ch_idx - 1) % n_ch
+                        right = (ch_idx + 1) % n_ch
+                        data[:, ch_idx] = 0.5 * (data[:, left] + data[:, right])
 
             # Determine rotation to apply
             if use_per_session_rotation:
@@ -307,7 +313,6 @@ class DataManager:
         features_extracted = False
         feature_dim = 0
         if feature_config is not None and feature_config.get("mode") != "raw" and X.ndim == 3:
-            from playagain_pipeline.models.classifier import EMGFeatureExtractor
             extractor = EMGFeatureExtractor(feature_config)
             X = extractor.extract_features(X)
             features_extracted = True
@@ -417,7 +422,6 @@ class DataManager:
         Returns:
             True if successfully deleted
         """
-        import shutil
         dataset_path = self.datasets_dir / name
         if dataset_path.exists() and dataset_path.is_dir():
             shutil.rmtree(dataset_path)
@@ -443,7 +447,7 @@ class DataManager:
         Returns:
             X_train, X_test, y_train, y_test
         """
-        from sklearn.model_selection import train_test_split
+
 
         X = dataset["X"]
         y = dataset["y"]
