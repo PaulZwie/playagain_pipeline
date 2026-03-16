@@ -1509,8 +1509,16 @@ class PerformanceReviewTab(QWidget):
         self._clear_summary_table()
         self._log(f"ERROR:\n{tb}")
         self._status_lbl.setText("Error — see log")
-        QMessageBox.critical(self, "Comparison Error",
-                             "Pipeline error — see log for details.")
+        
+        import sys
+        print(f"[ERROR] {tb}", file=sys.stderr)
+
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Icon.Critical)
+        msg.setWindowTitle("Comparison Error")
+        msg.setText("Pipeline error — see details below.")
+        msg.setDetailedText(tb)
+        msg.exec()
 
     def _on_run_done(self):
         self._progress_bar.setVisible(False)

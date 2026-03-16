@@ -1322,9 +1322,9 @@ class MainWindow(QMainWindow):
             except ValueError:
                 calibrated_data = downstream_data  # Channel mismatch — skip
 
-        # Record if session is active (raw data — calibration applied at dataset creation)
+        # Record if session is active (interpolated data — bad channels already replaced by neighbors)
         if self._current_session and self._current_session.is_recording:
-            self._current_session.add_data(data)
+            self._current_session.add_data(downstream_data)
 
         # Feed calibrated data to Unity TCP server if running.
         # The server now runs prediction on its own background thread,
