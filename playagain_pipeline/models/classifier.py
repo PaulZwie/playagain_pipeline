@@ -794,10 +794,12 @@ class MLPClassifier(BaseClassifier):
             X_val_scaled = self._scaler.transform(X_val_features)
 
         device = resolve_device(self.hyperparameters["device"])
-        X_train_tensor = torch.FloatTensor(X_train_scaled).to(device)
-        y_train_tensor = torch.LongTensor(y_train).to(device)
-        X_val_tensor = torch.FloatTensor(X_val_scaled).to(device) if X_val_scaled is not None else None
-        y_val_tensor = torch.LongTensor(y_val).to(device) if y_val is not None else None
+        # Keep tensors on CPU for DataLoader with pin_memory=True
+        # They will be moved to device inside the training loop
+        X_train_tensor = torch.FloatTensor(X_train_scaled)
+        y_train_tensor = torch.LongTensor(y_train)
+        X_val_tensor = torch.FloatTensor(X_val_scaled) if X_val_scaled is not None else None
+        y_val_tensor = torch.LongTensor(y_val) if y_val is not None else None
 
         self._input_dim = X_train_scaled.shape[1]
         self._output_dim = len(np.unique(y_train))
@@ -841,6 +843,8 @@ class MLPClassifier(BaseClassifier):
             train_loss = 0.0; correct = 0; total = 0
             max_grad_norm = self.hyperparameters.get("max_grad_norm", 1.0)
             for inputs, targets in dataloader:
+                # Move to device here, not before DataLoader
+                inputs, targets = inputs.to(device), targets.to(device)
                 optimizer.zero_grad()
                 outputs = self._model(inputs)
                 loss = criterion(outputs, targets)
@@ -860,11 +864,14 @@ class MLPClassifier(BaseClassifier):
             if X_val_scaled is not None:
                 self._model.eval()
                 with torch.inference_mode():
-                    outputs = self._model(X_val_tensor)
-                    loss = criterion(outputs, y_val_tensor)
+                    # Move validation tensors to device
+                    X_val_device = X_val_tensor.to(device)
+                    y_val_device = y_val_tensor.to(device)
+                    outputs = self._model(X_val_device)
+                    loss = criterion(outputs, y_val_device)
                     val_loss = loss.item()
                     _, predicted = outputs.max(1)
-                    val_acc = predicted.eq(y_val_tensor).sum().item() / y_val_tensor.size(0)
+                    val_acc = predicted.eq(y_val_device).sum().item() / y_val_device.size(0)
 
             history["train_loss"].append(train_loss)
             history["val_loss"].append(val_loss)
@@ -1025,10 +1032,12 @@ class CNNClassifier(BaseClassifier):
             X_val_scaled = self._scaler.transform(X_val_proc.transpose(0, 2, 1).reshape(-1, Cv)).reshape(Nv, Tv, Cv).transpose(0, 2, 1)
 
         device = resolve_device(self.hyperparameters["device"])
-        X_train_tensor = torch.FloatTensor(X_scaled).to(device)
-        y_train_tensor = torch.LongTensor(y_train).to(device)
-        X_val_tensor = torch.FloatTensor(X_val_scaled).to(device) if X_val_scaled is not None else None
-        y_val_tensor = torch.LongTensor(y_val).to(device) if y_val is not None else None
+        # Keep tensors on CPU for DataLoader with pin_memory=True
+        # They will be moved to device inside the training loop
+        X_train_tensor = torch.FloatTensor(X_scaled)
+        y_train_tensor = torch.LongTensor(y_train)
+        X_val_tensor = torch.FloatTensor(X_val_scaled) if X_val_scaled is not None else None
+        y_val_tensor = torch.LongTensor(y_val) if y_val is not None else None
 
         self._input_shape = (C, T); self._output_dim = len(np.unique(y_train))
         self._model = self._build_model(C, T, self._output_dim).to(device)
@@ -1062,6 +1071,8 @@ class CNNClassifier(BaseClassifier):
             self._model.train(); train_loss = 0.0; correct = 0; total = 0
             mgn = self.hyperparameters.get("max_grad_norm", 1.0)
             for inputs, targets in dataloader:
+                # Move to device here, not before DataLoader
+                inputs, targets = inputs.to(device), targets.to(device)
                 optimizer.zero_grad()
                 outputs = self._model(inputs); loss = criterion(outputs, targets)
                 loss.backward()
@@ -1074,10 +1085,13 @@ class CNNClassifier(BaseClassifier):
             if X_val_scaled is not None:
                 self._model.eval()
                 with torch.inference_mode():
-                    outputs = self._model(X_val_tensor); loss = criterion(outputs, y_val_tensor)
+                    # Move validation tensors to device
+                    X_val_device = X_val_tensor.to(device)
+                    y_val_device = y_val_tensor.to(device)
+                    outputs = self._model(X_val_device); loss = criterion(outputs, y_val_device)
                     val_loss = loss.item()
                     _, predicted = outputs.max(1)
-                    val_acc = predicted.eq(y_val_tensor).sum().item() / y_val_tensor.size(0)
+                    val_acc = predicted.eq(y_val_device).sum().item() / y_val_device.size(0)
             history["train_loss"].append(train_loss); history["val_loss"].append(val_loss)
             history["train_acc"].append(train_acc); history["val_acc"].append(val_acc)
             if callback: callback(epoch + 1, train_loss, val_loss, train_acc, val_acc)
