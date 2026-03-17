@@ -14,11 +14,12 @@ Improvements over v1:
 from __future__ import annotations
 
 import json
+import random
 import re
 import sys
 import traceback
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, cast
 
 import pyqtgraph as pg
 from PySide6.QtCore import Qt, QThread, Signal
@@ -76,6 +77,7 @@ class ComparisonWorker(QThread):
         cv_folds: int,
         window_size_ms:  int,
         window_stride_ms: int,
+        intra_session_request: Optional[Dict[str, Any]] = None,
         feature_configs: Optional[List[Dict[str, Any]]] = None,
         parent=None,
     ):
@@ -90,6 +92,7 @@ class ComparisonWorker(QThread):
         self._cv_folds         = cv_folds
         self._window_size_ms   = window_size_ms
         self._window_stride_ms = window_stride_ms
+        self._intra_session_request = intra_session_request
         self._feature_configs    = feature_configs or []
 
     def run(self):
@@ -113,7 +116,7 @@ class ComparisonWorker(QThread):
             comparison_module = None
             original_train_and_evaluate = None
             try:
-                import performance_assessment.model_comparison as model_comparison_module
+                import playagain_pipeline.performance_assessment.model_comparison as model_comparison_module
                 comparison_module = model_comparison_module
                 original_train_and_evaluate = model_comparison_module._train_and_evaluate_fold
 
@@ -203,14 +206,26 @@ class ComparisonWorker(QThread):
                     return result
 
                 comparison_module._train_and_evaluate_fold = _patched
-                from performance_assessment.model_comparison import run_comparison
+                from playagain_pipeline.performance_assessment.model_comparison import run_comparison
 
                 if self._mode == "holdout":
+                    if self._train_sessions is None or self._val_sessions is None or self._test_sessions is None:
+                        raise ValueError("Hold-out mode requires train, val, and test session lists.")
                     res = run_comparison(
                         model_types=self._model_types,
                         window_size_ms=self._window_size_ms,
                         window_stride_ms=self._window_stride_ms,
                         _holdout_sessions=(self._train_sessions, self._val_sessions, self._test_sessions),
+                        feature_configs=self._feature_configs,
+                    )
+                elif self._mode == "intra_session":
+                    if self._intra_session_request is None:
+                        raise ValueError("Intra-session mode requires split settings and source sessions.")
+                    res = run_comparison(
+                        model_types=self._model_types,
+                        window_size_ms=self._window_size_ms,
+                        window_stride_ms=self._window_stride_ms,
+                        _intra_session_split=self._intra_session_request,
                         feature_configs=self._feature_configs,
                     )
                 else:
@@ -269,6 +284,9 @@ class SessionPickerWidget(QWidget):
         self._mode      = "holdout"
         self._val_ratio = 0.15
         self._test_ratio = 0.15
+        self._random_holdout = False
+        self._random_seed = 42
+        self._single_test_expected = False
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -311,6 +329,27 @@ class SessionPickerWidget(QWidget):
             self._recompute_defaults()
             self._rebuild()
 
+    def set_random_holdout(self, enabled: bool):
+        self._random_holdout = bool(enabled)
+        if self._mode == "holdout":
+            self._recompute_defaults()
+            self._rebuild()
+
+    def set_random_seed(self, seed: int):
+        self._random_seed = int(seed)
+        if self._mode == "holdout" and self._random_holdout:
+            self._recompute_defaults()
+            self._rebuild()
+
+    def reshuffle_random_holdout(self):
+        if self._mode == "holdout" and self._random_holdout:
+            self._recompute_defaults()
+            self._rebuild()
+
+    def set_single_test_expected(self, enabled: bool):
+        self._single_test_expected = bool(enabled)
+        self._update_stats()
+
     def load_sessions(self, subject_sessions: Dict[str, List[Any]]):
         self._subject_sessions = subject_sessions
         self._recompute_defaults()
@@ -327,7 +366,12 @@ class SessionPickerWidget(QWidget):
                 for s in sessions:
                     self._session_role[s.metadata.session_id] = "use"
             else:
-                n     = len(sessions)
+                ordered_sessions = list(sessions)
+                if self._random_holdout:
+                    rng = random.Random(f"{self._random_seed}:{subj}")
+                    rng.shuffle(ordered_sessions)
+
+                n     = len(ordered_sessions)
                 if n <= 0:
                     continue
 
@@ -350,7 +394,7 @@ class SessionPickerWidget(QWidget):
                             break
 
                 n_train = n - n_val - n_test
-                for i, s in enumerate(sessions):
+                for i, s in enumerate(ordered_sessions):
                     if i < n_train:
                         role = "train"
                     elif i < n_train + n_val:
@@ -528,7 +572,16 @@ class SessionPickerWidget(QWidget):
             nt, nv, nte = roles.count("train"), roles.count("val"), roles.count("test")
             tot = nt + nv + nte
             split = f" ({nt/tot:.0%}/{nv/tot:.0%}/{nte/tot:.0%})" if tot else ""
-            self._stats_lbl.setText(f"🟢 Train: {nt}   🟡 Val: {nv}   🔴 Test: {nte}{split}")
+            mode_txt = "Random" if self._random_holdout else "Chronological"
+            extra = f" | split: {mode_txt}"
+            if self._random_holdout:
+                extra += f" (seed {self._random_seed})"
+            if self._single_test_expected:
+                if nte == 1:
+                    extra += " | single-session test: OK"
+                else:
+                    extra += " | single-session test: select exactly 1 TEST"
+            self._stats_lbl.setText(f"🟢 Train: {nt}   🟡 Val: {nv}   🔴 Test: {nte}{split}{extra}")
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -741,11 +794,14 @@ class PerformanceReviewTab(QWidget):
         self._mode_grp     = QButtonGroup(self)
         self._holdout_radio = QRadioButton("Hold-out  (train / val / test split)")
         self._cv_radio      = QRadioButton("Cross-Validation  (k-fold)")
+        self._intra_radio   = QRadioButton("Single recording split  (70/15/15 within selected sessions)")
         self._holdout_radio.setChecked(True)
         self._mode_grp.addButton(self._holdout_radio, 0)
         self._mode_grp.addButton(self._cv_radio,      1)
+        self._mode_grp.addButton(self._intra_radio,   2)
         ml.addWidget(self._holdout_radio)
         ml.addWidget(self._cv_radio)
+        ml.addWidget(self._intra_radio)
 
         self._ratio_row = QWidget()
         rf = QFormLayout(self._ratio_row)
@@ -764,8 +820,30 @@ class PerformanceReviewTab(QWidget):
         self._test_ratio_spin.valueChanged.connect(
             lambda v: self._session_picker.set_test_ratio(v / 100.0)
         )
+        self._random_split_cb = QCheckBox("Random session split")
+        self._random_split_cb.toggled.connect(self._on_random_split_toggled)
+        self._random_seed_spin = QSpinBox()
+        self._random_seed_spin.setRange(0, 999999)
+        self._random_seed_spin.setValue(42)
+        self._random_seed_spin.setEnabled(False)
+        self._random_seed_spin.valueChanged.connect(self._on_random_seed_changed)
+        self._reshuffle_btn = QPushButton("Reshuffle")
+        self._reshuffle_btn.setFixedHeight(24)
+        self._reshuffle_btn.setEnabled(False)
+        self._reshuffle_btn.clicked.connect(self._on_reshuffle_clicked)
+        seed_row = QWidget()
+        seed_layout = QHBoxLayout(seed_row)
+        seed_layout.setContentsMargins(0, 0, 0, 0)
+        seed_layout.setSpacing(4)
+        seed_layout.addWidget(self._random_seed_spin)
+        seed_layout.addWidget(self._reshuffle_btn)
+        self._single_test_cb = QCheckBox("Single-session TEST run")
+        self._single_test_cb.toggled.connect(self._on_single_test_toggled)
         rf.addRow("Val ratio:", self._val_ratio_spin)
         rf.addRow("Test ratio:", self._test_ratio_spin)
+        rf.addRow("Split mode:", self._random_split_cb)
+        rf.addRow("Seed:", seed_row)
+        rf.addRow("Session transfer:", self._single_test_cb)
         ml.addWidget(self._ratio_row)
 
         self._folds_row = QWidget()
@@ -779,6 +857,8 @@ class PerformanceReviewTab(QWidget):
         ml.addWidget(self._folds_row)
 
         self._holdout_radio.toggled.connect(self._on_mode_changed)
+        self._cv_radio.toggled.connect(self._on_mode_changed)
+        self._intra_radio.toggled.connect(self._on_mode_changed)
         cl.addWidget(mode_box)
 
         # ── Session picker ─────────────────────────────────────────
@@ -818,13 +898,26 @@ class PerformanceReviewTab(QWidget):
         )
         self._global_test_btn.clicked.connect(lambda: self._set_global_role("test"))
 
+        self._single_test_latest_btn = QPushButton("Latest → TEST")
+        self._single_test_latest_btn.setFixedHeight(24)
+        self._single_test_latest_btn.setStyleSheet(
+            f"font-size:9px;background:{_C['accent']}22;color:{_C['accent']};"
+            f"border:1px solid {_C['accent']}55;border-radius:3px;"
+        )
+        self._single_test_latest_btn.clicked.connect(self._set_latest_session_as_single_test)
+        self._single_test_latest_btn.setVisible(False)
+
         top_row.addWidget(self._global_train_btn)
         top_row.addWidget(self._global_val_btn)
         top_row.addWidget(self._global_test_btn)
+        top_row.addWidget(self._single_test_latest_btn)
         sbl.addLayout(top_row)
 
         self._session_picker = SessionPickerWidget()
         self._session_picker.setMinimumHeight(260)
+        self._session_picker.set_random_seed(self._random_seed_spin.value())
+        self._session_picker.set_random_holdout(self._random_split_cb.isChecked())
+        self._session_picker.set_single_test_expected(self._single_test_cb.isChecked())
         self._session_picker.roles_changed.connect(self._update_run_btn)
         sbl.addWidget(self._session_picker)
         cl.addWidget(sess_box)
@@ -1147,15 +1240,75 @@ class PerformanceReviewTab(QWidget):
     # Mode / UI helpers
     # ──────────────────────────────────────────────────────────────────
 
+    def _selected_eval_mode(self) -> str:
+        if self._cv_radio.isChecked():
+            return "cv"
+        if self._intra_radio.isChecked():
+            return "intra_session"
+        return "holdout"
+
     def _on_mode_changed(self):
-        is_ho = self._holdout_radio.isChecked()
-        self._ratio_row.setVisible(is_ho)
-        self._folds_row.setVisible(not is_ho)
+        mode = self._selected_eval_mode()
+        is_ho = mode == "holdout"
+        is_cv = mode == "cv"
+        is_intra = mode == "intra_session"
+
+        self._ratio_row.setVisible(is_ho or is_intra)
+        self._folds_row.setVisible(is_cv)
         self._global_train_btn.setVisible(is_ho)
         self._global_val_btn.setVisible(is_ho)
         self._global_test_btn.setVisible(is_ho)
+        self._single_test_latest_btn.setVisible(is_ho and self._single_test_cb.isChecked())
+
+        self._random_split_cb.setEnabled(is_ho)
+        self._random_seed_spin.setEnabled(is_ho and self._random_split_cb.isChecked())
+        self._reshuffle_btn.setEnabled(is_ho and self._random_split_cb.isChecked())
+        self._single_test_cb.setEnabled(is_ho)
+
+        # Intra-session mode uses USE/excluded cards like CV, then splits windows internally.
         self._session_picker.set_mode("holdout" if is_ho else "cv")
+        self._session_picker.set_single_test_expected(is_ho and self._single_test_cb.isChecked())
         self._update_run_btn()
+
+    def _on_random_split_toggled(self, checked: bool):
+        self._random_seed_spin.setEnabled(checked)
+        self._reshuffle_btn.setEnabled(checked)
+        self._session_picker.set_random_holdout(checked)
+
+    def _on_random_seed_changed(self, value: int):
+        self._session_picker.set_random_seed(value)
+
+    def _on_reshuffle_clicked(self):
+        self._session_picker.reshuffle_random_holdout()
+
+    def _on_single_test_toggled(self, checked: bool):
+        self._single_test_latest_btn.setVisible(self._holdout_radio.isChecked() and checked)
+        self._session_picker.set_single_test_expected(self._holdout_radio.isChecked() and checked)
+
+    def _set_latest_session_as_single_test(self):
+        sp = self._session_picker
+        all_sessions = [
+            s for sessions in sp._subject_sessions.values()
+            for s in sessions
+        ]
+        if not all_sessions:
+            return
+
+        latest = max(
+            all_sessions,
+            key=lambda s: (
+                str(getattr(s.metadata, "created_at", "")),
+                str(s.metadata.session_id),
+            ),
+        )
+        sp._recompute_defaults()
+        for sid in list(sp._session_role.keys()):
+            if sid == latest.metadata.session_id:
+                sp._session_role[sid] = "test"
+            elif sp._session_role[sid] == "test":
+                sp._session_role[sid] = "train"
+        sp._rebuild()
+        sp.roles_changed.emit()
 
     def _set_global_role(self, role: str):
         sp = self._session_picker
@@ -1399,7 +1552,7 @@ class PerformanceReviewTab(QWidget):
         self._run_btn.setEnabled(self._worker is None)
 
     def _on_run(self):
-        mode   = "cv" if self._cv_radio.isChecked() else "holdout"
+        mode   = self._selected_eval_mode()
         roles  = self._session_picker.get_roles()
         sp     = self._session_picker
         all_s  = {s.metadata.session_id: s
@@ -1417,6 +1570,12 @@ class PerformanceReviewTab(QWidget):
             QMessageBox.warning(self, "Feature configuration", str(exc))
             return
 
+        holdout_train: Optional[List[Any]] = None
+        holdout_val: Optional[List[Any]] = None
+        holdout_test: Optional[List[Any]] = None
+        intra_request: Optional[Dict[str, Any]] = None
+        cv_sessions: Optional[List[Any]] = None
+
         if mode == "holdout":
             train = [all_s[sid] for sid, r in roles.items() if r == "train" and sid in all_s]
             val   = [all_s[sid] for sid, r in roles.items() if r == "val"   and sid in all_s]
@@ -1433,13 +1592,54 @@ class PerformanceReviewTab(QWidget):
                 QMessageBox.warning(self, "No TEST sessions",
                     "Assign at least one session as TEST.\nClick a card or use 'All → TEST'.")
                 return
+            if self._single_test_cb.isChecked() and len(test) != 1:
+                QMessageBox.warning(
+                    self,
+                    "Single-session TEST required",
+                    "Session transfer mode expects exactly one TEST session.\n"
+                    "Tip: use 'Latest → TEST' or manually leave only one TEST card.",
+                )
+                return
+            holdout_train = cast(List[Any], train)
+            holdout_val = cast(List[Any], val)
+            holdout_test = cast(List[Any], test)
             cv_sessions = None
-        else:
+        elif mode == "cv":
             train = val = test = None
             cv_sessions = [all_s[sid] for sid, r in roles.items() if r == "use" and sid in all_s]
             if not cv_sessions:
                 QMessageBox.warning(self, "No sessions", "Mark at least one session as USE.")
                 return
+        else:
+            source_sessions = [all_s[sid] for sid, r in roles.items() if r == "use" and sid in all_s]
+            if not source_sessions:
+                QMessageBox.warning(
+                    self,
+                    "No source sessions",
+                    "Mark at least one session as USE.\n"
+                    "This mode trains/validates/tests within the selected recording sessions.",
+                )
+                return
+
+            val_ratio = self._val_ratio_spin.value() / 100.0
+            test_ratio = self._test_ratio_spin.value() / 100.0
+            train_ratio = 1.0 - val_ratio - test_ratio
+            if train_ratio <= 0:
+                QMessageBox.warning(
+                    self,
+                    "Invalid split",
+                    "Train ratio must be > 0. Reduce Val/Test ratios.",
+                )
+                return
+
+            intra_request = {
+                "sessions": source_sessions,
+                "train_ratio": train_ratio,
+                "val_ratio": val_ratio,
+                "test_ratio": test_ratio,
+                "shuffle": False,
+                "random_seed": self._random_seed_spin.value(),
+            }
 
         has_deep = any(m in _DEEP_MODELS for m in sel_models)
         self._live_plot_frame.setVisible(has_deep)
@@ -1450,6 +1650,21 @@ class PerformanceReviewTab(QWidget):
         self._clear_summary_table()
         sweep_desc = ", ".join(cfg["label"] for cfg in feature_configs)
         self._log(f"Starting comparison …\nFeature configs: {sweep_desc}")
+        if mode == "holdout":
+            split_mode = "random" if self._random_split_cb.isChecked() else "chronological"
+            self._log(f"Hold-out split mode: {split_mode}"
+                      f"{' (seed ' + str(self._random_seed_spin.value()) + ')' if self._random_split_cb.isChecked() else ''}")
+            if self._single_test_cb.isChecked() and holdout_test:
+                test_sid = getattr(getattr(holdout_test[0], "metadata", None), "session_id", "<unknown>")
+                self._log(f"Session transfer mode: testing on single session {test_sid}")
+        elif mode == "intra_session":
+            self._log(
+                "Intra-session split mode: "
+                f"train {intra_request['train_ratio']:.0%} / "
+                f"val {intra_request['val_ratio']:.0%} / "
+                f"test {intra_request['test_ratio']:.0%}"
+            )
+            self._log(f"Source sessions: {len(intra_request['sessions'])}")
         self._status_lbl.setText("Running …")
         self._progress_bar.setVisible(True)
         self._run_btn.setEnabled(False)
@@ -1460,13 +1675,14 @@ class PerformanceReviewTab(QWidget):
             data_dir         = self._dm.data_dir,
             model_types      = sel_models,
             mode             = mode,
-            train_sessions   = train,
-            val_sessions     = val,
-            test_sessions    = test,
+            train_sessions   = holdout_train if mode == "holdout" else None,
+            val_sessions     = holdout_val if mode == "holdout" else None,
+            test_sessions    = holdout_test if mode == "holdout" else None,
             cv_sessions      = cv_sessions,
             cv_folds         = self._cv_folds_spin.value(),
             window_size_ms   = self._win_size_spin.value(),
             window_stride_ms = self._win_stride_spin.value(),
+            intra_session_request = intra_request,
             feature_configs  = feature_configs,
         )
         self._worker.log_line.connect(self._log)
