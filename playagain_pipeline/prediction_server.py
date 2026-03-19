@@ -44,7 +44,7 @@ import numpy as np
 
 from playagain_pipeline.config.config import get_default_config
 from playagain_pipeline.core.data_manager import DataManager
-from playagain_pipeline.devices.emg_device import DeviceManager
+from playagain_pipeline.devices.emg_device import DeviceManager, DeviceType, SyntheticEMGDevice
 from playagain_pipeline.models.classifier import ModelManager, BaseClassifier
 
 
@@ -709,8 +709,6 @@ def run_standalone(model_name: str, host: str = "127.0.0.1", port: int = 5555,
         port: TCP port to bind to
         device_type: EMG device type ("muovi" or "synthetic")
     """
-    from playagain_pipeline.devices.emg_device import DeviceType
-    
     # Setup paths
     pipeline_dir = Path(__file__).parent
     data_dir = pipeline_dir / "data"
@@ -730,7 +728,6 @@ def run_standalone(model_name: str, host: str = "127.0.0.1", port: int = 5555,
     device_mgr = DeviceManager()
     
     if device_type == "synthetic":
-        from playagain_pipeline.devices.emg_device import SyntheticEMGDevice
         device = SyntheticEMGDevice(
             num_channels=model.metadata.num_channels,
             sampling_rate=model.metadata.sampling_rate

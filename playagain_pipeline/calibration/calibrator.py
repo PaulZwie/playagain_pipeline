@@ -337,6 +337,10 @@ class CalibrationProcessor:
         The Maximum Energy Channel (MEC) is identified for both patterns.
         The rotation offset is the circular distance between them.
 
+        For 32-channel devices (2-ring layout), energies are summed across rows
+        to create a robust 16-channel angular profile. This prevents noise
+        from shifting the peak between rings (e.g. index 0 vs 16).
+
         Confidence is based on how prominent the energy peak is—a sharp
         peak in a single channel means high confidence; a flat distribution
         means low confidence.
@@ -350,6 +354,32 @@ class CalibrationProcessor:
         """
         n = self.num_channels
 
+        # --- Enhanced logic for 32-channel (2-ring) devices ---
+        if n == 32:
+            # Fold 32 channels into 16 angular sectors by summing rings.
+            # Sector i = Channel i (Inner) + Channel i+16 (Outer)
+            # This makes the detection insensitive to proximal/distal shifts.
+            current_folded = current_energy[:16] + current_energy[16:]
+            reference_folded = reference_energy[:16] + reference_energy[16:]
+            
+            # Find MEC on the folded profile (0..15)
+            # We use circular cross-correlation to find the best shift,
+            # which is more robust than simple argmax difference.
+            # (Though paper uses MEC, cross-corr is consistent with "max energy alignment")
+            # Sticking to MEC as per paper request:
+            curr_mec = int(np.argmax(current_folded))
+            ref_mec = int(np.argmax(reference_folded))
+            
+            rotation_offset = (curr_mec - ref_mec) % 16
+            
+            # Re-calculate confidence on the cleaner 16-channel profile
+            confidence = self._compute_energy_confidence(current_folded)
+            
+            # Note: We return offset in 0..15. The channel mapping logic
+            # handles this as a column shift. Row shifts (flipping) are ignored.
+            return rotation_offset, confidence
+
+        # --- Standard logic for single-ring (e.g. 8-channel) devices ---
         current_mec = int(np.argmax(current_energy))
         reference_mec = int(np.argmax(reference_energy))
 
@@ -409,13 +439,38 @@ class CalibrationProcessor:
         Channels are rearranged so that channel[rotation_offset] becomes
         channel[0] in the new order.
 
+        For 32-channel devices (2x16 layout), the mapping respects the 
+        physical electrode topology where rows wraps independently.
+        (Indices 0-15 and 16-31).
+
         Args:
             rotation_offset: Number of channels the bracelet has rotated
 
         Returns:
             List of channel indices in corrected order
         """
-        return [(i - rotation_offset) % self.num_channels
+        if self.num_channels == 32:
+            # Handle split-ring topology for 2x16 electrode layout
+            # Row 1: 0-15 -> Wraps 15 to 0
+            # Row 2: 16-31 -> Wraps 31 to 16
+            
+            row_shift = rotation_offset // 16
+            col_shift = rotation_offset % 16
+            
+            mapping = []
+            for i in range(self.num_channels):
+                r = i // 16
+                c = i % 16
+                
+                # Apply shift respecting the 2-row topology
+                target_r = (r + row_shift) % 2
+                target_c = (c + col_shift) % 16
+                
+                mapping.append(target_r * 16 + target_c)
+            return mapping
+
+        # Default ring topology for other channel counts
+        return [(i + rotation_offset) % self.num_channels
                 for i in range(self.num_channels)]
 
     def calibrate_from_data(
@@ -423,6 +478,7 @@ class CalibrationProcessor:
         calibration_data: Dict[str, Union[np.ndarray, List[np.ndarray]]],
         device_name: str = "unknown",
         reference_result: Optional[CalibrationResult] = None,
+        plot_path: Optional[Path] = None,
     ) -> CalibrationResult:
         """
         Perform calibration from recorded gesture data using the MEC method.
@@ -447,19 +503,28 @@ class CalibrationProcessor:
         for g, e in per_gesture_energy.items():
             per_gesture_confidence[g] = self._compute_energy_confidence(e)
 
-        if reference_result is not None:
-            ref_combined = reference_result.reference_patterns.get("__combined__")
-            if ref_combined is not None and len(ref_combined) == self.num_channels:
-                offset, confidence = self.find_rotation_offset(combined_energy, ref_combined)
-            else:
-                # Incompatible reference — use identity mapping
-                offset = 0
-                confidence = 1.0
+        # Select the best sync pattern (e.g. waveOut or Fist)
+        ref_patterns_map = reference_result.reference_patterns if reference_result else None
+        
+        sync_energy, ref_sync_energy, sync_gesture = self._select_sync_pattern(
+            energy_patterns, ref_patterns_map
+        )
+        
+        # Calculate offset using the selected patterns
+        if ref_sync_energy is not None and len(ref_sync_energy) == self.num_channels:
+            offset, confidence = self.find_rotation_offset(sync_energy, ref_sync_energy)
         else:
             offset = 0
-            confidence = 1.0
+            # If creating a new reference, confidence is how "peaked" the selected gesture is
+            confidence = self._compute_energy_confidence(sync_energy)
 
         channel_mapping = self.create_channel_mapping(offset)
+
+        # --- Debug plot for energy profile alignment ---
+        if plot_path is not None:
+             # Use the actual sync patterns for plotting, not the combined ones
+             # unless combined was selected.
+            self._plot_energy_profile(sync_energy, ref_sync_energy, offset, confidence, plot_path)
 
         return CalibrationResult(
             created_at=datetime.now(),
@@ -471,12 +536,63 @@ class CalibrationProcessor:
             reference_patterns=energy_patterns,
             metadata={
                 "method": "maximum_energy_channel",
+                "sync_gesture": sync_gesture,  # Record which gesture was used
                 "per_gesture_confidence": per_gesture_confidence,
                 "num_gestures": len(calibration_data),
                 "has_reference": reference_result is not None,
-                "mec_channel": int(np.argmax(combined_energy)),
+                "mec_channel": int(np.argmax(sync_energy)),
             },
         )
+
+    def _select_sync_pattern(
+        self,
+        patterns: Dict[str, np.ndarray],
+        reference_patterns: Optional[Dict[str, np.ndarray]] = None
+    ) -> Tuple[np.ndarray, Optional[np.ndarray], str]:
+        """
+        Select the best gesture pattern for synchronization.
+
+        Prioritizes gestures recommended by Barona López et al. (Sensors 2020):
+        waveOut > Fist > Open > waveIn > Pinch > Tripod.
+
+        If a reference is provided, selects the highest priority gesture
+        available in *both* sets. If no common gesture, falls back to
+        "__combined__".
+
+        Returns:
+            (current_pattern, reference_pattern, gesture_name)
+        """
+        # Normalized priority list (lowercase for matching)
+        priority = ["waveout", "fist", "open", "wavein", "pinch", "tripod"]
+
+        # Helper to find case-insensitive match
+        def find_match(info_dict, target):
+            for key in info_dict:
+                if key.lower() == target:
+                    return key
+            return None
+
+        # 1. If we have a reference, try to find the best common gesture
+        if reference_patterns:
+            for p in priority:
+                curr_key = find_match(patterns, p)
+                ref_key = find_match(reference_patterns, p)
+
+                if curr_key and ref_key:
+                    return patterns[curr_key], reference_patterns[ref_key], curr_key
+
+            # Fallback: use __combined__ if both have it (they should)
+            if "__combined__" in patterns and "__combined__" in reference_patterns:
+                return patterns["__combined__"], reference_patterns["__combined__"], "Combined (Fallback)"
+
+        # 2. No reference (or creating one): pick best available from current
+        for p in priority:
+            key = find_match(patterns, p)
+            if key:
+                return patterns[key], None, key
+
+        # 3. Last resort: Combined
+        return patterns.get("__combined__", np.zeros(self.num_channels)), None, "Combined"
 
     def set_reference_calibration(self, result: Optional[CalibrationResult]) -> None:
         """Set or clear the reference calibration for future calibrations."""
@@ -601,7 +717,7 @@ class AutoCalibrator:
 
         return result
 
-    def calibrate_from_session(self, session) -> CalibrationResult:
+    def calibrate_from_session(self, session, plot_path: Optional[Path] = None) -> CalibrationResult:
         """
         Perform calibration directly from a normal recording session.
 
@@ -613,6 +729,7 @@ class AutoCalibrator:
 
         Args:
             session: A RecordingSession with annotated trials
+            plot_path: Optional path to save a debug plot of the energy profile
 
         Returns:
             CalibrationResult with rotation offset and channel mapping
@@ -641,7 +758,8 @@ class AutoCalibrator:
         result = self.processor.calibrate_from_data(
             gesture_trials,
             device_name=session.metadata.device_name,
-            reference_result=self.processor.get_reference_calibration()
+            reference_result=self.processor.get_reference_calibration(),
+            plot_path=plot_path
         )
 
         self._current_calibration = result
@@ -686,7 +804,7 @@ class AutoCalibrator:
 
         return calibration.apply_to_data(data)
 
-    def detect_session_rotation(self, session, save_to_metadata: bool = True) -> Optional[CalibrationResult]:
+    def detect_session_rotation(self, session, save_to_metadata: bool = True, save_plot: bool = False) -> Optional[CalibrationResult]:
         """
         Detect bracelet rotation for a session and optionally write it to the session metadata.
 
@@ -704,6 +822,7 @@ class AutoCalibrator:
             session: A RecordingSession with annotated trials
             save_to_metadata: If True, writes rotation_offset and rotation_confidence
                               to the session's metadata fields
+            save_plot: If True, saves a debug plot in the session folder
 
         Returns:
             CalibrationResult if detection succeeded, None otherwise
@@ -717,8 +836,22 @@ class AutoCalibrator:
         if not non_rest:
             return None
 
+        plot_path = None
+        if save_plot:
+            # We assume session has a path or we can construct one.
+            # session doesn't store its own path? DataManager loads it from path.
+            # But here we might not know the path easily if it's new.
+            # However, detect_session_rotation is often called with a session object.
+            # Let's save it to calibration dir by session ID if possible.
+            try:
+                # Assuming session_id is unique
+                plot_filename = f"rotation_plot_{session.metadata.session_id}.png"
+                plot_path = self.data_dir / "plots" / plot_filename
+            except Exception:
+                pass
+
         try:
-            result = self.calibrate_from_session(session)
+            result = self.calibrate_from_session(session, plot_path=plot_path)
         except (ValueError, Exception) as e:
             print(f"[AutoCalibrator] Could not detect rotation for session "
                   f"'{session.metadata.session_id}': {e}")
@@ -732,10 +865,9 @@ class AutoCalibrator:
 
         return result
 
-
 def backfill_session_rotations(data_dir: Path, calibrations_dir: Optional[Path] = None,
                                 num_channels: int = 32, sampling_rate: int = 2000,
-                                force: bool = False) -> Dict[str, Dict[str, Any]]:
+                                force: bool = False, save_plots: bool = False) -> Dict[str, Dict[str, Any]]:
     """
     Backfill rotation offsets for all existing recording sessions.
 
@@ -756,6 +888,7 @@ def backfill_session_rotations(data_dir: Path, calibrations_dir: Optional[Path] 
         num_channels: Number of EMG channels
         sampling_rate: Sampling rate in Hz
         force: If True, re-detect rotation even for sessions that already have it
+        save_plots: If True, generate debug plots for each session
 
     Returns:
         Dictionary mapping session_id to {"rotation_offset": int, "confidence": float, "status": str}
@@ -808,7 +941,7 @@ def backfill_session_rotations(data_dir: Path, calibrations_dir: Optional[Path] 
                 continue
 
             # Detect rotation
-            cal_result = calibrator.detect_session_rotation(session, save_to_metadata=True)
+            cal_result = calibrator.detect_session_rotation(session, save_to_metadata=True, save_plot=save_plots)
 
             if cal_result is not None:
                 # If no reference exists yet, save first successful calibration as reference

@@ -5,7 +5,12 @@ Provides hyperparameter editing, real-time progress monitoring,
 and training result visualization.
 """
 
+from datetime import datetime as _dt
+from pathlib import Path
+import threading
 from typing import Optional, Dict, Any, List
+
+from sklearn.model_selection import train_test_split
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGridLayout, QGroupBox,
     QLabel, QSpinBox, QDoubleSpinBox, QComboBox, QCheckBox,
@@ -16,7 +21,8 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Signal, Slot, QThread, Qt
 import pyqtgraph as pg
 
-from playagain_pipeline.config.config import PipelineConfig, ModelConfig
+from playagain_pipeline.config.config import PipelineConfig
+from playagain_pipeline.models.classifier import ModelManager
 from playagain_pipeline.models.feature_pipeline import get_registered_features
 
 
@@ -68,6 +74,9 @@ class TrainingWorker(QThread):
             # Add callback to kwargs
             self.kwargs['callback'] = progress_callback
 
+            if self.kwargs.get("auto_learning_rate"):
+                self.progress.emit(12, "Running learning-rate finder...")
+
             # For non-iterative models, use a background timer to simulate progress
             is_iterative = hasattr(self.model, 'hyperparameters') and \
                            self.model.hyperparameters.get("epochs", 0) > 0
@@ -75,7 +84,6 @@ class TrainingWorker(QThread):
             if not is_iterative:
                 self.progress.emit(15, "Extracting features...")
                 # Start a simulated progress thread that advances 20% → 90%
-                import threading, time as _time
                 _sim_stop = threading.Event()
 
                 def _simulate_progress():
@@ -324,6 +332,8 @@ class HyperparameterWidget(QWidget):
         )
         grid.addWidget(self.scheduler_combo, 7, 1)
 
+        self._setup_auto_lr_controls(grid, 8)
+
         layout.addLayout(grid)
 
     def _setup_cnn_params(self, layout):
@@ -414,6 +424,8 @@ class HyperparameterWidget(QWidget):
             .get(self.config.model.cnn_scheduler, "None")
         )
         grid.addWidget(self.scheduler_combo, 9, 1)
+
+        self._setup_auto_lr_controls(grid, 10)
 
         layout.addLayout(grid)
 
@@ -521,6 +533,8 @@ class HyperparameterWidget(QWidget):
         )
         grid.addWidget(self.scheduler_combo, 10, 1)
 
+        self._setup_auto_lr_controls(grid, 11)
+
         layout.addLayout(grid)
 
     def _setup_mstnet_params(self, layout):
@@ -611,7 +625,54 @@ class HyperparameterWidget(QWidget):
         )
         grid.addWidget(self.scheduler_combo, 9, 1)
 
+        self._setup_auto_lr_controls(grid, 10)
+
         layout.addLayout(grid)
+
+    def _setup_auto_lr_controls(self, grid: QGridLayout, row: int):
+        """Add the Auto Learning Rate option shared by deep-learning models."""
+        self._manual_epochs_value = None
+        self._manual_early_stopping_value = None
+
+        self.auto_lr_check = QCheckBox("Auto Learning Rate (LR Finder)")
+        self.auto_lr_check.setToolTip(
+            "Run an LR range test before training, then train for 100 epochs with early stopping disabled."
+        )
+        self.auto_lr_check.toggled.connect(self._on_auto_lr_toggled)
+        grid.addWidget(self.auto_lr_check, row, 0, 1, 2)
+
+        self.auto_lr_info_label = QLabel("Uses a learning-rate search before training.")
+        self.auto_lr_info_label.setStyleSheet("color: #666; font-size: 10px;")
+        grid.addWidget(self.auto_lr_info_label, row + 1, 0, 1, 3)
+
+    def _on_auto_lr_toggled(self, enabled: bool):
+        """Lock or unlock training controls when Auto LR is enabled."""
+        if enabled:
+            if hasattr(self, "epochs_spin"):
+                self._manual_epochs_value = self.epochs_spin.value()
+                self.epochs_spin.setValue(100)
+                self.epochs_spin.setEnabled(False)
+            if hasattr(self, "early_stop_check"):
+                self._manual_early_stopping_value = self.early_stop_check.isChecked()
+                self.early_stop_check.setChecked(False)
+                self.early_stop_check.setEnabled(False)
+            if hasattr(self, "patience_spin"):
+                self.patience_spin.setEnabled(False)
+            if hasattr(self, "lr_spin"):
+                self.lr_spin.setEnabled(False)
+        else:
+            if hasattr(self, "epochs_spin"):
+                if self._manual_epochs_value is not None:
+                    self.epochs_spin.setValue(self._manual_epochs_value)
+                self.epochs_spin.setEnabled(True)
+            if hasattr(self, "early_stop_check"):
+                if self._manual_early_stopping_value is not None:
+                    self.early_stop_check.setChecked(self._manual_early_stopping_value)
+                self.early_stop_check.setEnabled(True)
+            if hasattr(self, "patience_spin"):
+                self.patience_spin.setEnabled(True)
+            if hasattr(self, "lr_spin"):
+                self.lr_spin.setEnabled(True)
 
     def get_hyperparameters(self) -> Dict[str, Any]:
         """Get the configured hyperparameters."""
@@ -653,17 +714,18 @@ class HyperparameterWidget(QWidget):
 
             params = {
                 "hidden_layers": tuple(layers),
-                "epochs": self.epochs_spin.value(),
+                "epochs": 100 if getattr(self, "auto_lr_check", None) and self.auto_lr_check.isChecked() else self.epochs_spin.value(),
                 "batch_size": self.batch_spin.value(),
                 "learning_rate": self.lr_spin.value(),
                 "optimizer": self.optimizer_combo.currentText().lower(),
-                "early_stopping": self.early_stop_check.isChecked(),
+                "early_stopping": False if getattr(self, "auto_lr_check", None) and self.auto_lr_check.isChecked() else self.early_stop_check.isChecked(),
                 "patience": self.patience_spin.value(),
                 "dropout": 0.2,
                 "weight_decay": self.weight_decay_spin.value(),
                 "scheduler": {"None": "none", "Cosine Annealing": "cosine",
                               "Reduce on Plateau": "plateau", "Step": "step"}
                              .get(self.scheduler_combo.currentText(), "none"),
+                "auto_learning_rate": getattr(self, "auto_lr_check", None) and self.auto_lr_check.isChecked(),
             }
         elif self.model_type == "cnn":
             # Parse filters
@@ -691,16 +753,17 @@ class HyperparameterWidget(QWidget):
                 "filters": filters,
                 "kernel_sizes": kernels,
                 "fc_layers": tuple(fc_layers),
-                "epochs": self.epochs_spin.value(),
+                "epochs": 100 if getattr(self, "auto_lr_check", None) and self.auto_lr_check.isChecked() else self.epochs_spin.value(),
                 "batch_size": self.batch_spin.value(),
                 "learning_rate": self.lr_spin.value(),
                 "optimizer": self.optimizer_combo.currentText().lower(),
-                "early_stopping": self.early_stop_check.isChecked(),
+                "early_stopping": False if getattr(self, "auto_lr_check", None) and self.auto_lr_check.isChecked() else self.early_stop_check.isChecked(),
                 "patience": self.patience_spin.value(),
                 "weight_decay": self.weight_decay_spin.value(),
                 "scheduler": {"None": "none", "Cosine Annealing": "cosine",
                               "Reduce on Plateau": "plateau", "Step": "step"}
                              .get(self.scheduler_combo.currentText(), "none"),
+                "auto_learning_rate": getattr(self, "auto_lr_check", None) and self.auto_lr_check.isChecked(),
             }
 
         elif self.model_type == "attention_net":
@@ -717,16 +780,17 @@ class HyperparameterWidget(QWidget):
                 "inception_channels": self.inc_base_spin.value(),
                 "branch_kernels": kernels,
                 "reduction_ratio": self.att_red_spin.value(),
-                "epochs": self.epochs_spin.value(),
+                "epochs": 100 if getattr(self, "auto_lr_check", None) and self.auto_lr_check.isChecked() else self.epochs_spin.value(),
                 "batch_size": self.batch_spin.value(),
                 "learning_rate": self.lr_spin.value(),
                 "optimizer": self.optimizer_combo.currentText().lower(),
-                "early_stopping": self.early_stop_check.isChecked(),
+                "early_stopping": False if getattr(self, "auto_lr_check", None) and self.auto_lr_check.isChecked() else self.early_stop_check.isChecked(),
                 "patience": self.patience_spin.value(),
                 "weight_decay": self.weight_decay_spin.value(),
                 "scheduler": {"None": "none", "Cosine Annealing": "cosine",
                               "Reduce on Plateau": "plateau", "Step": "step"}
                              .get(self.scheduler_combo.currentText(), "none"),
+                "auto_learning_rate": getattr(self, "auto_lr_check", None) and self.auto_lr_check.isChecked(),
             }
 
         elif self.model_type == "mstnet":
@@ -743,17 +807,18 @@ class HyperparameterWidget(QWidget):
                 "base_filters": self.mst_base_spin.value(),
                 "ms_kernels": ms_kernels,
                 "num_blocks": self.mst_blocks_spin.value(),
-                "epochs": self.epochs_spin.value(),
+                "epochs": 100 if getattr(self, "auto_lr_check", None) and self.auto_lr_check.isChecked() else self.epochs_spin.value(),
                 "batch_size": self.batch_spin.value(),
                 "learning_rate": self.lr_spin.value(),
                 "optimizer": self.optimizer_combo.currentText().lower(),
-                "early_stopping": self.early_stop_check.isChecked(),
+                "early_stopping": False if getattr(self, "auto_lr_check", None) and self.auto_lr_check.isChecked() else self.early_stop_check.isChecked(),
                 "patience": self.patience_spin.value(),
                 "dropout": self.config.model.mstnet_dropout,
                 "weight_decay": self.weight_decay_spin.value(),
                 "scheduler": {"None": "none", "Cosine Annealing": "cosine",
                               "Reduce on Plateau": "plateau", "Step": "step"}
                              .get(self.scheduler_combo.currentText(), "none"),
+                "auto_learning_rate": getattr(self, "auto_lr_check", None) and self.auto_lr_check.isChecked(),
             }
 
         return params
@@ -1067,9 +1132,6 @@ class TrainingProgressDialog(QDialog):
     @Slot()
     def _on_start_training(self):
         """Start the training process."""
-        from playagain_pipeline.models.classifier import ModelManager
-        from sklearn.model_selection import train_test_split
-
         self._log("Starting training...")
         self.train_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
@@ -1100,7 +1162,6 @@ class TrainingProgressDialog(QDialog):
                     raise ValueError("Please select a dataset")
 
             # Create model with hyperparameters
-            from pathlib import Path
             # Use parent window's model_manager if available, or create with proper path
             if hasattr(self.parent(), 'model_manager'):
                 model_manager = self.parent().model_manager
@@ -1239,7 +1300,6 @@ class TrainingProgressDialog(QDialog):
             # Use model type if available
             prefix = self.model_type if self.model_type else "model"
             # Add time stamp so re-training doesn't overwrite previous runs
-            from datetime import datetime as _dt
             ts = _dt.now().strftime("%H%M%S")
             model_name = f"{prefix}_{safe_name}_{ts}"
 
@@ -1297,7 +1357,6 @@ class TrainingProgressDialog(QDialog):
                     QMessageBox.information(self, "Success", f"Model saved as '{self._model.name}'")
                 else:
                     # Fallback save
-                    from pathlib import Path
                     save_dir = Path("data/models") / self._model.name
                     self._model.save(save_dir)
                     self._log(f"Model saved to: {save_dir}")

@@ -6,6 +6,7 @@ platform-appropriate paths, imports, and behaviour throughout
 the pipeline.
 """
 
+import os
 import platform
 import sys
 from pathlib import Path
@@ -134,7 +135,6 @@ def get_app_config_dir() -> Path:
     if IS_MACOS:
         base = Path.home() / "Library" / "Application Support"
     elif IS_WINDOWS:
-        import os
         base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
     else:
         base = Path.home() / ".config"

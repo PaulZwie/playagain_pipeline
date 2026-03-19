@@ -111,6 +111,9 @@ class GameRecorder:
         # Calibration/rotation metadata (set externally before start_recording)
         self._calibration_info: Optional[Dict[str, Any]] = None
 
+        # Optional participant metadata (set externally before start_recording)
+        self._participant_info: Optional[Dict[str, Any]] = None
+
     # ─── Properties ───────────────────────────────────────────────────────
 
     @property
@@ -189,6 +192,10 @@ class GameRecorder:
             "rotation_confidence": round(confidence, 4),
             "channel_mapping": channel_mapping,
         }
+
+    def set_participant_info(self, participant_info: Optional[Dict[str, Any]]):
+        """Attach participant information to the recording config."""
+        self._participant_info = dict(participant_info) if participant_info else None
 
     # ─── Recording Control ────────────────────────────────────────────────
 
@@ -528,6 +535,9 @@ class GameRecorder:
             model_info = dict(self._model_metadata)
             model_info.pop("training_history", None)
             config["model"] = model_info
+
+        if self._participant_info:
+            config["participant"] = self._participant_info
 
         if self._calibration_info:
             config["calibration"] = self._calibration_info

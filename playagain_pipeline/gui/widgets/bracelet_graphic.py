@@ -99,12 +99,23 @@ class BraceletGraphicWidget(QWidget):
         elec_x, elec_y, elec_depth, elec_idx, elec_ring = [], [], [], [], []
 
         for pair in range(n_pairs):
-            theta = 2.0 * math.pi * pair / n_pairs - math.pi / 2  # start at top
+            theta = 2.0 * math.pi * pair / n_pairs - math.pi / 2  # start at bottom (approx)
 
             for ring_i, (radius, idx_offset) in enumerate(
                 [(r_outer, 0), (r_inner, 1)]
             ):
-                idx = pair * 2 + idx_offset
+                if N == 32:
+                    # Split ring topology for 32-ch bracelet
+                    # Inner ring (ring_i=1): 0-15
+                    # Outer ring (ring_i=0): 16-31
+                    if ring_i == 1:
+                        idx = pair
+                    else:
+                        idx = pair + 16
+                else:
+                    # Default interleaved topology
+                    idx = pair * 2 + idx_offset
+
                 x, y, d = project(theta, radius)
                 elec_x.append(x)
                 elec_y.append(y)

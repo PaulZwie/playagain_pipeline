@@ -7,21 +7,28 @@ different ML models for EMG gesture recognition.
 
 import json
 import logging
-import os
 import pickle
+import shutil
+import time
 import numpy as np
 
 from abc import ABC, abstractmethod
-from typing import Optional, Dict, Any, List, Tuple
+from typing import Optional, Dict, Any, List
 from pathlib import Path
 from dataclasses import dataclass, field
 from datetime import datetime
 from catboost import CatBoostClassifier as CatBoostWrapper
+from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
+from sklearn.ensemble import RandomForestClassifier as RFClassifier
+from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import StandardScaler
+from sklearn.svm import SVC
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.utils.data import DataLoader, TensorDataset
+
+from playagain_pipeline.models.feature_pipeline import get_registered_features
 
 logger = logging.getLogger(__name__)
 
@@ -86,6 +93,89 @@ def resolve_device(requested: str = "auto") -> torch.device:
 
     _device_cache[requested] = device
     return device
+
+
+def _build_optimizer(params, opt_name: str, lr: float, weight_decay: float = 0.0):
+    """Create an optimizer from the project's supported optimizer names."""
+    opt_name = (opt_name or "adam").lower()
+    if opt_name == "adamw":
+        return optim.AdamW(params, lr=lr, weight_decay=weight_decay)
+    if opt_name == "adam":
+        return optim.Adam(params, lr=lr, weight_decay=weight_decay)
+    if opt_name == "rmsprop":
+        return optim.RMSprop(params, lr=lr, weight_decay=weight_decay)
+    return optim.SGD(params, lr=lr, momentum=0.9, weight_decay=weight_decay)
+
+
+def _find_learning_rate(
+    model: nn.Module,
+    dataloader: DataLoader,
+    criterion: nn.Module,
+    device: torch.device,
+    opt_name: str,
+    weight_decay: float = 0.0,
+    start_lr: float = 1e-6,
+    end_lr: float = 1.0,
+    max_steps: int = 100,
+    max_grad_norm: float = 0.0,
+) -> float:
+    """Run a lightweight LR range test and return a suggested learning rate."""
+    if len(dataloader) == 0:
+        return 1e-3
+
+    original_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
+    model.train()
+    model.to(device)
+
+    optimizer = _build_optimizer(model.parameters(), opt_name, start_lr, weight_decay)
+    steps = min(max_steps, len(dataloader))
+    if steps <= 1:
+        model.load_state_dict(original_state)
+        model.to(device)
+        return start_lr
+
+    lr_mult = (end_lr / start_lr) ** (1 / (steps - 1))
+    lr = start_lr
+    smoothed_loss = None
+    best_loss = float("inf")
+    best_lr = start_lr
+    beta = 0.98
+
+    for step_idx, (inputs, targets) in enumerate(dataloader):
+        if step_idx >= steps:
+            break
+
+        inputs, targets = inputs.to(device), targets.to(device)
+        optimizer.zero_grad()
+        outputs = model(inputs)
+        loss = criterion(outputs, targets)
+
+        if not torch.isfinite(loss):
+            break
+
+        loss.backward()
+        if max_grad_norm > 0:
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_grad_norm)
+        optimizer.step()
+
+        loss_value = float(loss.item())
+        smoothed_loss = loss_value if smoothed_loss is None else beta * smoothed_loss + (1 - beta) * loss_value
+        corrected_loss = smoothed_loss / (1 - beta ** (step_idx + 1))
+
+        if corrected_loss < best_loss:
+            best_loss = corrected_loss
+            best_lr = lr
+
+        if corrected_loss > 4 * best_loss:
+            break
+
+        lr *= lr_mult
+        for group in optimizer.param_groups:
+            group["lr"] = lr
+
+    model.load_state_dict(original_state)
+    model.to(device)
+    return max(best_lr, start_lr)
 
 
 
@@ -389,7 +479,6 @@ class EMGFeatureExtractor:
                     features.append(feature_map[name_lower](data))
                 else:
                     # Maybe it's a registered custom feature from feature_pipeline
-                    from playagain_pipeline.models.feature_pipeline import get_registered_features
                     registered = get_registered_features()
                     if name in registered:
                         extractor = registered[name]()
@@ -462,10 +551,6 @@ class SVMClassifier(BaseClassifier):
         **kwargs
     ) -> Dict[str, Any]:
         """Train the SVM model."""
-        from sklearn.svm import SVC
-        from sklearn.preprocessing import StandardScaler
-        import time
-
         start_time = time.time()
 
         # Extract features (skip if already 2D = pre-extracted)
@@ -584,9 +669,6 @@ class RandomForestClassifier(BaseClassifier):
         **kwargs
     ) -> Dict[str, Any]:
         """Train the Random Forest model."""
-        from sklearn.ensemble import RandomForestClassifier as RFClassifier
-        import time
-
         start_time = time.time()
 
         # Extract features (skip if already 2D = pre-extracted)
@@ -672,8 +754,6 @@ class LDAClassifier(BaseClassifier):
         return self._feature_extractor.extract_features(X)
 
     def train(self, X_train, y_train, X_val=None, y_val=None, **kwargs):
-        from sklearn.discriminant_analysis import LinearDiscriminantAnalysis
-        import time
         start_time = time.time()
 
         X_train_features = X_train if X_train.ndim == 2 else self.extract_features(X_train)
@@ -778,9 +858,9 @@ class MLPClassifier(BaseClassifier):
         return nn.Sequential(*layers)
 
     def train(self, X_train, y_train, X_val=None, y_val=None, **kwargs):
-        import time
         start_time = time.time()
         callback = kwargs.get("callback", None)
+        auto_learning_rate = kwargs.get("auto_learning_rate", False)
 
         X_train_features = X_train if X_train.ndim == 2 else self.extract_features(X_train)
         feature_count = X_train_features.shape[1]
@@ -808,14 +888,33 @@ class MLPClassifier(BaseClassifier):
         opt_name = self.hyperparameters["optimizer"].lower()
         lr = self.hyperparameters["learning_rate"]
         wd = self.hyperparameters.get("weight_decay", 0.0)
-        if opt_name == "adamw": optimizer = optim.AdamW(self._model.parameters(), lr=lr, weight_decay=wd)
-        elif opt_name == "adam": optimizer = optim.Adam(self._model.parameters(), lr=lr, weight_decay=wd)
-        elif opt_name == "rmsprop": optimizer = optim.RMSprop(self._model.parameters(), lr=lr, weight_decay=wd)
-        else: optimizer = optim.SGD(self._model.parameters(), lr=lr, momentum=0.9, weight_decay=wd)
 
         scheduler_name = self.hyperparameters.get("scheduler", "none").lower()
         scheduler = None
         total_epochs = self.hyperparameters["epochs"]
+        if auto_learning_rate:
+            total_epochs = 100
+            lr = _find_learning_rate(
+                self._model,
+                DataLoader(
+                    TensorDataset(X_train_tensor, y_train_tensor),
+                    batch_size=min(32, len(X_train_tensor)),
+                    shuffle=True,
+                    num_workers=0,
+                    pin_memory=(device.type != "cpu"),
+                ),
+                nn.CrossEntropyLoss(),
+                device,
+                opt_name,
+                weight_decay=wd,
+                max_steps=min(100, len(X_train_tensor)),
+                max_grad_norm=self.hyperparameters.get("max_grad_norm", 1.0),
+            )
+            self.hyperparameters["learning_rate"] = lr
+            self.hyperparameters["early_stopping"] = False
+            self.hyperparameters["epochs"] = total_epochs
+
+        optimizer = _build_optimizer(self._model.parameters(), opt_name, lr, wd)
         if scheduler_name == "cosine":
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs)
         elif scheduler_name == "plateau":
@@ -1006,9 +1105,9 @@ class CNNClassifier(BaseClassifier):
         return nn.Sequential(*layers)
 
     def train(self, X_train, y_train, X_val=None, y_val=None, **kwargs):
-        import time
         start_time = time.time()
         callback = kwargs.get("callback", None)
+        auto_learning_rate = kwargs.get("auto_learning_rate", False)
         if X_train.ndim == 2:
             X_train = X_train[:, np.newaxis, :]
             if X_val is not None and X_val.ndim == 2: X_val = X_val[:, np.newaxis, :]
@@ -1044,13 +1143,32 @@ class CNNClassifier(BaseClassifier):
 
         lr = self.hyperparameters["learning_rate"]; wd = self.hyperparameters.get("weight_decay", 0.0)
         opt_name = self.hyperparameters["optimizer"]
-        if opt_name == "adamw": optimizer = optim.AdamW(self._model.parameters(), lr=lr, weight_decay=wd)
-        elif opt_name == "adam": optimizer = optim.Adam(self._model.parameters(), lr=lr, weight_decay=wd)
-        elif opt_name == "rmsprop": optimizer = optim.RMSprop(self._model.parameters(), lr=lr, weight_decay=wd)
-        else: optimizer = optim.SGD(self._model.parameters(), lr=lr, momentum=0.9, weight_decay=wd)
 
         sched_name = self.hyperparameters.get("scheduler", "none").lower()
         sched = None; cnn_epochs = self.hyperparameters["epochs"]
+        if auto_learning_rate:
+            cnn_epochs = 100
+            lr = _find_learning_rate(
+                self._model,
+                DataLoader(
+                    TensorDataset(X_train_tensor, y_train_tensor),
+                    batch_size=min(32, len(X_train_tensor)),
+                    shuffle=True,
+                    num_workers=0,
+                    pin_memory=(device.type != "cpu"),
+                ),
+                nn.CrossEntropyLoss(),
+                device,
+                opt_name,
+                weight_decay=wd,
+                max_steps=min(100, len(X_train_tensor)),
+                max_grad_norm=self.hyperparameters.get("max_grad_norm", 1.0),
+            )
+            self.hyperparameters["learning_rate"] = lr
+            self.hyperparameters["early_stopping"] = False
+            self.hyperparameters["epochs"] = cnn_epochs
+
+        optimizer = _build_optimizer(self._model.parameters(), opt_name, lr, wd)
         if sched_name == "cosine": sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cnn_epochs)
         elif sched_name == "plateau": sched = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-7)
         elif sched_name == "step": sched = optim.lr_scheduler.StepLR(optimizer, step_size=max(1, cnn_epochs // 3), gamma=0.1)
@@ -1383,7 +1501,7 @@ class CatBoostClassifier(BaseClassifier):
     def extract_features(self, X): return self._feature_extractor.extract_features(X)
 
     def train(self, X_train, y_train, X_val=None, y_val=None, **kwargs):
-        import time; start_time = time.time()
+        start_time = time.time()
         X_train_features = X_train if X_train.ndim == 2 else self.extract_features(X_train)
         feature_count = X_train_features.shape[1]
         self._scaler = StandardScaler()
@@ -1469,7 +1587,6 @@ class ModelManager:
         return model
 
     def train_model(self, model, dataset, test_ratio=0.2, save=True):
-        from sklearn.model_selection import train_test_split
         X, y = dataset["X"], dataset["y"]
         X_train, X_val, y_train, y_val = train_test_split(X, y, test_size=test_ratio, stratify=y, random_state=42)
         results = model.train(X_train, y_train, X_val, y_val,
@@ -1500,7 +1617,6 @@ class ModelManager:
     def list_models(self): return [d.name for d in self.models_dir.iterdir() if d.is_dir()]
 
     def delete_model(self, name):
-        import shutil
         model_path = self.models_dir / name
         if model_path.exists() and model_path.is_dir():
             if self._current_model and hasattr(self._current_model, 'name') and self._current_model.name == name:

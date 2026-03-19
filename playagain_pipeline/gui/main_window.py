@@ -93,6 +93,68 @@ class PredictionWorker(QThread):
         self.wait()
 
 
+class ParticipantInfoDialog(QDialog):
+    """Modal dialog used to collect participant information."""
+
+    def __init__(self, subject_id: str, participant_info: Optional[dict] = None, parent=None):
+        super().__init__(parent)
+        self.subject_id = subject_id
+        self.participant_info = participant_info or {}
+        self.setWindowTitle(f"Participant Info - {subject_id}")
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+
+        form = QFormLayout()
+        self.subject_label = QLabel(self.subject_id)
+        form.addRow("Subject ID:", self.subject_label)
+
+        self.full_name_edit = QLineEdit(self.participant_info.get("full_name", ""))
+        self.full_name_edit.setPlaceholderText("Optional full name")
+        form.addRow("Full Name:", self.full_name_edit)
+
+        self.age_spin = QSpinBox()
+        self.age_spin.setRange(0, 120)
+        self.age_spin.setValue(int(self.participant_info.get("age", 0) or 0))
+        self.age_spin.setSpecialValueText("Unknown")
+        form.addRow("Age:", self.age_spin)
+
+        self.handedness_combo = QComboBox()
+        self.handedness_combo.addItems(["Unknown", "Left", "Right", "Ambidextrous"])
+        handedness = self.participant_info.get("handedness", "Unknown")
+        self.handedness_combo.setCurrentText(handedness if handedness in {"Unknown", "Left", "Right", "Ambidextrous"} else "Unknown")
+        form.addRow("Handedness:", self.handedness_combo)
+
+        self.notes_edit = QTextEdit(self.participant_info.get("notes", ""))
+        self.notes_edit.setPlaceholderText("Optional notes about the participant")
+        self.notes_edit.setMinimumHeight(90)
+        form.addRow("Notes:", self.notes_edit)
+
+        layout.addLayout(form)
+
+        button_row = QHBoxLayout()
+        button_row.addStretch()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.clicked.connect(self.reject)
+        button_row.addWidget(cancel_btn)
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(self.accept)
+        button_row.addWidget(save_btn)
+        layout.addLayout(button_row)
+
+    def get_participant_info(self) -> dict:
+        """Return the participant data entered by the user."""
+        info = {
+            "subject_id": self.subject_id,
+            "full_name": self.full_name_edit.text().strip(),
+            "age": int(self.age_spin.value()) if self.age_spin.value() > 0 else None,
+            "handedness": self.handedness_combo.currentText(),
+            "notes": self.notes_edit.toPlainText().strip(),
+        }
+        return {k: v for k, v in info.items() if v not in (None, "")}
+
+
 class MainWindow(QMainWindow):
     """
     Main application window for gesture recording and prediction.
@@ -283,8 +345,22 @@ class MainWindow(QMainWindow):
         session_layout = QFormLayout(session_group)
 
         self.subject_id_edit = QLineEdit()
-        self.subject_id_edit.setPlaceholderText("e.g., subject_01")
+        self.subject_id_edit.setPlaceholderText("e.g., VP_01")
         session_layout.addRow("Subject ID:", self.subject_id_edit)
+
+        participant_row = QHBoxLayout()
+        self.participant_info_btn = QPushButton("Participant Info...")
+        self.participant_info_btn.clicked.connect(self._on_edit_participant_info)
+        participant_row.addWidget(self.participant_info_btn)
+
+        self.participant_info_status_label = QLabel("No participant info saved yet")
+        self.participant_info_status_label.setStyleSheet("color: #666; font-size: 10px;")
+        participant_row.addWidget(self.participant_info_status_label)
+        participant_row.addStretch()
+        session_layout.addRow(participant_row)
+
+        self.subject_id_edit.textChanged.connect(self._update_participant_info_status)
+        self._update_participant_info_status(self.subject_id_edit.text())
 
         self.session_notes_edit = QLineEdit()
         session_layout.addRow("Notes:", self.session_notes_edit)
@@ -927,6 +1003,69 @@ class MainWindow(QMainWindow):
         self.protocol_widget.step_completed.connect(self._on_step_completed)
         self.protocol_widget.protocol_completed.connect(self._on_protocol_completed)
 
+    def _update_participant_info_status(self, subject_id: Optional[str] = None):
+        """Update the status label for the currently selected participant."""
+        if not hasattr(self, "participant_info_status_label"):
+            return
+
+        subject = (subject_id or self.subject_id_edit.text()).strip()
+        if not subject:
+            self.participant_info_status_label.setText("No participant selected")
+            return
+
+        if self.data_manager.has_participant_info(subject):
+            self.participant_info_status_label.setText(f"Info saved for {subject}")
+        else:
+            self.participant_info_status_label.setText(f"No info saved for {subject}")
+
+    def _prompt_participant_info(self, subject_id: str, existing_info: Optional[dict] = None) -> Optional[dict]:
+        """Open the participant info dialog and return the captured data."""
+        dialog = ParticipantInfoDialog(subject_id, existing_info, self)
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return dialog.get_participant_info()
+
+    def _ensure_participant_info(self, subject_id: str, allow_create: bool = True) -> Optional[dict]:
+        """Load existing participant info or prompt the user to create it."""
+        subject_id = subject_id.strip()
+        if not subject_id:
+            return None
+
+        existing = self.data_manager.load_participant_info(subject_id)
+        if existing is not None:
+            participant = existing.get("participant", existing)
+            self._update_participant_info_status(subject_id)
+            return participant
+
+        if not allow_create:
+            return None
+
+        participant = self._prompt_participant_info(subject_id)
+        if participant is None:
+            return None
+
+        self.data_manager.save_participant_info(subject_id, participant)
+        self._update_participant_info_status(subject_id)
+        return participant
+
+    @Slot()
+    def _on_edit_participant_info(self):
+        """Open the participant info dialog for the current subject."""
+        subject_id = self.subject_id_edit.text().strip()
+        if not subject_id:
+            subject_id = self.data_manager.get_next_subject_id()
+            self.subject_id_edit.setText(subject_id)
+
+        existing = self.data_manager.load_participant_info(subject_id)
+        existing_participant = existing.get("participant", existing) if existing else None
+        participant = self._prompt_participant_info(subject_id, existing_participant)
+        if participant is None:
+            return
+
+        self.data_manager.save_participant_info(subject_id, participant)
+        self._update_participant_info_status(subject_id)
+        self._log(f"Saved participant info for {subject_id}")
+
     def _log(self, message: str):
         """Add message to log with color coding."""
         timestamp = datetime.now().strftime("%H:%M:%S")
@@ -1351,13 +1490,19 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_start_recording(self):
         """Start a new recording session."""
-        if not self.subject_id_edit.text():
-            QMessageBox.warning(self, "Warning", "Please enter a subject ID")
-            return
-
         device = self.device_manager.device
         if not device or not device.is_connected:
             QMessageBox.warning(self, "Warning", "Please connect a device first")
+            return
+
+        subject_id = self.subject_id_edit.text().strip()
+        if not subject_id:
+            subject_id = self.data_manager.get_next_subject_id()
+            self.subject_id_edit.setText(subject_id)
+
+        participant_info = self._ensure_participant_info(subject_id, allow_create=True)
+        if participant_info is None and not self.data_manager.has_participant_info(subject_id):
+            QMessageBox.warning(self, "Warning", "Participant info is required before starting a new participant.")
             return
 
         # Create gesture set
@@ -1383,12 +1528,14 @@ class MainWindow(QMainWindow):
         bad_channels = self._get_excluded_channels()
         actual_channels = device.num_channels
 
-        self._current_session = RecordingSession(session_id=session_id, subject_id=self.subject_id_edit.text(),
+        self._current_session = RecordingSession(session_id=session_id, subject_id=subject_id,
             device_name=device.config.device_type.name, num_channels=actual_channels,
             sampling_rate=device.sampling_rate, gesture_set=gesture_set, protocol_name=protocol_config.name)
         self._current_session.metadata.notes = self.session_notes_edit.text()
         # Store bad channels in session metadata from the start
         self._current_session.metadata.bad_channels = bad_channels
+        if participant_info:
+            self._current_session.metadata.custom_metadata["participant_info"] = participant_info
 
         # Setup protocol widget
         self.protocol_widget.set_protocol(self._current_protocol)
@@ -2694,6 +2841,19 @@ class MainWindow(QMainWindow):
                 channel_mapping=cal.channel_mapping
             )
 
+        # Attach participant info for the gameplay recording
+        subject_id = self.game_rec_subject_edit.text().strip() or self.subject_id_edit.text().strip()
+        if not subject_id:
+            subject_id = self.data_manager.get_next_subject_id()
+        self.game_rec_subject_edit.setText(subject_id)
+
+        participant_info = self._ensure_participant_info(subject_id, allow_create=True)
+        if participant_info is None and not self.data_manager.has_participant_info(subject_id):
+            QMessageBox.warning(self, "Warning", "Participant info is required before starting a new participant.")
+            self._game_recorder = None
+            return
+        self._game_recorder.set_participant_info(participant_info)
+
         # Register callbacks with the prediction server
         self._prediction_server.add_prediction_callback(self._game_recorder.on_prediction)
         self._prediction_server.add_game_state_callback(self._game_recorder.on_game_state)
@@ -2702,7 +2862,7 @@ class MainWindow(QMainWindow):
         num_channels = device.num_channels
 
         # Start recording
-        subject_id = self.game_rec_subject_edit.text().strip() or None
+        subject_id = subject_id or None
         session_name = self.game_rec_session_edit.text().strip() or None
 
         file_path = self._game_recorder.start_recording(

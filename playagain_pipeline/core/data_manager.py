@@ -43,9 +43,11 @@ class DataManager:
         self.datasets_dir = self.data_dir / "datasets"
         self.calibrations_dir = self.data_dir / "calibrations"
         self.models_dir = self.data_dir / "models"
+        self.participants_dir = self.data_dir / "Participant_Info"
 
         for d in [self.sessions_dir, self.datasets_dir,
-                  self.calibrations_dir, self.models_dir]:
+                  self.calibrations_dir, self.models_dir,
+                  self.participants_dir]:
             d.mkdir(exist_ok=True)
 
     def get_session_path(self, subject_id: str, session_id: str) -> Path:
@@ -85,9 +87,63 @@ class DataManager:
 
     def list_subjects(self) -> List[str]:
         """List all subjects with recorded data, sorted in natural rising order."""
-        subjects = [d.name for d in self.sessions_dir.iterdir() if d.is_dir()]
-        subjects.sort(key=self._natural_sort_key)
-        return subjects
+        subjects = set()
+
+        for d in self.sessions_dir.iterdir():
+            if d.is_dir():
+                subjects.add(d.name)
+
+        if self.participants_dir.exists():
+            for participant_file in self.participants_dir.glob("*.json"):
+                subjects.add(participant_file.stem)
+
+        return sorted(subjects, key=self._natural_sort_key)
+
+    def get_participant_info_path(self, subject_id: str) -> Path:
+        """Get the JSON file path for a participant's info record."""
+        return self.participants_dir / f"{subject_id}.json"
+
+    def has_participant_info(self, subject_id: str) -> bool:
+        """Return True if a participant info file exists for the subject."""
+        return self.get_participant_info_path(subject_id).exists()
+
+    def load_participant_info(self, subject_id: str) -> Optional[Dict[str, Any]]:
+        """Load stored participant information for a subject, if available."""
+        path = self.get_participant_info_path(subject_id)
+        if not path.exists():
+            return None
+
+        with open(path, 'r') as f:
+            return json.load(f)
+
+    def save_participant_info(self, subject_id: str, info: Dict[str, Any]) -> Path:
+        """Save participant information to `Participant_Info/<subject_id>.json`."""
+        self.participants_dir.mkdir(parents=True, exist_ok=True)
+
+        payload = {
+            "subject_id": subject_id,
+            "saved_at": datetime.now().isoformat(),
+            "participant": info,
+        }
+
+        path = self.get_participant_info_path(subject_id)
+        with open(path, 'w') as f:
+            json.dump(payload, f, indent=2, default=str)
+        return path
+
+    def get_next_subject_id(self, prefix: str = "VP_", digits: int = 2) -> str:
+        """Allocate the next available `VP_##` subject identifier."""
+        pattern = re.compile(rf"^{re.escape(prefix)}(\d+)$")
+        max_index = 0
+
+        for subject_id in self.list_subjects():
+            match = pattern.match(subject_id)
+            if match:
+                max_index = max(max_index, int(match.group(1)))
+
+        next_index = max_index + 1
+        width = max(digits, len(str(next_index)))
+        return f"{prefix}{next_index:0{width}d}"
 
     @staticmethod
     def _natural_sort_key(text: str):

@@ -16,6 +16,7 @@ from __future__ import annotations
 import json
 import random
 import re
+import subprocess
 import sys
 import traceback
 from pathlib import Path
@@ -1715,8 +1716,12 @@ class PerformanceReviewTab(QWidget):
         self._log(f"✓ Complete. Results: {out}")
         summary = result.get("summary")
         self._populate_summary_table(summary)
-        if summary is not None:
-            self._log("\n── Summary ──\n" + summary.to_string(index=False))
+        condensed_text = result.get("condensed_review_text")
+        if isinstance(condensed_text, str) and condensed_text.strip():
+            self._log("\n-- Condensed review --\n" + condensed_text)
+        elif summary is not None:
+            top_preview = summary.head(10)
+            self._log("\n-- Summary (top 10) --\n" + top_preview.to_string(index=False))
         if out:
             self._load_plots(Path(out))
 
@@ -1726,7 +1731,6 @@ class PerformanceReviewTab(QWidget):
         self._log(f"ERROR:\n{tb}")
         self._status_lbl.setText("Error — see log")
         
-        import sys
         print(f"[ERROR] {tb}", file=sys.stderr)
 
         msg = QMessageBox(self)
@@ -1751,7 +1755,6 @@ class PerformanceReviewTab(QWidget):
 
     def _on_open_folder(self):
         if self._last_output_dir:
-            import subprocess
             subprocess.Popen(["open", self._last_output_dir])
 
     def _log(self, text: str):
