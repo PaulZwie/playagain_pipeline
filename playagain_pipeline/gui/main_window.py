@@ -26,7 +26,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, Q
                                QSplitter, QStatusBar, QListWidget, QScrollArea, QCheckBox,
                                QGridLayout, QApplication, QDialog, QListWidgetItem)
 
-from playagain_pipeline.calibration.calibrator_old import AutoCalibrator
+from playagain_pipeline.calibration.calibrator import AutoCalibrator
 from playagain_pipeline.config.config import get_default_config, PipelineConfig
 from playagain_pipeline.core.data_manager_old import DataManager
 from playagain_pipeline.core.gesture import (create_default_gesture_set)
@@ -1609,6 +1609,12 @@ class MainWindow(QMainWindow):
                 self._current_session.end_trial()
                 self._log(f"Rest trial recorded (between gestures)")
 
+        # End calibration-sync trial
+        if step.phase == ProtocolPhase.CALIBRATION_SYNC and step.is_recording:
+            if self._current_session:
+                self._current_session.end_trial()
+                self._log("Calibration sync (waveout) recorded")
+
         # Update synthetic device gesture during CUE
         if step.phase == ProtocolPhase.CUE and step.gesture:
             device = self.device_manager.device
@@ -1628,6 +1634,14 @@ class MainWindow(QMainWindow):
         if step.phase == ProtocolPhase.REST and step.is_recording:
             if self._current_session:
                 self._current_session.start_trial("rest")
+
+        # Start calibration-sync trial — bypasses gesture-set lookup, trial_type
+        # keeps it out of model training while making it available to the calibrator
+        if step.phase == ProtocolPhase.CALIBRATION_SYNC and step.is_recording:
+            if self._current_session:
+                self._current_session.start_trial(
+                    "waveout_sync", trial_type="calibration_sync"
+                )
 
     @Slot()
     def _on_protocol_completed(self):

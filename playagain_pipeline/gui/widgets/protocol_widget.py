@@ -74,13 +74,14 @@ class GestureDisplayWidget(QWidget):
 
         # Phase colors
         self._phase_colors = {
-            ProtocolPhase.PREPARATION: "#FFA500",  # Orange
-            ProtocolPhase.REST: "#4CAF50",         # Green
-            ProtocolPhase.CUE: "#2196F3",          # Blue
-            ProtocolPhase.HOLD: "#F44336",         # Red
-            ProtocolPhase.RELEASE: "#9C27B0",      # Purple
-            ProtocolPhase.FEEDBACK: "#00BCD4",     # Cyan
-            ProtocolPhase.COMPLETE: "#4CAF50"      # Green
+            ProtocolPhase.PREPARATION:      "#FFA500",  # Orange
+            ProtocolPhase.REST:             "#4CAF50",  # Green
+            ProtocolPhase.CUE:              "#2196F3",  # Blue
+            ProtocolPhase.HOLD:             "#F44336",  # Red
+            ProtocolPhase.RELEASE:          "#9C27B0",  # Purple
+            ProtocolPhase.FEEDBACK:         "#00BCD4",  # Cyan
+            ProtocolPhase.COMPLETE:         "#4CAF50",  # Green
+            ProtocolPhase.CALIBRATION_SYNC: "#FF6F00",  # Deep amber — visually distinct
         }
 
     def update_step(self, step: ProtocolStep):

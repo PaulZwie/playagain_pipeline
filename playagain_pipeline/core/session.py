@@ -75,6 +75,10 @@ class RecordingTrial:
     end_time: float
     is_valid: bool = True
     notes: str = ""
+    # "gesture"          — normal training trial (default; used by all older sessions)
+    # "calibration_sync" — waveout sync gesture; excluded from model training,
+    #                      used only by the rotation-detection calibrator
+    trial_type: str = "gesture"
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -86,11 +90,15 @@ class RecordingTrial:
             "start_time": self.start_time,
             "end_time": self.end_time,
             "is_valid": self.is_valid,
-            "notes": self.notes
+            "notes": self.notes,
+            "trial_type": self.trial_type,
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "RecordingTrial":
+        # trial_type was added later; older session JSON files won't have it.
+        # Passing data as **kwargs lets the dataclass default ("gesture") fill in
+        # for any missing key, so older sessions load transparently.
         return cls(**data)
 
 
@@ -132,6 +140,7 @@ class RecordingSession:
         self._is_recording: bool = False
         self._current_trial_start: Optional[int] = None
         self._current_trial_gesture: Optional[str] = None
+        self._current_trial_type: str = "gesture"   # tracks type for the in-progress trial
         self._source_dir: Optional[Path] = None  # Set when loaded from disk
 
     @property
@@ -174,23 +183,31 @@ class RecordingSession:
         self._data_chunks.append(data.copy())
         self._current_sample += data.shape[0]
 
-    def start_trial(self, gesture_name: str) -> None:
+    def start_trial(self, gesture_name: str, trial_type: str = "gesture") -> None:
         """
         Mark the start of a new trial.
 
         Args:
-            gesture_name: Name of the gesture being performed
+            gesture_name: Name of the gesture being performed.
+            trial_type:   "gesture" (default) for normal training trials.
+                          "calibration_sync" for the waveout sync gesture
+                          recorded at the start of each session.  Calibration-sync
+                          trials are *not* required to exist in the gesture set —
+                          they bypass the gesture lookup and store gesture_label=-1.
         """
         if self._current_trial_start is not None:
             # End previous trial first
             self.end_trial()
 
-        gesture = self.gesture_set.get_gesture(gesture_name)
-        if gesture is None:
-            raise ValueError(f"Unknown gesture: {gesture_name}")
+        if trial_type != "calibration_sync":
+            # Normal gesture: must exist in the gesture set
+            gesture = self.gesture_set.get_gesture(gesture_name)
+            if gesture is None:
+                raise ValueError(f"Unknown gesture: {gesture_name}")
 
         self._current_trial_start = self._current_sample
         self._current_trial_gesture = gesture_name
+        self._current_trial_type = trial_type
 
     def end_trial(self, is_valid: bool = True, notes: str = "") -> None:
         """
@@ -203,23 +220,34 @@ class RecordingSession:
         if self._current_trial_start is None:
             return
 
-        gesture = self.gesture_set.get_gesture(self._current_trial_gesture)
+        trial_type = self._current_trial_type
+
+        if trial_type == "calibration_sync":
+            # Calibration-sync trials are not in the gesture set.
+            # Use gesture_label = -1 as a sentinel so they are never confused
+            # with a real gesture class.
+            gesture_label = -1
+        else:
+            gesture = self.gesture_set.get_gesture(self._current_trial_gesture)
+            gesture_label = gesture.label_id
 
         trial = RecordingTrial(
             trial_id=len(self.trials),
             gesture_name=self._current_trial_gesture,
-            gesture_label=gesture.label_id,
+            gesture_label=gesture_label,
             start_sample=self._current_trial_start,
             end_sample=self._current_sample,
             start_time=self._current_trial_start / self.metadata.sampling_rate,
             end_time=self._current_sample / self.metadata.sampling_rate,
             is_valid=is_valid,
-            notes=notes
+            notes=notes,
+            trial_type=trial_type,
         )
 
         self.trials.append(trial)
         self._current_trial_start = None
         self._current_trial_gesture = None
+        self._current_trial_type = "gesture"
 
     def get_data(self) -> np.ndarray:
         """
@@ -246,8 +274,27 @@ class RecordingSession:
         return all_data[trial.start_sample:trial.end_sample]
 
     def get_valid_trials(self) -> List[RecordingTrial]:
-        """Get only valid trials."""
-        return [t for t in self.trials if t.is_valid]
+        """
+        Get valid gesture trials only.
+
+        Calibration-sync trials (trial_type == "calibration_sync") are always
+        excluded — they exist for rotation detection, not model training.
+        Old sessions without a trial_type field default to "gesture" on load,
+        so this is fully backward-compatible.
+        """
+        return [t for t in self.trials
+                if t.is_valid and t.trial_type == "gesture"]
+
+    def get_calibration_trials(self) -> List[RecordingTrial]:
+        """
+        Get calibration-sync trials recorded at the start of the session.
+
+        These contain the waveout sync gesture used by AutoCalibrator for
+        rotation detection.  Returns an empty list for older sessions that
+        were recorded before calibration-sync trials were introduced.
+        """
+        return [t for t in self.trials
+                if t.trial_type == "calibration_sync"]
 
     def save(self, directory: Path) -> None:
         """

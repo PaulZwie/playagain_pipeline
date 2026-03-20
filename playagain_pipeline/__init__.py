@@ -59,7 +59,7 @@ from playagain_pipeline.models.classifier import (
 )
 
 # Calibration
-from playagain_pipeline.calibration.calibrator_old import (
+from playagain_pipeline.calibration.calibrator import (
     AutoCalibrator,
     CalibrationResult,
     CalibrationProcessor

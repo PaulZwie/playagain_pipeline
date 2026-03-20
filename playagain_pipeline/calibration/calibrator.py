@@ -325,28 +325,121 @@ class CalibrationProcessor:
 
         return np.mean(arr[mask], axis=0)
 
+    # ------------------------------------------------------------------
+    # Energy pre-processing helpers
+    # ------------------------------------------------------------------
+
+    def _normalize_energy(self, energy: np.ndarray) -> np.ndarray:
+        """
+        L2-normalise an energy vector so that inter-session amplitude
+        differences do not bias the MEC location.
+
+        Without normalisation a session recorded with a stronger contraction
+        would shift the raw argmax toward a spuriously dominant channel
+        simply because the overall signal was louder that day, not because
+        the bracelet was aligned differently.
+        """
+        norm = np.linalg.norm(energy)
+        if norm < 1e-12:
+            return energy.copy()
+        return energy / norm
+
+    def _smooth_energy_circular(
+        self, energy: np.ndarray, sigma: float = 0.8
+    ) -> np.ndarray:
+        """
+        Apply a circular Gaussian smoothing pass to the energy ring.
+
+        A single noisy electrode can steal the argmax from the true
+        anatomical peak.  A light smooth (sigma ≈ 1 channel) blends each
+        channel with its immediate neighbours while preserving the dominant
+        spatial mode.  The padding is circular so the smoothing wraps
+        correctly across the ring boundary (channel 0 ↔ channel N−1).
+
+        Args:
+            energy: Per-channel energy vector (num_channels,)
+            sigma:  Gaussian sigma in channel units
+
+        Returns:
+            Smoothed energy vector of the same length
+        """
+        from scipy.ndimage import gaussian_filter1d
+        n = len(energy)
+        if n < 3 or sigma <= 0:
+            return energy.copy()
+        pad = min(int(4 * sigma) + 1, n)
+        extended = np.concatenate([energy[-pad:], energy, energy[:pad]])
+        smoothed = gaussian_filter1d(extended, sigma=sigma)
+        return smoothed[pad: pad + n]
+
+    def _compute_xcorr_confidence(self, xcorr: np.ndarray) -> float:
+        """
+        Confidence of the rotation estimate derived from a circular
+        cross-correlation vector.
+
+        A sharp, isolated peak in xcorr means the two profiles align
+        clearly at exactly one shift — high confidence.  A broad or flat
+        xcorr means any shift is almost equally plausible — low confidence.
+
+        Metric: z-score of the best shift  = (peak − mean) / (std + ε),
+        mapped to [0, 1] via clipping at z = 5.  This is more sensitive to
+        sharpness of the alignment than a peak-to-second ratio because it
+        accounts for the full spread of the distribution.
+
+        Args:
+            xcorr: Real-valued circular cross-correlation (any length)
+
+        Returns:
+            Confidence in [0, 1]
+        """
+        if len(xcorr) < 2:
+            return 0.0
+        peak = float(np.max(xcorr))
+        mu   = float(np.mean(xcorr))
+        std  = float(np.std(xcorr))
+        if std < 1e-12:
+            return 0.0          # completely flat → no information
+        z = (peak - mu) / std
+        return float(np.clip(z / 5.0, 0.0, 1.0))
+
+    # ------------------------------------------------------------------
+
     def find_rotation_offset(
         self,
         current_energy: np.ndarray,
         reference_energy: np.ndarray,
     ) -> Tuple[int, float]:
         """
-        Find the rotation offset by comparing the MEC of the current and
-        reference energy patterns.
+        Find the rotation offset using circular cross-correlation of the
+        L2-normalised, smoothed energy profiles.
 
-        The Maximum Energy Channel (MEC) is identified for both patterns.
-        The rotation offset is the circular distance between them.
+        **Why cross-correlation instead of argmax difference?**
 
-        For 32-channel devices (2-ring layout), energies are summed across rows
-        to create a robust 16-channel angular profile. This prevents noise
-        from shifting the peak between rings (e.g. index 0 vs 16).
+        The original MEC paper (Barona López et al., Sensors 2020) compares
+        the two peak channels:
+            offset = argmax(current) − argmax(reference)
+        This is fast but brittle: a single noisy electrode can shift the
+        argmax by ±1 (or more), causing a systematic mis-correction.
 
-        Confidence is based on how prominent the energy peak is—a sharp
-        peak in a single channel means high confidence; a flat distribution
-        means low confidence.
+        Circular cross-correlation instead maximises the inner product
+        between the two profiles at every possible circular shift,
+        effectively using *all* channels as corroborating evidence.  The
+        shift that best aligns the whole ring wins — identical in spirit to
+        the paper's MEC goal but far more robust.
+
+        Algorithm:
+          1. For 32-ch devices, fold into 16 angular sectors (row-sum),
+             making detection insensitive to proximal/distal row shifts.
+          2. L2-normalise both profiles to remove inter-session gain bias.
+          3. Lightly smooth with a circular Gaussian (suppresses single-
+             channel impulse noise before peak-finding).
+          4. Compute circular cross-correlation via FFT.
+          5. The lag at max xcorr is the rotation offset.
+          6. Confidence is the z-score of the xcorr peak (measures how
+             isolated and unambiguous the winning shift is).
 
         Args:
-            current_energy: Current per-channel energy (num_channels,)
+            current_energy:   Current per-channel energy (num_channels,)
             reference_energy: Reference per-channel energy (num_channels,)
 
         Returns:
@@ -354,41 +447,38 @@ class CalibrationProcessor:
         """
         n = self.num_channels
 
-        # --- Enhanced logic for 32-channel (2-ring) devices ---
+        # Step 1 — fold 32-ch into 16 angular sectors
         if n == 32:
-            # Fold 32 channels into 16 angular sectors by summing rings.
-            # Sector i = Channel i (Inner) + Channel i+16 (Outer)
-            # This makes the detection insensitive to proximal/distal shifts.
-            current_folded = current_energy[:16] + current_energy[16:]
-            reference_folded = reference_energy[:16] + reference_energy[16:]
-            
-            # Find MEC on the folded profile (0..15)
-            # We use circular cross-correlation to find the best shift,
-            # which is more robust than simple argmax difference.
-            # (Though paper uses MEC, cross-corr is consistent with "max energy alignment")
-            # Sticking to MEC as per paper request:
-            curr_mec = int(np.argmax(current_folded))
-            ref_mec = int(np.argmax(reference_folded))
-            
-            rotation_offset = (curr_mec - ref_mec) % 16
-            
-            # Re-calculate confidence on the cleaner 16-channel profile
-            confidence = self._compute_energy_confidence(current_folded)
-            
-            # Note: We return offset in 0..15. The channel mapping logic
-            # handles this as a column shift. Row shifts (flipping) are ignored.
-            return rotation_offset, confidence
+            # Sector i = inner-ring channel i  +  outer-ring channel i+16
+            # This collapses the 2-row topology to a pure azimuthal profile.
+            current_profile   = current_energy[:16]  + current_energy[16:]
+            reference_profile = reference_energy[:16] + reference_energy[16:]
+        else:
+            current_profile   = current_energy.copy()
+            reference_profile = reference_energy.copy()
 
-        # --- Standard logic for single-ring (e.g. 8-channel) devices ---
-        current_mec = int(np.argmax(current_energy))
-        reference_mec = int(np.argmax(reference_energy))
+        # Step 2 — L2-normalise: equalise inter-session amplitude
+        curr_norm = self._normalize_energy(current_profile)
+        ref_norm  = self._normalize_energy(reference_profile)
 
-        # Rotation offset: how many channels the bracelet has shifted
-        rotation_offset = (current_mec - reference_mec) % n
+        # Step 3 — circular Gaussian smooth: suppress single-channel spikes
+        curr_smooth = self._smooth_energy_circular(curr_norm,  sigma=0.8)
+        ref_smooth  = self._smooth_energy_circular(ref_norm,   sigma=0.8)
 
-        # Confidence scoring based on peak prominence
-        # A good sync gesture produces a clear energy peak in one channel.
-        confidence = self._compute_energy_confidence(current_energy)
+        # Step 4 — circular cross-correlation via FFT
+        # xcorr[lag] = Σ_k  curr[k] · ref[(k − lag) mod N]
+        # Peaks at the lag equal to the true rotation offset.
+        xcorr = np.real(
+            np.fft.ifft(
+                np.fft.fft(curr_smooth) * np.conj(np.fft.fft(ref_smooth))
+            )
+        )
+
+        # Step 5 — the winning lag is the rotation offset
+        rotation_offset = int(np.argmax(xcorr))
+
+        # Step 6 — confidence from xcorr peak z-score
+        confidence = self._compute_xcorr_confidence(xcorr)
 
         return rotation_offset, confidence
 
@@ -552,46 +642,71 @@ class CalibrationProcessor:
         """
         Select the best gesture pattern for synchronization.
 
-        Prioritizes gestures recommended by Barona López et al. (Sensors 2020):
-        waveOut > Fist > Open > waveIn > Pinch > Tripod.
+        Prioritises gestures recommended by Barona López et al. (Sensors 2020,
+        Appendix A): waveOut > Fist > Open > waveIn > Pinch > Tripod.
 
-        If a reference is provided, selects the highest priority gesture
-        available in *both* sets. If no common gesture, falls back to
-        "__combined__".
+        Matching uses *substring* search (case-insensitive) so gesture keys
+        like "cal_waveout", "waveout_sync", or "WAVEOUT" all resolve to the
+        correct priority tier without requiring exact naming conventions.
+
+        Selection logic:
+          1. If a reference exists, return the highest-priority gesture that
+             appears in *both* the current and reference pattern dictionaries.
+          2. If no common priority gesture is found, fall back to "__combined__"
+             (present in both by construction).
+          3. If there is no reference, pick the highest-priority gesture in the
+             current set.
+          4. If no priority token matches at all, pick the gesture whose energy
+             pattern has the highest confidence (sharpest spatial peak) — a
+             sharper profile is a better sync signal regardless of its name.
 
         Returns:
-            (current_pattern, reference_pattern, gesture_name)
+            (current_pattern, reference_pattern_or_None, gesture_name_used)
         """
-        # Normalized priority list (lowercase for matching)
         priority = ["waveout", "fist", "open", "wavein", "pinch", "tripod"]
 
-        # Helper to find case-insensitive match
-        def find_match(info_dict, target):
-            for key in info_dict:
-                if key.lower() == target:
+        def find_match(d: dict, token: str) -> Optional[str]:
+            """Return the first key that contains *token* as a substring."""
+            for key in d:
+                if token in key.lower():
                     return key
             return None
 
-        # 1. If we have a reference, try to find the best common gesture
+        # 1. Best common gesture when a reference exists
         if reference_patterns:
             for p in priority:
                 curr_key = find_match(patterns, p)
-                ref_key = find_match(reference_patterns, p)
-
+                ref_key  = find_match(reference_patterns, p)
                 if curr_key and ref_key:
                     return patterns[curr_key], reference_patterns[ref_key], curr_key
 
-            # Fallback: use __combined__ if both have it (they should)
+            # Fallback: combined pseudo-key (always present)
             if "__combined__" in patterns and "__combined__" in reference_patterns:
-                return patterns["__combined__"], reference_patterns["__combined__"], "Combined (Fallback)"
+                return (
+                    patterns["__combined__"],
+                    reference_patterns["__combined__"],
+                    "Combined (fallback)",
+                )
 
-        # 2. No reference (or creating one): pick best available from current
+        # 2. No reference — best priority gesture in the current set
         for p in priority:
             key = find_match(patterns, p)
             if key:
                 return patterns[key], None, key
 
-        # 3. Last resort: Combined
+        # 3. No priority match at all — pick sharpest non-rest pattern
+        active = {
+            k: v for k, v in patterns.items()
+            if k != "__combined__" and "rest" not in k.lower()
+        }
+        if active:
+            best_key = max(
+                active,
+                key=lambda k: self._compute_energy_confidence(active[k]),
+            )
+            return active[best_key], None, f"{best_key} (auto-selected)"
+
+        # 4. Last resort
         return patterns.get("__combined__", np.zeros(self.num_channels)), None, "Combined"
 
     def set_reference_calibration(self, result: Optional[CalibrationResult]) -> None:
@@ -721,11 +836,17 @@ class AutoCalibrator:
         """
         Perform calibration directly from a normal recording session.
 
-        Extracts per-gesture trial data from the session and uses it to
-        compute calibration patterns. Multiple trials of the same gesture
-        are averaged with outlier rejection for robustness.
+        **Preferred path (new sessions):** if the session contains one or more
+        `calibration_sync` trials (the waveout gesture recorded at the very start
+        of each session by the protocol), those trials are used exclusively as the
+        synchronisation gesture.  This gives the calibrator the cleanest possible
+        waveout signal — the paper's recommended sync gesture — without mixing in
+        other gesture data.
 
-        This eliminates the need for a separate calibration recording.
+        **Fallback path (older sessions):** if no calibration_sync trials exist,
+        all valid gesture trials are used as before, and `_select_sync_pattern`
+        picks the best available gesture.  This preserves full backward
+        compatibility with sessions recorded before this feature was introduced.
 
         Args:
             session: A RecordingSession with annotated trials
@@ -734,40 +855,70 @@ class AutoCalibrator:
         Returns:
             CalibrationResult with rotation offset and channel mapping
         """
-        # Group trial data by gesture name
-        gesture_trials: Dict[str, List[np.ndarray]] = {}
         all_data = session.get_data()
 
+        # ── Try dedicated calibration-sync trials first ──────────────────────
+        cal_trials = []
+        if hasattr(session, "get_calibration_trials"):
+            cal_trials = session.get_calibration_trials()
+
+        if cal_trials:
+            # Build a single-gesture dict so _select_sync_pattern
+            # immediately picks this waveout recording.
+            sync_chunks = []
+            for trial in cal_trials:
+                chunk = all_data[trial.start_sample:trial.end_sample]
+                if chunk.shape[0] >= 10:
+                    sync_chunks.append(chunk)
+
+            if sync_chunks:
+                calibration_data = {"waveout": sync_chunks}
+
+                # Also include valid gesture trials so the combined energy
+                # pattern is still informative for sessions that use it.
+                valid_trials = session.get_valid_trials()
+                for trial in valid_trials:
+                    chunk = all_data[trial.start_sample:trial.end_sample]
+                    if chunk.shape[0] < 10:
+                        continue
+                    name = trial.gesture_name
+                    calibration_data.setdefault(name, []).append(chunk)
+
+                result = self.processor.calibrate_from_data(
+                    calibration_data,
+                    device_name=session.metadata.device_name,
+                    reference_result=self.processor.get_reference_calibration(),
+                    plot_path=plot_path,
+                )
+                self._current_calibration = result
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                result.save(self.data_dir / f"calibration_{timestamp}.json")
+                return result
+
+        # ── Fallback: use all valid gesture trials (older sessions) ──────────
+        gesture_trials: Dict[str, List[np.ndarray]] = {}
         valid_trials = session.get_valid_trials()
         if not valid_trials:
             raise ValueError("Session has no valid trials to calibrate from")
 
         for trial in valid_trials:
             trial_data = all_data[trial.start_sample:trial.end_sample]
-            if trial_data.shape[0] < 10:  # Skip very short trials
+            if trial_data.shape[0] < 10:
                 continue
-
-            if trial.gesture_name not in gesture_trials:
-                gesture_trials[trial.gesture_name] = []
-            gesture_trials[trial.gesture_name].append(trial_data)
+            gesture_trials.setdefault(trial.gesture_name, []).append(trial_data)
 
         if not gesture_trials:
             raise ValueError("No usable trial data found in session")
 
-        # Pass as lists of arrays — the processor handles multi-trial averaging
         result = self.processor.calibrate_from_data(
             gesture_trials,
             device_name=session.metadata.device_name,
             reference_result=self.processor.get_reference_calibration(),
-            plot_path=plot_path
+            plot_path=plot_path,
         )
-
         self._current_calibration = result
-
-        # Save calibration
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
         result.save(self.data_dir / f"calibration_{timestamp}.json")
-
         return result
 
     @property
@@ -893,7 +1044,7 @@ def backfill_session_rotations(data_dir: Path, calibrations_dir: Optional[Path] 
     Returns:
         Dictionary mapping session_id to {"rotation_offset": int, "confidence": float, "status": str}
     """
-    from playagain_pipeline.core.data_manager_old import DataManager
+    from playagain_pipeline.core.data_manager import DataManager
 
     data_dir = Path(data_dir)
     if calibrations_dir is None:

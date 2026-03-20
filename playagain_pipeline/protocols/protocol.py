@@ -18,13 +18,14 @@ from playagain_pipeline.config.config import get_default_config
 
 class ProtocolPhase(Enum):
     """Phases within a protocol."""
-    PREPARATION = auto()  # Get ready phase
-    REST = auto()         # Rest between trials
-    CUE = auto()          # Show gesture cue
-    HOLD = auto()         # Hold the gesture
-    RELEASE = auto()      # Release the gesture
-    FEEDBACK = auto()     # Show feedback
-    COMPLETE = auto()     # Protocol complete
+    PREPARATION = auto()       # Get ready phase
+    REST = auto()              # Rest between trials
+    CUE = auto()               # Show gesture cue
+    HOLD = auto()              # Hold the gesture
+    RELEASE = auto()           # Release the gesture
+    FEEDBACK = auto()          # Show feedback
+    COMPLETE = auto()          # Protocol complete
+    CALIBRATION_SYNC = auto()  # Waveout sync gesture at session start
 
 
 @dataclass
@@ -138,6 +139,19 @@ class RecordingProtocol:
             duration=self.config.preparation_time,
             message="Bereit? Wir starten gleich!",
             is_recording=False
+        ))
+
+        # Calibration sync gesture (waveout) — recorded once per session.
+        # This is NOT part of the gesture set and will NOT be used for model
+        # training.  It gives the rotation-detection calibrator a clean,
+        # high-quality waveout signal regardless of which gesture set the
+        # session was recorded with.
+        self._steps.append(ProtocolStep(
+            phase=ProtocolPhase.CALIBRATION_SYNC,
+            gesture=None,
+            duration=self.config.rest_time,   # same duration as a rest pause
+            message="🔧  Sync: Extend wrist outward (WaveOut)",
+            is_recording=True,
         ))
 
         # Get the gesture sequence
