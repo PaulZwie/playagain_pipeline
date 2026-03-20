@@ -75,6 +75,7 @@ class ProtocolSettings:
 class ModelConfig:
     """Configuration for ML models."""
     default_model_type: str = "svm"
+    bad_channel_mode: str = "interpolate"
     test_ratio: float = 0.2
     cross_validation_folds: int = 5
 
@@ -196,6 +197,7 @@ class PipelineConfig:
             },
             "model": {
                 "default_model_type": self.model.default_model_type,
+                "bad_channel_mode": self.model.bad_channel_mode,
                 "test_ratio": self.model.test_ratio,
                 "cross_validation_folds": self.model.cross_validation_folds,
                 "svm_kernel": self.model.svm_kernel,
@@ -320,6 +322,7 @@ class PipelineConfig:
             m = data["model"]
             config.model = ModelConfig(
                 default_model_type=m.get("default_model_type", config.model.default_model_type),
+                bad_channel_mode=m.get("bad_channel_mode", config.model.bad_channel_mode),
                 test_ratio=m.get("test_ratio", config.model.test_ratio),
                 cross_validation_folds=m.get("cross_validation_folds", config.model.cross_validation_folds),
                 svm_kernel=m.get("svm_kernel", config.model.svm_kernel),

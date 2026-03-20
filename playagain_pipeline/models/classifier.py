@@ -178,6 +178,51 @@ def _find_learning_rate(
     return max(best_lr, start_lr)
 
 
+def apply_bad_channel_strategy(
+    data: np.ndarray,
+    bad_channels: Optional[List[int]] = None,
+    mode: str = "interpolate",
+) -> np.ndarray:
+    """Apply bad-channel handling to the last channel axis of an EMG array."""
+    if bad_channels is None or len(bad_channels) == 0:
+        return data
+    if data.ndim < 2:
+        return data
+
+    n_ch = data.shape[-1]
+    bad = sorted({int(ch) for ch in bad_channels if 0 <= int(ch) < n_ch})
+    if not bad:
+        return data
+
+    out = data.copy()
+    mode = (mode or "interpolate").lower()
+    if mode == "zero":
+        out[..., bad] = 0.0
+        return out
+
+    bad_set = set(bad)
+
+    def _nearest_valid(ch_idx: int, step: int) -> Optional[int]:
+        for offset in range(1, n_ch):
+            cand = (ch_idx + step * offset) % n_ch
+            if cand not in bad_set:
+                return cand
+        return None
+
+    for ch_idx in bad:
+        left = _nearest_valid(ch_idx, -1)
+        right = _nearest_valid(ch_idx, 1)
+        if left is None and right is None:
+            out[..., ch_idx] = 0.0
+        elif left is None:
+            out[..., ch_idx] = data[..., right]
+        elif right is None:
+            out[..., ch_idx] = data[..., left]
+        else:
+            out[..., ch_idx] = 0.5 * (data[..., left] + data[..., right])
+    return out
+
+
 
 
 @dataclass
@@ -196,6 +241,7 @@ class ModelMetadata:
     hyperparameters: Dict[str, Any] = field(default_factory=dict)
     training_history: Dict[str, List[float]] = field(default_factory=dict)
     bad_channels: List[int] = field(default_factory=list)  # Channels excluded during training
+    bad_channel_mode: str = "interpolate"  # interpolate or zero
     features_extracted: bool = False  # Whether dataset had features pre-extracted
     feature_config: Optional[Dict[str, Any]] = None  # Feature config used for pre-extraction
 
@@ -214,6 +260,7 @@ class ModelMetadata:
             "hyperparameters": self.hyperparameters,
             "training_history": self.training_history,
             "bad_channels": self.bad_channels,
+            "bad_channel_mode": self.bad_channel_mode,
             "features_extracted": self.features_extracted,
             "feature_config": self.feature_config,
         }
@@ -225,6 +272,8 @@ class ModelMetadata:
         # Backward compat: older models may not have bad_channels
         if "bad_channels" not in data:
             data["bad_channels"] = []
+        if "bad_channel_mode" not in data:
+            data["bad_channel_mode"] = "interpolate"
         # Backward compat: older models may not have feature fields
         if "features_extracted" not in data:
             data["features_extracted"] = False
@@ -1596,6 +1645,7 @@ class ModelManager:
         if model.metadata and "label_names" in dataset["metadata"]:
             model.metadata.class_names = dataset["metadata"]["label_names"]
         if model.metadata:
+            model.metadata.bad_channel_mode = dataset["metadata"].get("bad_channel_mode", "interpolate")
             model.metadata.features_extracted = dataset["metadata"].get("features_extracted", False)
             model.metadata.feature_config = dataset["metadata"].get("feature_config", None)
         if save: model.save(self.models_dir / model.name)

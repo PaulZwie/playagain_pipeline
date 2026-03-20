@@ -35,7 +35,7 @@ from playagain_pipeline.devices.emg_device import (DeviceManager, DeviceType, Sy
 from playagain_pipeline.gui.widgets.emg_plot import EMGPlotWidget
 from playagain_pipeline.gui.widgets.performance_tab import PerformanceReviewTab
 from playagain_pipeline.gui.widgets.protocol_widget import ProtocolWidget
-from playagain_pipeline.models.classifier import ModelManager, BaseClassifier
+from playagain_pipeline.models.classifier import ModelManager, BaseClassifier, apply_bad_channel_strategy
 from playagain_pipeline.protocols.protocol import (RecordingProtocol, ProtocolPhase,
                                                    create_quick_protocol, create_standard_protocol,
                                                    create_extended_protocol)
@@ -240,6 +240,12 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self._log(f"Failed to load config, using defaults: {e}")
 
+        if hasattr(self, "bad_ch_mode_combo"):
+            preferred_mode = getattr(self.config.model, "bad_channel_mode", "interpolate")
+            idx = self.bad_ch_mode_combo.findData(preferred_mode)
+            if idx >= 0:
+                self.bad_ch_mode_combo.setCurrentIndex(idx)
+
         self._log("Application started")
 
     def _setup_ui(self):
@@ -407,13 +413,16 @@ class MainWindow(QMainWindow):
         channel_note.setWordWrap(True)
         device_layout.addRow(channel_note)
 
-        # Bad channel handling info
-        bad_ch_label = QLabel("Interpolate from neighbors")
-        bad_ch_label.setToolTip(
-            "Bad channels are replaced by the average of their two\n"
-            "circular neighbors, preserving channel dimensionality."
+        # Bad channel handling mode
+        self.bad_ch_mode_combo = QComboBox()
+        self.bad_ch_mode_combo.addItem("Interpolate (neighbor average)", "interpolate")
+        self.bad_ch_mode_combo.addItem("Zero out bad channels", "zero")
+        self.bad_ch_mode_combo.setToolTip(
+            "Choose how excluded channels are handled for recording,\n"
+            "dataset creation, and live prediction preprocessing."
         )
-        device_layout.addRow("Bad Ch. Handling:", bad_ch_label)
+        self.bad_ch_mode_combo.currentIndexChanged.connect(self._on_bad_channel_mode_changed)
+        device_layout.addRow("Bad Ch. Handling:", self.bad_ch_mode_combo)
 
         # Internal state for excluded channels (updated by plot widget signal)
         self._excluded_channels: list[int] = []
@@ -1441,16 +1450,11 @@ class MainWindow(QMainWindow):
                 self._log(f"Plot display reconfigured: {old_ch} -> {data.shape[1]} channels")
             self._plot_widget.update_data(data)
 
-        # Interpolate bad channels from circular neighbors
-        downstream_data = data
-        if bad_channels:
-            downstream_data = data.copy()
-            n_ch = downstream_data.shape[1]
-            for ch_idx in bad_channels:
-                if ch_idx < n_ch:
-                    left = (ch_idx - 1) % n_ch
-                    right = (ch_idx + 1) % n_ch
-                    downstream_data[:, ch_idx] = 0.5 * (downstream_data[:, left] + downstream_data[:, right])
+        downstream_data = apply_bad_channel_strategy(
+            data,
+            bad_channels,
+            mode=self._get_bad_channel_mode(),
+        )
 
         # Apply calibration channel reordering for prediction/server
         # (not for raw plot or session recording — those stay in physical order)
@@ -1461,7 +1465,7 @@ class MainWindow(QMainWindow):
             except ValueError:
                 calibrated_data = downstream_data  # Channel mismatch — skip
 
-        # Record if session is active (interpolated data — bad channels already replaced by neighbors)
+        # Record if session is active (bad-channel strategy already applied)
         if self._current_session and self._current_session.is_recording:
             self._current_session.add_data(downstream_data)
 
@@ -1524,7 +1528,7 @@ class MainWindow(QMainWindow):
         n_rep = protocol_config.repetitions_per_gesture
         session_id = f"{timestamp}_{n_rep}rep"
 
-        # Determine actual number of channels (all channels kept, bad ones zeroed)
+        # Determine actual number of channels (all channels kept; strategy applied in stream path)
         bad_channels = self._get_excluded_channels()
         actual_channels = device.num_channels
 
@@ -1534,6 +1538,7 @@ class MainWindow(QMainWindow):
         self._current_session.metadata.notes = self.session_notes_edit.text()
         # Store bad channels in session metadata from the start
         self._current_session.metadata.bad_channels = bad_channels
+        self._current_session.metadata.custom_metadata["bad_channel_mode"] = self._get_bad_channel_mode()
         if participant_info:
             self._current_session.metadata.custom_metadata["participant_info"] = participant_info
 
@@ -1560,6 +1565,7 @@ class MainWindow(QMainWindow):
             if bad_channels:
                 self._current_session.metadata.bad_channels = bad_channels
                 self._log(f"Marked {len(bad_channels)} bad channels: {bad_channels}")
+            self._current_session.metadata.custom_metadata["bad_channel_mode"] = self._get_bad_channel_mode()
 
             # Auto-detect bracelet rotation before saving
             try:
@@ -2277,6 +2283,15 @@ class MainWindow(QMainWindow):
         include_invalid_cb.setChecked(False)
         params_layout.addRow("Include Invalid Trials:", include_invalid_cb)
 
+        bad_channel_mode_combo = QComboBox()
+        bad_channel_mode_combo.addItem("Interpolate (neighbor average)", "interpolate")
+        bad_channel_mode_combo.addItem("Zero out bad channels", "zero")
+        current_bad_mode = self._get_bad_channel_mode()
+        bad_mode_idx = bad_channel_mode_combo.findData(current_bad_mode)
+        if bad_mode_idx >= 0:
+            bad_channel_mode_combo.setCurrentIndex(bad_mode_idx)
+        params_layout.addRow("Bad Ch. Handling:", bad_channel_mode_combo)
+
         # Per-session rotation alignment (recommended for multi-session datasets)
         per_session_rot_cb = QCheckBox()
         per_session_rot_cb.setChecked(True)  # Default ON — best for combining sessions
@@ -2448,6 +2463,7 @@ class MainWindow(QMainWindow):
                     calibration=cal_to_apply,
                     use_per_session_rotation=use_per_session,
                     feature_config=ds_feature_config,
+                    bad_channel_mode=bad_channel_mode_combo.currentData(),
                 )
 
                 self.data_manager.save_dataset(dataset)
@@ -2544,6 +2560,12 @@ class MainWindow(QMainWindow):
         try:
             self._current_model = self.model_manager.load_model(model_name)
             self._log(f"Loaded model: {model_name}")
+
+            model_bad_mode = getattr(self._current_model.metadata, "bad_channel_mode", None)
+            if model_bad_mode in {"interpolate", "zero"} and hasattr(self, "bad_ch_mode_combo"):
+                idx = self.bad_ch_mode_combo.findData(model_bad_mode)
+                if idx >= 0:
+                    self.bad_ch_mode_combo.setCurrentIndex(idx)
 
             # Initialize prediction buffer using actual device channel count.
             # Model metadata num_channels may be wrong for pre-extracted feature
@@ -2922,6 +2944,19 @@ class MainWindow(QMainWindow):
     def _get_excluded_channels(self) -> list[int]:
         """Get list of excluded channel indices (0-based) from the EMG plot checkboxes."""
         return list(self._excluded_channels)
+
+    def _get_bad_channel_mode(self) -> str:
+        """Return configured bad-channel handling mode."""
+        if hasattr(self, "bad_ch_mode_combo"):
+            mode = self.bad_ch_mode_combo.currentData()
+            if mode in {"interpolate", "zero"}:
+                return mode
+        return "interpolate"
+
+    def _on_bad_channel_mode_changed(self, *_):
+        """Persist selected bad-channel handling mode in runtime config."""
+        if hasattr(self, "config") and hasattr(self.config, "model"):
+            self.config.model.bad_channel_mode = self._get_bad_channel_mode()
 
     @Slot(np.ndarray)
     def _on_bad_channels_updated(self, lines_enabled: np.ndarray):

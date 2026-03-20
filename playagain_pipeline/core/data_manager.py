@@ -14,7 +14,7 @@ import numpy as np
 
 from playagain_pipeline.core.session import RecordingSession
 from playagain_pipeline.core.gesture import GestureSet
-from playagain_pipeline.models.classifier import EMGFeatureExtractor
+from playagain_pipeline.models.classifier import EMGFeatureExtractor, apply_bad_channel_strategy
 from sklearn.model_selection import train_test_split
 
 
@@ -212,6 +212,7 @@ class DataManager:
         use_per_session_rotation: bool = False,
         feature_config: Optional[Dict[str, Any]] = None,
         bad_channels: Optional[Dict[str, List[int]]] = None,
+        bad_channel_mode: str = "interpolate",
     ) -> Dict[str, Any]:
         """
         Create a machine learning dataset from recording sessions.
@@ -235,7 +236,8 @@ class DataManager:
                 pre-extracting features at dataset creation time. If provided and
                 mode is not 'raw', features are computed and stored as 2D X.
             bad_channels: Optional dict mapping session_id -> list of bad channel
-                indices (0-based). Bad channels are zeroed out per session.
+                indices (0-based).
+            bad_channel_mode: How to handle bad channels: "interpolate" or "zero".
 
         Returns:
             Dictionary containing:
@@ -257,19 +259,18 @@ class DataManager:
             """Return processed data array (as float32) for a single session."""
             data = np.array(session.get_data(), dtype=np.float32, copy=True)
 
-            # Zero out bad channels for this session
+            # Handle bad channels for this session.
             session_bad_chs: list = []
             if bad_channels is not None:
                 session_bad_chs = list(bad_channels.get(session.metadata.session_id, []))
             if hasattr(session.metadata, 'bad_channels') and session.metadata.bad_channels:
                 session_bad_chs = list(set(session_bad_chs) | set(session.metadata.bad_channels))
             if session_bad_chs:
-                n_ch = data.shape[1]
-                for ch_idx in session_bad_chs:
-                    if ch_idx < n_ch:
-                        left = (ch_idx - 1) % n_ch
-                        right = (ch_idx + 1) % n_ch
-                        data[:, ch_idx] = 0.5 * (data[:, left] + data[:, right])
+                data = apply_bad_channel_strategy(
+                    data,
+                    session_bad_chs,
+                    mode=bad_channel_mode,
+                )
 
             # Determine rotation to apply
             if use_per_session_rotation:
@@ -396,6 +397,7 @@ class DataManager:
             ),
             "per_session_rotation": use_per_session_rotation,
             "session_rotation_offsets": per_session_rotations,
+            "bad_channel_mode": bad_channel_mode,
             "features_extracted": features_extracted,
             "feature_config": feature_config if feature_config else None,
             "feature_dim": feature_dim,

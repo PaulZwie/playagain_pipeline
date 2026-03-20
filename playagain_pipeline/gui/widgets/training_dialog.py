@@ -1278,6 +1278,7 @@ class TrainingProgressDialog(QDialog):
         if self._model.metadata:
             self._model.metadata.features_extracted = self.dataset["metadata"].get("features_extracted", False)
             self._model.metadata.feature_config = self.dataset["metadata"].get("feature_config", None)
+            self._model.metadata.bad_channel_mode = self.dataset["metadata"].get("bad_channel_mode", "interpolate")
 
         self._results = results
 
