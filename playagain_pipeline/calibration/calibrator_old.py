@@ -893,7 +893,7 @@ def backfill_session_rotations(data_dir: Path, calibrations_dir: Optional[Path] 
     Returns:
         Dictionary mapping session_id to {"rotation_offset": int, "confidence": float, "status": str}
     """
-    from playagain_pipeline.core.data_manager import DataManager
+    from playagain_pipeline.core.data_manager_old import DataManager
 
     data_dir = Path(data_dir)
     if calibrations_dir is None:

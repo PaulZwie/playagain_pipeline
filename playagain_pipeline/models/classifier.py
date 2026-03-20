@@ -909,7 +909,6 @@ class MLPClassifier(BaseClassifier):
     def train(self, X_train, y_train, X_val=None, y_val=None, **kwargs):
         start_time = time.time()
         callback = kwargs.get("callback", None)
-        auto_learning_rate = kwargs.get("auto_learning_rate", False)
 
         X_train_features = X_train if X_train.ndim == 2 else self.extract_features(X_train)
         feature_count = X_train_features.shape[1]
@@ -941,28 +940,6 @@ class MLPClassifier(BaseClassifier):
         scheduler_name = self.hyperparameters.get("scheduler", "none").lower()
         scheduler = None
         total_epochs = self.hyperparameters["epochs"]
-        if auto_learning_rate:
-            total_epochs = 100
-            lr = _find_learning_rate(
-                self._model,
-                DataLoader(
-                    TensorDataset(X_train_tensor, y_train_tensor),
-                    batch_size=min(32, len(X_train_tensor)),
-                    shuffle=True,
-                    num_workers=0,
-                    pin_memory=(device.type != "cpu"),
-                ),
-                nn.CrossEntropyLoss(),
-                device,
-                opt_name,
-                weight_decay=wd,
-                max_steps=min(100, len(X_train_tensor)),
-                max_grad_norm=self.hyperparameters.get("max_grad_norm", 1.0),
-            )
-            self.hyperparameters["learning_rate"] = lr
-            self.hyperparameters["early_stopping"] = False
-            self.hyperparameters["epochs"] = total_epochs
-
         optimizer = _build_optimizer(self._model.parameters(), opt_name, lr, wd)
         if scheduler_name == "cosine":
             scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=total_epochs)
@@ -1156,7 +1133,6 @@ class CNNClassifier(BaseClassifier):
     def train(self, X_train, y_train, X_val=None, y_val=None, **kwargs):
         start_time = time.time()
         callback = kwargs.get("callback", None)
-        auto_learning_rate = kwargs.get("auto_learning_rate", False)
         if X_train.ndim == 2:
             X_train = X_train[:, np.newaxis, :]
             if X_val is not None and X_val.ndim == 2: X_val = X_val[:, np.newaxis, :]
@@ -1195,28 +1171,6 @@ class CNNClassifier(BaseClassifier):
 
         sched_name = self.hyperparameters.get("scheduler", "none").lower()
         sched = None; cnn_epochs = self.hyperparameters["epochs"]
-        if auto_learning_rate:
-            cnn_epochs = 100
-            lr = _find_learning_rate(
-                self._model,
-                DataLoader(
-                    TensorDataset(X_train_tensor, y_train_tensor),
-                    batch_size=min(32, len(X_train_tensor)),
-                    shuffle=True,
-                    num_workers=0,
-                    pin_memory=(device.type != "cpu"),
-                ),
-                nn.CrossEntropyLoss(),
-                device,
-                opt_name,
-                weight_decay=wd,
-                max_steps=min(100, len(X_train_tensor)),
-                max_grad_norm=self.hyperparameters.get("max_grad_norm", 1.0),
-            )
-            self.hyperparameters["learning_rate"] = lr
-            self.hyperparameters["early_stopping"] = False
-            self.hyperparameters["epochs"] = cnn_epochs
-
         optimizer = _build_optimizer(self._model.parameters(), opt_name, lr, wd)
         if sched_name == "cosine": sched = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=cnn_epochs)
         elif sched_name == "plateau": sched = optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode='min', factor=0.5, patience=5, min_lr=1e-7)

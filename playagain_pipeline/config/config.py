@@ -61,6 +61,14 @@ class ProtocolSettings:
     quick_repetitions: int = 3
     quick_randomize: bool = True
 
+    long_preparation_time: float = 2.0
+    long_cue_time: float = 1.0
+    long_hold_time: float = 6.0
+    long_release_time: float = 0.3
+    long_rest_time: float = 5.0
+    long_repetitions: int = 10
+    long_randomize: bool = True
+
     # Calibration protocol settings
     cal_preparation_time: float = 2.0
     cal_cue_time: float = 0.5

@@ -26,9 +26,9 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, Q
                                QSplitter, QStatusBar, QListWidget, QScrollArea, QCheckBox,
                                QGridLayout, QApplication, QDialog, QListWidgetItem)
 
-from playagain_pipeline.calibration.calibrator import AutoCalibrator
+from playagain_pipeline.calibration.calibrator_old import AutoCalibrator
 from playagain_pipeline.config.config import get_default_config, PipelineConfig
-from playagain_pipeline.core.data_manager import DataManager
+from playagain_pipeline.core.data_manager_old import DataManager
 from playagain_pipeline.core.gesture import (create_default_gesture_set)
 from playagain_pipeline.core.session import RecordingSession
 from playagain_pipeline.devices.emg_device import (DeviceManager, DeviceType, SyntheticEMGDevice)
@@ -1752,7 +1752,7 @@ class MainWindow(QMainWindow):
             self._log("Setting new reference and recomputing all session rotations...")
             QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
             try:
-                from playagain_pipeline.calibration.calibrator import backfill_session_rotations
+                from playagain_pipeline.calibration.calibrator_old import backfill_session_rotations
                 self.calibrator.save_as_reference(
                     self.calibrator.current_calibration,
                     recompute_all=True,
@@ -1771,7 +1771,7 @@ class MainWindow(QMainWindow):
         file_path, _ = QFileDialog.getOpenFileName(self, "Load Calibration", str(self.data_dir / "calibrations"),
             "JSON Files (*.json)")
         if file_path:
-            from playagain_pipeline.calibration.calibrator import CalibrationResult
+            from playagain_pipeline.calibration.calibrator_old import CalibrationResult
             cal = CalibrationResult.load(Path(file_path))
             self.calibrator._current_calibration = cal
             self._update_calibration_display()
@@ -1780,7 +1780,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_apply_manual_rotation(self):
         """Apply a manually configured rotation offset (for pretrained model usage)."""
-        from playagain_pipeline.calibration.calibrator import CalibrationResult
+        from playagain_pipeline.calibration.calibrator_old import CalibrationResult
         offset = self.manual_rotation_spin.value()
         num_ch = self.channels_spin.value()
         mapping = [(i - offset) % num_ch for i in range(num_ch)]

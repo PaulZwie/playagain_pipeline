@@ -38,7 +38,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from playagain_pipeline.core.data_manager import DataManager
+from playagain_pipeline.core.data_manager_old import DataManager
 from playagain_pipeline.models.classifier import ModelManager
 from playagain_pipeline.models.feature_pipeline import get_registered_features
 
@@ -1716,6 +1716,8 @@ class PerformanceReviewTab(QWidget):
         self._log(f"✓ Complete. Results: {out}")
         summary = result.get("summary")
         self._populate_summary_table(summary)
+        if summary is not None:
+            self._log("\n── Summary ──\n" + summary.to_string(index=False))
         condensed_text = result.get("condensed_review_text")
         if isinstance(condensed_text, str) and condensed_text.strip():
             self._log("\n-- Condensed review --\n" + condensed_text)
@@ -1730,7 +1732,8 @@ class PerformanceReviewTab(QWidget):
         self._clear_summary_table()
         self._log(f"ERROR:\n{tb}")
         self._status_lbl.setText("Error — see log")
-        
+
+        import sys
         print(f"[ERROR] {tb}", file=sys.stderr)
 
         msg = QMessageBox(self)
@@ -1755,6 +1758,7 @@ class PerformanceReviewTab(QWidget):
 
     def _on_open_folder(self):
         if self._last_output_dir:
+            import subprocess
             subprocess.Popen(["open", self._last_output_dir])
 
     def _log(self, text: str):
@@ -1880,3 +1884,4 @@ class PerformanceReviewTab(QWidget):
         img.setScaledContents(False)
         fl.addWidget(img)
         return frame
+

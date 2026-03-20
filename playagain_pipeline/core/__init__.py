@@ -12,7 +12,7 @@ from playagain_pipeline.core.session import (
     RecordingMetadata,
     RecordingTrial
 )
-from playagain_pipeline.core.data_manager import DataManager
+from playagain_pipeline.core.data_manager_old import DataManager
 
 __all__ = [
     "Gesture",

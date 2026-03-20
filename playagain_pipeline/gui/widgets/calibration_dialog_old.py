@@ -258,7 +258,7 @@ class CalibrationDialog(QDialog):
             channel_mapping = [(i + offset) % num_channels for i in range(num_channels)]
 
             # Create calibration result
-            from playagain_pipeline.calibration.calibrator import CalibrationResult
+            from playagain_pipeline.calibration.calibrator_old import CalibrationResult
 
             self._calibration_result = CalibrationResult(
                 created_at=datetime.now(),

@@ -318,13 +318,13 @@ def create_extended_protocol() -> ProtocolConfig:
     return ProtocolConfig(
         name="extended",
         description="Extended protocol (10 repetitions)",
-        preparation_time=5.0, # Kept longer
-        cue_time=1.5, # Kept longer
-        hold_time=4.0, # Kept longer
-        release_time=0.5,
-        rest_time=3.0, # Kept longer
-        repetitions_per_gesture=10,
-        randomize_order=True
+        preparation_time=settings.long_preparation_time,
+        cue_time=settings.long_cue_time,
+        hold_time=settings.long_hold_time,
+        release_time=settings.long_release_time,
+        rest_time=settings.long_rest_time,
+        repetitions_per_gesture=settings.long_repetitions,
+        randomize_order=settings.long_randomize
     )
 
 
