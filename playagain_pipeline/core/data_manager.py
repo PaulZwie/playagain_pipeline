@@ -28,6 +28,14 @@ class DataManager:
     - Creating ML-ready datasets
     """
 
+    _INVALID_PATH_CHARS_RE = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+    @classmethod
+    def _sanitize_path_component(cls, value: str) -> str:
+        """Normalize a filesystem path component for cross-platform safety."""
+        safe = cls._INVALID_PATH_CHARS_RE.sub("-", str(value)).strip().rstrip(". ")
+        return safe or "unnamed"
+
     def __init__(self, data_dir: Path):
         """
         Initialize the data manager.
@@ -52,7 +60,9 @@ class DataManager:
 
     def get_session_path(self, subject_id: str, session_id: str) -> Path:
         """Get the path for a specific session."""
-        return self.sessions_dir / subject_id / session_id
+        safe_subject = self._sanitize_path_component(subject_id)
+        safe_session = self._sanitize_path_component(session_id)
+        return self.sessions_dir / safe_subject / safe_session
 
     def save_session(self, session: RecordingSession) -> Path:
         """

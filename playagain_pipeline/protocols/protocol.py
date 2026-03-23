@@ -141,16 +141,35 @@ class RecordingProtocol:
             is_recording=False
         ))
 
+        # Add a short rest before the calibration sync so the first cue does not
+        # start abruptly. Keep startup duration close to previous behavior by
+        # taking this time from the calibration-sync step.
+        pre_sync_rest = min(1.0, max(0.0, self.config.rest_time * 0.3))
+        sync_duration = self.config.rest_time - pre_sync_rest
+
+        if sync_duration <= 0:
+            pre_sync_rest = 0.0
+            sync_duration = self.config.rest_time
+
+        if pre_sync_rest > 0:
+            self._steps.append(ProtocolStep(
+                phase=ProtocolPhase.REST,
+                gesture=None,
+                duration=pre_sync_rest,
+                message="Rest. Calibration starts next.",
+                is_recording=False,
+            ))
+
         # Calibration sync gesture (waveout) — recorded once per session.
         # This is NOT part of the gesture set and will NOT be used for model
-        # training.  It gives the rotation-detection calibrator a clean,
+        # training. It gives the rotation-detection calibrator a clean,
         # high-quality waveout signal regardless of which gesture set the
         # session was recorded with.
         self._steps.append(ProtocolStep(
             phase=ProtocolPhase.CALIBRATION_SYNC,
             gesture=None,
-            duration=self.config.rest_time,   # same duration as a rest pause
-            message="🔧  Sync: Extend wrist outward (WaveOut)",
+            duration=sync_duration,
+            message="Calibration sync: WAVE OUT now (move wrist clearly outward)",
             is_recording=True,
         ))
 
