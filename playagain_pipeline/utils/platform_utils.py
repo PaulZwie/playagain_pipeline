@@ -6,6 +6,7 @@ platform-appropriate paths, imports, and behaviour throughout
 the pipeline.
 """
 
+import os
 import platform
 import sys
 from pathlib import Path
@@ -70,12 +71,8 @@ def _find_sibling_package(package_dir_name: str) -> Optional[Path]:
 
 
 def get_device_interfaces_path() -> Optional[Path]:
-    """Return the filesystem path to the local ``device_interfaces`` package."""
-    # Support both common folder names used in different clones.
-    return (
-        _find_sibling_package("device-interfaces")
-        or _find_sibling_package("device-interfaces-main")
-    )
+    """Return the filesystem path to the ``device-interfaces-main`` package."""
+    return _find_sibling_package("device-interfaces-main")
 
 
 def get_gui_custom_elements_path() -> Optional[Path]:
@@ -138,7 +135,6 @@ def get_app_config_dir() -> Path:
     if IS_MACOS:
         base = Path.home() / "Library" / "Application Support"
     elif IS_WINDOWS:
-        import os
         base = Path(os.environ.get("APPDATA", Path.home() / "AppData" / "Roaming"))
     else:
         base = Path.home() / ".config"
@@ -159,5 +155,5 @@ def print_platform_info() -> None:
 
     print(f"[Platform] OS            : {get_os_name()} ({platform.version()})")
     print(f"[Platform] Python        : {sys.version.split()[0]}")
-    print(f"[Platform] device_interfaces  : {di if di else 'not found'}")
-    print(f"[Platform] gui_custom_elements: {ge if ge else 'not found'}")
+    #print(f"[Platform] device_interfaces  : {'✓ ' + str(di) if di else '✗ not found'}")
+    #print(f"[Platform] gui_custom_elements: {'✓ ' + str(ge) if ge else '✗ not found'}")
