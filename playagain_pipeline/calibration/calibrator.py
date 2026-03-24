@@ -1100,8 +1100,10 @@ def backfill_session_rotations(data_dir: Path, calibrations_dir: Optional[Path] 
                     calibrator.save_as_reference(cal_result)
                     print(f"[Backfill] Saved '{subject}/{session_id}' as reference calibration")
 
-                # Re-save session metadata with rotation info
-                session_path = dm.get_session_path(subject, session_id)
+                # Re-save metadata to the directory this session was loaded from.
+                # This preserves legacy folder names (e.g. ':' timestamps) and
+                # avoids creating duplicate sanitised folders.
+                session_path = getattr(session, "_source_dir", None) or dm.get_session_path(subject, session_id)
                 session.save(session_path)
 
                 results[f"{subject}/{session_id}"] = {

@@ -64,6 +64,50 @@ class DataManager:
         safe_session = self._sanitize_path_component(session_id)
         return self.sessions_dir / safe_subject / safe_session
 
+
+    # Duplicate logic to resolve session path with legacy compatibility for raw vs sanitised names.
+    def _resolve_session_path(self, subject_id: str, session_id: str) -> Path:
+        """Resolve a session folder across legacy (raw) and sanitised naming."""
+        raw_subject = self.sessions_dir / str(subject_id)
+        safe_subject = self.sessions_dir / self._sanitize_path_component(subject_id)
+
+        subject_candidates = []
+        for candidate in (raw_subject, safe_subject):
+            if candidate not in subject_candidates:
+                subject_candidates.append(candidate)
+
+        session_names = [str(session_id), self._sanitize_path_component(session_id)]
+        tried_paths = []
+        seen_paths = set()
+
+        for subject_dir in subject_candidates:
+            for sess_name in session_names:
+                path = subject_dir / sess_name
+                key = str(path)
+                if key in seen_paths:
+                    continue
+                seen_paths.add(key)
+                tried_paths.append(path)
+                if path.exists():
+                    return path
+
+        # Legacy compatibility: if caller passes a sanitised ID but on-disk
+        # folder still uses raw characters (e.g. ':' on macOS), match by
+        # sanitised-name equivalence.
+        target_sanitized = self._sanitize_path_component(session_id)
+        for subject_dir in subject_candidates:
+            if not subject_dir.exists():
+                continue
+            for child in subject_dir.iterdir():
+                if child.is_dir() and self._sanitize_path_component(child.name) == target_sanitized:
+                    return child
+
+        attempted = "\n".join(f"- {p}" for p in tried_paths)
+        raise FileNotFoundError(
+            f"Session not found for subject={subject_id!r}, session_id={session_id!r}. "
+            f"Attempted paths:\n{attempted}"
+        )
+
     def save_session(self, session: RecordingSession) -> Path:
         """
         Save a recording session.
@@ -92,7 +136,7 @@ class DataManager:
         Returns:
             Loaded RecordingSession
         """
-        path = self.get_session_path(subject_id, session_id)
+        path = self._resolve_session_path(subject_id, session_id)
         return RecordingSession.load(path)
 
     def list_subjects(self) -> List[str]:
@@ -163,7 +207,9 @@ class DataManager:
 
     def list_sessions(self, subject_id: str) -> List[str]:
         """List all sessions for a subject, sorted by recording order (creation time)."""
-        subject_dir = self.sessions_dir / subject_id
+        subject_dir = self.sessions_dir / str(subject_id)
+        if not subject_dir.exists():
+            subject_dir = self.sessions_dir / self._sanitize_path_component(subject_id)
         if not subject_dir.exists():
             return []
 

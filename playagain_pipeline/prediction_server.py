@@ -43,7 +43,7 @@ from typing import Optional, Dict, Any, List, Callable, Tuple
 import numpy as np
 
 from playagain_pipeline.config.config import get_default_config
-from playagain_pipeline.core.data_manager_old import DataManager
+from playagain_pipeline.core.data_manager import DataManager
 from playagain_pipeline.devices.emg_device import DeviceManager, DeviceType, SyntheticEMGDevice
 from playagain_pipeline.models.classifier import ModelManager, BaseClassifier
 

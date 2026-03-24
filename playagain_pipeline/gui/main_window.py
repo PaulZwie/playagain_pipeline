@@ -28,7 +28,7 @@ from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, Q
 
 from playagain_pipeline.calibration.calibrator import AutoCalibrator
 from playagain_pipeline.config.config import get_default_config, PipelineConfig
-from playagain_pipeline.core.data_manager_old import DataManager
+from playagain_pipeline.core.data_manager import DataManager
 from playagain_pipeline.core.gesture import (create_default_gesture_set)
 from playagain_pipeline.core.session import RecordingSession
 from playagain_pipeline.devices.emg_device import (DeviceManager, DeviceType, SyntheticEMGDevice)

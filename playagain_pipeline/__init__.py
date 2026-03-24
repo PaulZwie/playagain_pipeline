@@ -30,7 +30,7 @@ from playagain_pipeline.core.gesture import (
     create_calibration_gesture_set
 )
 from playagain_pipeline.core.session import RecordingSession, RecordingTrial
-from playagain_pipeline.core.data_manager_old import DataManager
+from playagain_pipeline.core.data_manager import DataManager
 
 # Protocols
 from playagain_pipeline.protocols.protocol import (

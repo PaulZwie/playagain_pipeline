@@ -12,17 +12,21 @@ from playagain_pipeline.core.session import (
     RecordingMetadata,
     RecordingTrial
 )
-from playagain_pipeline.core.data_manager_old import DataManager
+from playagain_pipeline.core.data_manager import DataManager
 
 __all__ = [
     "Gesture",
     "GestureSet",
     "GestureCategory",
     "create_default_gesture_set",
-    "create_extended_gesture_set",
+    #"create_extended_gesture_set",
     "create_calibration_gesture_set",
     "RecordingSession",
     "RecordingMetadata",
     "RecordingTrial",
     "DataManager",
 ]
+
+
+def data_manager():
+    return None

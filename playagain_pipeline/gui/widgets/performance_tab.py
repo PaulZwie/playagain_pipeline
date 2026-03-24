@@ -38,7 +38,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[3]
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
-from playagain_pipeline.core.data_manager_old import DataManager
+from playagain_pipeline.core.data_manager import DataManager
 from playagain_pipeline.models.classifier import ModelManager
 from playagain_pipeline.models.feature_pipeline import get_registered_features
 
