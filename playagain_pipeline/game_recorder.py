@@ -31,6 +31,8 @@ from typing import Optional, Dict, List, Any
 
 import numpy as np
 
+from playagain_pipeline.utils.platform_utils import IS_WINDOWS
+
 
 class GameRecorder:
     """
@@ -81,8 +83,17 @@ class GameRecorder:
         self._sample_count = 0
 
         # Background writer thread and queue
-        self._write_queue: queue.Queue = queue.Queue()
+        # Bounded queue prevents runaway RAM growth when disk stalls.
+        self._write_queue: queue.Queue = queue.Queue(maxsize=256)
         self._writer_thread: Optional[threading.Thread] = None
+
+        # Writer tuning (slower flush cadence helps Windows file I/O significantly)
+        self._flush_interval_s = 0.35 if IS_WINDOWS else 0.2
+        self._rows_per_flush = 2500 if IS_WINDOWS else 1500
+
+        # Optional verbose ground-truth logging (disabled in hot path by default)
+        self._debug_ground_truth = False
+        self._last_gt_log_time = 0.0
 
         # Current prediction state (updated atomically via on_prediction)
         self._current_prediction = "rest"
@@ -240,7 +251,8 @@ class GameRecorder:
         self._current_file_path = self._current_session_dir / "recording.csv"
 
         # Open file and write header
-        self._file = open(self._current_file_path, "w", newline="")
+        # Large text buffering reduces frequent kernel writes during gameplay.
+        self._file = open(self._current_file_path, "w", newline="", buffering=1024 * 1024)
         self._writer = csv.writer(self._file)
 
         # Build CSV header
@@ -308,7 +320,16 @@ class GameRecorder:
 
         # Signal writer thread to stop and wait for it to drain
         if self._writer_thread is not None:
-            self._write_queue.put(None)  # sentinel
+            # Ensure sentinel insertion even if queue is full.
+            while True:
+                try:
+                    self._write_queue.put_nowait(None)  # sentinel
+                    break
+                except queue.Full:
+                    try:
+                        self._write_queue.get_nowait()
+                    except queue.Empty:
+                        break
             self._writer_thread.join(timeout=5.0)
             self._writer_thread = None
 
@@ -346,6 +367,9 @@ class GameRecorder:
             return
 
         n_samples = data.shape[0]
+        if n_samples <= 0:
+            return
+
         n_channels = min(data.shape[1], self._num_channels)
         current_time = time.time()
         base_timestamp = current_time - self._start_time
@@ -353,7 +377,7 @@ class GameRecorder:
         # Snapshot current state (atomic reads under GIL)
         prediction = self._current_prediction
         gesture_id = self._current_gesture_id
-        confidence = self._current_confidence
+        confidence = float(self._current_confidence)
         probabilities = dict(self._current_probabilities)
         gt_active = self._ground_truth_active
         raw_gt = getattr(self, '_raw_ground_truth', gt_active)
@@ -362,20 +386,21 @@ class GameRecorder:
 
         # Build all rows in bulk, then enqueue as a single batch
         rows = []
-        sr = self._sampling_rate
+        sr = float(self._sampling_rate)
+        timestamps = base_timestamp + (np.arange(n_samples, dtype=np.float64) / sr)
         gt_flag = 1 if gt_active else 0
         raw_gt_flag = 1 if raw_gt else 0
         cam_flag = 1 if cam_blocking else 0
-        conf_str = f"{confidence:.4f}"
-        prob_values = [f"{probabilities.get(name, 0.0):.4f}" for name in self._class_names]
+        prob_values = [float(probabilities.get(name, 0.0)) for name in self._class_names]
+        emg_rows = data[:n_samples, :n_channels].tolist()
+        pad = [0.0] * (self._num_channels - n_channels)
 
-        for s in range(n_samples):
-            timestamp = base_timestamp + s / sr
+        for i, ts in enumerate(timestamps):
             row = [
-                f"{timestamp:.6f}",
+                float(ts),
                 prediction,
                 gesture_id,
-                conf_str,
+                confidence,
             ]
             row.extend(prob_values)
             row.extend([
@@ -384,12 +409,9 @@ class GameRecorder:
                 req_gesture,
                 cam_flag,
             ])
-            # EMG channels
-            for ch in range(n_channels):
-                row.append(f"{data[s, ch]:.6e}")
-            # Pad if fewer channels
-            for _ in range(n_channels, self._num_channels):
-                row.append("0.000000e+00")
+            row.extend(emg_rows[i])
+            if pad:
+                row.extend(pad)
             rows.append(row)
 
         self._sample_count += n_samples
@@ -468,12 +490,15 @@ class GameRecorder:
         self._requested_gesture = requested_gesture
         self._camera_blocking = camera_blocking
 
-        if self._is_recording:
-            print(f"[GameRecorder] Ground truth update: "
-                  f"reliable_active={self._ground_truth_active}, "
-                  f"raw_gt={ground_truth_active}, "
-                  f"gesture={requested_gesture}, "
-                  f"camera_blocking={camera_blocking}")
+        if self._is_recording and self._debug_ground_truth:
+            now = time.monotonic()
+            if now - self._last_gt_log_time >= 1.0:
+                self._last_gt_log_time = now
+                print(f"[GameRecorder] Ground truth update: "
+                      f"reliable_active={self._ground_truth_active}, "
+                      f"raw_gt={ground_truth_active}, "
+                      f"gesture={requested_gesture}, "
+                      f"camera_blocking={camera_blocking}")
 
     # ─── Internal ─────────────────────────────────────────────────────────
 
@@ -482,33 +507,56 @@ class GameRecorder:
         Background thread: drains the write queue and flushes rows to CSV.
         Stops when it receives a None sentinel on the queue.
         """
+        pending_rows = []
+        last_flush = time.monotonic()
+
         while True:
             try:
-                item = self._write_queue.get(timeout=0.5)
+                item = self._write_queue.get(timeout=0.1)
             except queue.Empty:
-                continue
+                item = None
 
             if item is None:
-                # Drain remaining items before exiting
-                while not self._write_queue.empty():
-                    try:
-                        remaining = self._write_queue.get_nowait()
-                        if remaining is not None and self._writer:
-                            self._writer.writerows(remaining)
-                    except queue.Empty:
-                        break
-                # Final flush
-                if self._file:
-                    try:
-                        self._file.flush()
-                    except Exception:
-                        pass
-                return
+                # None can be either timeout or stop sentinel; only stop when recording ended.
+                if not self._is_recording:
+                    # Drain remaining queued batches before exit.
+                    while True:
+                        try:
+                            remaining = self._write_queue.get_nowait()
+                        except queue.Empty:
+                            break
+                        if remaining is not None:
+                            pending_rows.extend(remaining)
 
-            if self._writer:
+                    if pending_rows and self._writer:
+                        try:
+                            self._writer.writerows(pending_rows)
+                        except Exception as e:
+                            print(f"[GameRecorder] Write error: {e}")
+
+                    if self._file:
+                        try:
+                            self._file.flush()
+                        except Exception:
+                            pass
+                    return
+            else:
+                pending_rows.extend(item)
+
+            now = time.monotonic()
+            should_flush = (
+                pending_rows and (
+                    len(pending_rows) >= self._rows_per_flush
+                    or (now - last_flush) >= self._flush_interval_s
+                )
+            )
+
+            if should_flush and self._writer:
                 try:
-                    self._writer.writerows(item)
+                    self._writer.writerows(pending_rows)
                     self._file.flush()
+                    pending_rows.clear()
+                    last_flush = now
                 except Exception as e:
                     print(f"[GameRecorder] Write error: {e}")
 

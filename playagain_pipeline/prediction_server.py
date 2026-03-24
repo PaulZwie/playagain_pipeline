@@ -202,6 +202,10 @@ class PredictionServer:
         self._data_queue: queue.Queue = queue.Queue(maxsize=64)
         self._prediction_thread: Optional[threading.Thread] = None
 
+        # Dedicated sender worker so network hiccups cannot block prediction
+        self._send_queue: queue.Queue = queue.Queue(maxsize=8)
+        self._sender_thread: Optional[threading.Thread] = None
+
         # Prediction smoothing
         self._smoother = PredictionSmoother(alpha=0.3, min_stable_ms=150.0)
         self._smoothing_enabled = True
@@ -369,7 +373,13 @@ class PredictionServer:
                 target=self._prediction_loop, daemon=True, name="PredictionServer-Predict"
             )
             self._prediction_thread.start()
-            
+
+            # Start sender thread
+            self._sender_thread = threading.Thread(
+                target=self._sender_loop, daemon=True, name="PredictionServer-Send"
+            )
+            self._sender_thread.start()
+
             # Start accept thread
             self._accept_thread = threading.Thread(
                 target=self._accept_loop, daemon=True, name="PredictionServer-Accept"
@@ -406,6 +416,16 @@ class PredictionServer:
                 pass
             self._server_socket = None
         
+        # Wake sender thread and wait for it
+        try:
+            self._send_queue.put_nowait(None)
+        except queue.Full:
+            pass
+
+        if self._sender_thread:
+            self._sender_thread.join(timeout=2.0)
+            self._sender_thread = None
+
         # Wait for prediction thread
         if self._prediction_thread:
             self._prediction_thread.join(timeout=2.0)
@@ -473,7 +493,11 @@ class PredictionServer:
                     self._prediction_buffer = np.zeros((window_samples, data.shape[1]))
 
                 n_samples = min(data.shape[0], len(self._prediction_buffer))
-                self._prediction_buffer = np.roll(self._prediction_buffer, -n_samples, axis=0)
+                if n_samples <= 0:
+                    continue
+                if n_samples < len(self._prediction_buffer):
+                    # In-place shift avoids np.roll allocation each frame.
+                    self._prediction_buffer[:-n_samples] = self._prediction_buffer[n_samples:]
                 self._prediction_buffer[-n_samples:] = data[:n_samples]
                 buffer_snapshot = self._prediction_buffer.copy()
 
@@ -547,7 +571,7 @@ class PredictionServer:
 
     def _broadcast_prediction(self, gesture: str, gesture_id: int,
                                confidence: float, probabilities: Dict[str, float]):
-        """Send prediction to all connected clients."""
+        """Queue prediction payload for asynchronous sending to connected clients."""
         message = {
             "gesture": gesture,
             "gesture_id": gesture_id,
@@ -555,28 +579,50 @@ class PredictionServer:
             "probabilities": probabilities,
             "timestamp": time.time()
         }
-        
-        line = json.dumps(message) + "\n"
-        data = line.encode("utf-8")
-        
-        disconnected = []
-        
-        with self._clients_lock:
-            for client in self._clients:
-                try:
-                    # Use a short timeout so a slow client can't block predictions
-                    client.settimeout(0.05)
-                    client.sendall(data)
-                except (OSError, BrokenPipeError, socket.timeout):
-                    disconnected.append(client)
-            
-            for client in disconnected:
-                self._clients.remove(client)
-                try:
-                    client.close()
-                except OSError:
-                    pass
-                print(f"[PredictionServer] Client disconnected (send failed)")
+
+        data = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
+
+        try:
+            self._send_queue.put_nowait(data)
+        except queue.Full:
+            # Keep the newest payload; stale predictions are less useful.
+            try:
+                self._send_queue.get_nowait()
+            except queue.Empty:
+                pass
+            try:
+                self._send_queue.put_nowait(data)
+            except queue.Full:
+                pass
+
+    def _sender_loop(self):
+        """Background thread: sends queued prediction payloads to all clients."""
+        while self._running:
+            try:
+                payload = self._send_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+
+            if payload is None:
+                break
+
+            disconnected = []
+            with self._clients_lock:
+                for client in self._clients:
+                    try:
+                        # Short timeout keeps sender responsive without affecting inference.
+                        client.settimeout(0.05)
+                        client.sendall(payload)
+                    except (OSError, BrokenPipeError, socket.timeout):
+                        disconnected.append(client)
+
+                for client in disconnected:
+                    self._clients.remove(client)
+                    try:
+                        client.close()
+                    except OSError:
+                        pass
+                    print(f"[PredictionServer] Client disconnected (send failed)")
 
     def _accept_loop(self):
         """Background thread: accept incoming client connections."""
