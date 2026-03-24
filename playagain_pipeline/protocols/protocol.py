@@ -173,6 +173,15 @@ class RecordingProtocol:
             is_recording=True,
         ))
 
+        # Add a rest phase before the first normal gesture
+        self._steps.append(ProtocolStep(
+            phase=ProtocolPhase.REST,
+            gesture=None,
+            duration=self.config.rest_time,
+            message="Rest. Get ready for the first gesture.",
+            is_recording=False
+        ))
+
         # Get the gesture sequence
         gestures = list(self.gesture_set.gestures)
         if self.config.randomize_order:

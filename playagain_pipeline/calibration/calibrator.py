@@ -568,6 +568,7 @@ class CalibrationProcessor:
         calibration_data: Dict[str, Union[np.ndarray, List[np.ndarray]]],
         device_name: str = "unknown",
         reference_result: Optional[CalibrationResult] = None,
+        signal_mode: str = "monopolar",
         plot_path: Optional[Path] = None,
     ) -> CalibrationResult:
         """
@@ -594,7 +595,22 @@ class CalibrationProcessor:
             per_gesture_confidence[g] = self._compute_energy_confidence(e)
 
         # Select the best sync pattern (e.g. waveOut or Fist)
-        ref_patterns_map = reference_result.reference_patterns if reference_result else None
+        reference_incompatible = None
+        ref_patterns_map = None
+        if reference_result is not None:
+            ref_mode = str(reference_result.metadata.get("signal_mode", "monopolar")).lower()
+            cur_mode = str(signal_mode or "monopolar").lower()
+            if reference_result.num_channels != self.num_channels:
+                reference_incompatible = (
+                    f"channel mismatch: reference={reference_result.num_channels}, "
+                    f"current={self.num_channels}"
+                )
+            elif ref_mode != cur_mode:
+                reference_incompatible = (
+                    f"signal mode mismatch: reference={ref_mode}, current={cur_mode}"
+                )
+            else:
+                ref_patterns_map = reference_result.reference_patterns
         
         sync_energy, ref_sync_energy, sync_gesture = self._select_sync_pattern(
             energy_patterns, ref_patterns_map
@@ -629,7 +645,9 @@ class CalibrationProcessor:
                 "sync_gesture": sync_gesture,  # Record which gesture was used
                 "per_gesture_confidence": per_gesture_confidence,
                 "num_gestures": len(calibration_data),
-                "has_reference": reference_result is not None,
+                "has_reference": ref_patterns_map is not None,
+                "signal_mode": str(signal_mode or "monopolar").lower(),
+                "reference_incompatible": reference_incompatible,
                 "mec_channel": int(np.argmax(sync_energy)),
             },
         )
@@ -709,6 +727,36 @@ class CalibrationProcessor:
         # 4. Last resort
         return patterns.get("__combined__", np.zeros(self.num_channels)), None, "Combined"
 
+    def _plot_energy_profile(
+        self,
+        sync_energy: np.ndarray,
+        ref_sync_energy: Optional[np.ndarray],
+        offset: int,
+        confidence: float,
+        plot_path: Path,
+    ) -> None:
+        """Save a lightweight diagnostic plot for sync-energy alignment."""
+        import matplotlib.pyplot as plt
+
+        plot_path = Path(plot_path)
+        plot_path.parent.mkdir(parents=True, exist_ok=True)
+
+        fig, ax = plt.subplots(figsize=(8, 4))
+        x = np.arange(len(sync_energy))
+        ax.plot(x, sync_energy, label="current", linewidth=2)
+
+        if ref_sync_energy is not None and len(ref_sync_energy) == len(sync_energy):
+            ax.plot(x, ref_sync_energy, label="reference", linewidth=1.5, alpha=0.8)
+
+        ax.set_title(f"Calibration Energy Profile (offset={offset}, conf={confidence:.2%})")
+        ax.set_xlabel("Channel")
+        ax.set_ylabel("Energy")
+        ax.grid(True, alpha=0.25)
+        ax.legend(loc="best")
+        fig.tight_layout()
+        fig.savefig(plot_path, dpi=150)
+        plt.close(fig)
+
     def set_reference_calibration(self, result: Optional[CalibrationResult]) -> None:
         """Set or clear the reference calibration for future calibrations."""
         self._reference_calibration = result
@@ -748,22 +796,61 @@ class AutoCalibrator:
         self.processor = CalibrationProcessor(num_channels, sampling_rate)
         self._current_calibration: Optional[CalibrationResult] = None
 
-        # Try to load existing reference calibration
-        self._load_reference()
+        # Try to load existing monopolar reference calibration.
+        self._load_reference_for_mode("monopolar")
 
     def _load_reference(self) -> None:
-        """Load existing reference calibration if available."""
-        ref_path = self.data_dir / "reference_calibration.json"
-        if ref_path.exists():
-            try:
-                ref = CalibrationResult.load(ref_path)
-                self.processor.set_reference_calibration(ref)
-            except Exception as e:
-                print(f"Warning: Could not load reference calibration: {e}")
+        """Load existing monopolar reference calibration (legacy compatibility)."""
+        self._load_reference_for_mode("monopolar")
+
+    @staticmethod
+    def _normalize_signal_mode(signal_mode: Optional[str]) -> str:
+        mode = str(signal_mode or "monopolar").strip().lower()
+        return "bipolar" if mode == "bipolar" else "monopolar"
+
+    def _reference_path(self, signal_mode: str) -> Path:
+        mode = self._normalize_signal_mode(signal_mode)
+        return self.data_dir / f"reference_calibration_{mode}.json"
+
+    def _extract_session_signal_mode(self, session) -> str:
+        custom = getattr(session.metadata, "custom_metadata", {}) or {}
+        if isinstance(custom, dict):
+            mode = custom.get("signal_mode")
+            if isinstance(mode, str):
+                return self._normalize_signal_mode(mode)
+            if bool(custom.get("bipolar_mode", False)):
+                return "bipolar"
+        return "monopolar"
+
+    def _load_reference_for_mode(self, signal_mode: str) -> None:
+        """Load existing reference calibration for a specific signal mode."""
+        mode = self._normalize_signal_mode(signal_mode)
+        ref_path = self._reference_path(mode)
+
+        if mode == "monopolar" and not ref_path.exists():
+            legacy = self.data_dir / "reference_calibration.json"
+            if legacy.exists():
+                ref_path = legacy
+
+        if not ref_path.exists():
+            self.processor.set_reference_calibration(None)
+            return
+
+        try:
+            ref = CalibrationResult.load(ref_path)
+            ref_mode = self._normalize_signal_mode(ref.metadata.get("signal_mode", "monopolar"))
+            if ref.num_channels != self.processor.num_channels or ref_mode != mode:
+                self.processor.set_reference_calibration(None)
+                return
+            self.processor.set_reference_calibration(ref)
+        except Exception as e:
+            print(f"Warning: Could not load reference calibration ({mode}): {e}")
+            self.processor.set_reference_calibration(None)
 
     def save_as_reference(self, result: CalibrationResult,
                           recompute_all: bool = False,
-                          data_dir: Optional[Path] = None) -> None:
+                          data_dir: Optional[Path] = None,
+                          signal_mode: Optional[str] = None) -> None:
         """Save a calibration result as the reference.
 
         Args:
@@ -772,6 +859,10 @@ class AutoCalibrator:
                            relative to this new reference.
             data_dir: Root data directory (needed when recompute_all=True).
         """
+        mode = self._normalize_signal_mode(
+            signal_mode or result.metadata.get("signal_mode", "monopolar")
+        )
+
         # When saving as reference the result itself becomes offset=0
         # (it IS the reference). Store original patterns but reset offset.
         ref_result = CalibrationResult(
@@ -782,11 +873,15 @@ class AutoCalibrator:
             channel_mapping=list(range(result.num_channels)),
             confidence=1.0,
             reference_patterns=result.reference_patterns,
-            metadata={**result.metadata, "is_reference": True},
+            metadata={**result.metadata, "is_reference": True, "signal_mode": mode},
         )
-        ref_path = self.data_dir / "reference_calibration.json"
+        ref_path = self._reference_path(mode)
         ref_result.save(ref_path)
         self.processor.set_reference_calibration(ref_result)
+
+        if mode == "monopolar":
+            legacy_path = self.data_dir / "reference_calibration.json"
+            ref_result.save(legacy_path)
 
         if recompute_all and data_dir is not None:
             backfill_session_rotations(
@@ -801,7 +896,8 @@ class AutoCalibrator:
         self,
         calibration_data: Dict[str, Any],
         device_name: str = "unknown",
-        save_as_reference: bool = False
+        save_as_reference: bool = False,
+        signal_mode: str = "monopolar",
     ) -> CalibrationResult:
         """
         Perform calibration from gesture data.
@@ -815,10 +911,14 @@ class AutoCalibrator:
         Returns:
             CalibrationResult
         """
+        mode = self._normalize_signal_mode(signal_mode)
+        self._load_reference_for_mode(mode)
+
         result = self.processor.calibrate_from_data(
             calibration_data,
             device_name,
-            self.processor.get_reference_calibration()
+            self.processor.get_reference_calibration(),
+            signal_mode=mode,
         )
 
         self._current_calibration = result
@@ -828,7 +928,7 @@ class AutoCalibrator:
         result.save(self.data_dir / f"calibration_{timestamp}.json")
 
         if save_as_reference:
-            self.save_as_reference(result)
+            self.save_as_reference(result, signal_mode=mode)
 
         return result
 
@@ -856,6 +956,8 @@ class AutoCalibrator:
             CalibrationResult with rotation offset and channel mapping
         """
         all_data = session.get_data()
+        signal_mode = self._extract_session_signal_mode(session)
+        self._load_reference_for_mode(signal_mode)
 
         # ── Try dedicated calibration-sync trials first ──────────────────────
         cal_trials = []
@@ -888,6 +990,7 @@ class AutoCalibrator:
                     calibration_data,
                     device_name=session.metadata.device_name,
                     reference_result=self.processor.get_reference_calibration(),
+                    signal_mode=signal_mode,
                     plot_path=plot_path,
                 )
                 self._current_calibration = result
@@ -914,6 +1017,7 @@ class AutoCalibrator:
             gesture_trials,
             device_name=session.metadata.device_name,
             reference_result=self.processor.get_reference_calibration(),
+            signal_mode=signal_mode,
             plot_path=plot_path,
         )
         self._current_calibration = result

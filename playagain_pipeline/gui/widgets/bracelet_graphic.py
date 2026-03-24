@@ -30,11 +30,13 @@ class BraceletGraphicWidget(QWidget):
         self,
         num_electrodes: int = 32,
         rotation_offset: int = 0,
+        signal_mode: str = "monopolar",
         parent=None,
     ):
         super().__init__(parent)
         self._num_electrodes = num_electrodes
         self._rotation_offset = rotation_offset
+        self._signal_mode = signal_mode
         self._tilt = 25.0  # degrees of tilt for 3D perspective
 
         self._fig = Figure(figsize=(4, 4), dpi=100, facecolor="white")
@@ -65,6 +67,11 @@ class BraceletGraphicWidget(QWidget):
         self._num_electrodes = n
         self._draw()
 
+    def set_signal_mode(self, mode: str) -> None:
+        """Update signal mode (monopolar/bipolar) and redraw."""
+        self._signal_mode = str(mode or "monopolar").lower()
+        self._draw()
+
     # ------------------------------------------------------------------
     # Drawing
     # ------------------------------------------------------------------
@@ -75,7 +82,8 @@ class BraceletGraphicWidget(QWidget):
         ax.clear()
 
         N = self._num_electrodes
-        n_pairs = N // 2  # electrode pairs (inner + outer per position)
+        bipolar_mode = self._signal_mode == "bipolar"
+        n_pairs = N if bipolar_mode else N // 2  # bipolar uses a single full ring
         tilt_rad = math.radians(self._tilt)
         cos_tilt = math.cos(tilt_rad)
 
@@ -98,13 +106,14 @@ class BraceletGraphicWidget(QWidget):
         # -- Collect electrode data --------------------------------------
         elec_x, elec_y, elec_depth, elec_idx, elec_ring = [], [], [], [], []
 
-        for pair in range(n_pairs):
+        for pair in range(max(1, n_pairs)):
             theta = 2.0 * math.pi * pair / n_pairs - math.pi / 2  # start at bottom (approx)
 
-            for ring_i, (radius, idx_offset) in enumerate(
-                [(r_outer, 0), (r_inner, 1)]
-            ):
-                if N == 32:
+            ring_defs = [(0.90, 0)] if bipolar_mode else [(r_outer, 0), (r_inner, 1)]
+            for ring_i, (radius, idx_offset) in enumerate(ring_defs):
+                if bipolar_mode:
+                    idx = pair
+                elif N == 32:
                     # Split ring topology for 32-ch bracelet
                     # Inner ring (ring_i=1): 0-15
                     # Outer ring (ring_i=0): 16-31
@@ -171,8 +180,9 @@ class BraceletGraphicWidget(QWidget):
             # Label front-facing electrodes
             if t > 0.35:
                 fs = max(5, int(6 + 4 * t))
+                label = f"B{idx + 1}" if bipolar_mode else str(idx)
                 ax.text(
-                    elec_x[i], elec_y[i], str(idx),
+                    elec_x[i], elec_y[i], label,
                     fontsize=fs, ha="center", va="center",
                     color="white", fontweight="bold",
                     zorder=3 + int(t * 10),
@@ -234,7 +244,8 @@ class BraceletGraphicWidget(QWidget):
             )
 
         # -- Title -------------------------------------------------------
-        title = f"Bracelet  ({N} ch)"
+        mode_label = "Bipolar" if bipolar_mode else "Monopolar"
+        title = f"Bracelet  ({N} ch, {mode_label})"
         if self._rotation_offset != 0:
             title += f"  —  Rotation: {self._rotation_offset} ch"
         else:

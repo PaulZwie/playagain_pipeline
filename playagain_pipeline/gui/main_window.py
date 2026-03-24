@@ -346,6 +346,12 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
+        # Create scroll area to prevent cramping on small screens
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll_content = QWidget()
+        scroll_layout = QVBoxLayout(scroll_content)
+
         # Session settings
         session_group = QGroupBox("Session Settings")
         session_layout = QFormLayout(session_group)
@@ -371,7 +377,7 @@ class MainWindow(QMainWindow):
         self.session_notes_edit = QLineEdit()
         session_layout.addRow("Notes:", self.session_notes_edit)
 
-        layout.addWidget(session_group)
+        scroll_layout.addWidget(session_group)
 
         # Device settings
         device_group = QGroupBox("Device")
@@ -391,6 +397,16 @@ class MainWindow(QMainWindow):
         self.sampling_rate_spin.setValue(2000)
         self.sampling_rate_spin.setSingleStep(100)
         device_layout.addRow("Sample Rate:", self.sampling_rate_spin)
+
+        # Bipolar Mode checkbox
+        self.bipolar_mode_cb = QCheckBox("Bipolar Mode (Top - Bottom)")
+        self.bipolar_mode_cb.setChecked(False)
+        self.bipolar_mode_cb.setToolTip(
+            "Subtracts the bottom row electrodes from the top row electrodes.\n"
+            "Will halve the number of channels automatically."
+        )
+        self.bipolar_mode_cb.toggled.connect(self._on_bipolar_mode_toggled)
+        device_layout.addRow(self.bipolar_mode_cb)
 
         # Session replay options (for synthetic device)
         self.use_session_data_cb = QCheckBox("Use Session Data for Replay")
@@ -440,7 +456,7 @@ class MainWindow(QMainWindow):
         device_btn_layout.addWidget(self.disconnect_btn)
         device_layout.addRow(device_btn_layout)
 
-        layout.addWidget(device_group)
+        scroll_layout.addWidget(device_group)
 
         # Gesture set selection
         gesture_group = QGroupBox("Gestures")
@@ -450,17 +466,22 @@ class MainWindow(QMainWindow):
         self.gesture_set_combo.addItems(["Default (4 gestures)", "Custom..."])
         gesture_layout.addRow("Gesture Set:", self.gesture_set_combo)
 
-        layout.addWidget(gesture_group)
+        scroll_layout.addWidget(gesture_group)
 
         # Protocol selection
         protocol_group = QGroupBox("Protocol")
         protocol_layout = QFormLayout(protocol_group)
 
         self.protocol_combo = QComboBox()
-        self.protocol_combo.addItems(["Quick (3 reps)", "Standard (5 reps)", "Extended (10 reps)"])
+        self.protocol_combo.addItems([
+            "Quick (3 reps)",
+            "Standard (5 reps)",
+            "Extended (10 reps)",
+            "Calibration Setup"
+        ])
         protocol_layout.addRow("Protocol:", self.protocol_combo)
 
-        layout.addWidget(protocol_group)
+        scroll_layout.addWidget(protocol_group)
 
         # Recording controls
         control_group = QGroupBox("Recording")
@@ -477,9 +498,13 @@ class MainWindow(QMainWindow):
         self.stop_recording_btn.clicked.connect(self._on_stop_recording)
         control_layout.addWidget(self.stop_recording_btn)
 
-        layout.addWidget(control_group)
+        scroll_layout.addWidget(control_group)
 
-        layout.addStretch()
+        scroll_layout.addStretch()
+
+        scroll.setWidget(scroll_content)
+        layout.addWidget(scroll)
+
         return tab
 
     def _create_calibration_tab(self) -> QWidget:
@@ -681,6 +706,7 @@ class MainWindow(QMainWindow):
         self.bracelet_graphic = BraceletGraphicWidget(
             num_electrodes=self.channels_spin.value(),
             rotation_offset=0,
+            signal_mode=("bipolar" if self.bipolar_mode_cb.isChecked() else "monopolar"),
         )
         # Set minimum height for bracelet graphic to ensure it doesn't get squashed
         self.bracelet_graphic.setMinimumHeight(200)
@@ -1332,7 +1358,11 @@ class MainWindow(QMainWindow):
         try:
             # 2. Create the device instance through the manager
             # This will clean up any existing device automatically
-            kwargs = {"num_channels": self.channels_spin.value(), "sampling_rate": self.sampling_rate_spin.value()}
+            kwargs = {
+                "num_channels": self.channels_spin.value(), 
+                "sampling_rate": self.sampling_rate_spin.value(),
+                "bipolar_mode": self.bipolar_mode_cb.isChecked()
+            }
 
             # Add session replay parameters for synthetic device
             if device_type == DeviceType.SYNTHETIC and self.use_session_data_cb.isChecked():
@@ -1344,6 +1374,7 @@ class MainWindow(QMainWindow):
             # Update calibrator to use the actual device channel count (adaptive)
             # This fixes the issue when bad channels are removed and fewer channels are available
             self.calibrator.processor.num_channels = device.num_channels
+            self._on_bipolar_mode_toggled(self.bipolar_mode_cb.isChecked())
 
             # Update channel checkboxes based on device channel count
             self._update_channel_checkboxes(device.num_channels)
@@ -1539,6 +1570,9 @@ class MainWindow(QMainWindow):
         # Store bad channels in session metadata from the start
         self._current_session.metadata.bad_channels = bad_channels
         self._current_session.metadata.custom_metadata["bad_channel_mode"] = self._get_bad_channel_mode()
+        signal_mode = "bipolar" if self.bipolar_mode_cb.isChecked() else "monopolar"
+        self._current_session.metadata.custom_metadata["bipolar_mode"] = (signal_mode == "bipolar")
+        self._current_session.metadata.custom_metadata["signal_mode"] = signal_mode
         if participant_info:
             self._current_session.metadata.custom_metadata["participant_info"] = participant_info
 
@@ -1566,6 +1600,9 @@ class MainWindow(QMainWindow):
                 self._current_session.metadata.bad_channels = bad_channels
                 self._log(f"Marked {len(bad_channels)} bad channels: {bad_channels}")
             self._current_session.metadata.custom_metadata["bad_channel_mode"] = self._get_bad_channel_mode()
+            signal_mode = "bipolar" if self.bipolar_mode_cb.isChecked() else "monopolar"
+            self._current_session.metadata.custom_metadata["bipolar_mode"] = (signal_mode == "bipolar")
+            self._current_session.metadata.custom_metadata["signal_mode"] = signal_mode
 
             # Auto-detect bracelet rotation before saving
             try:
@@ -1796,7 +1833,8 @@ class MainWindow(QMainWindow):
         """Apply a manually configured rotation offset (for pretrained model usage)."""
         from playagain_pipeline.calibration.calibrator import CalibrationResult
         offset = self.manual_rotation_spin.value()
-        num_ch = self.channels_spin.value()
+        num_ch = self._effective_num_channels()
+        signal_mode = "bipolar" if self.bipolar_mode_cb.isChecked() else "monopolar"
         mapping = [(i - offset) % num_ch for i in range(num_ch)]
         cal = CalibrationResult(
             created_at=datetime.now(),
@@ -1806,7 +1844,7 @@ class MainWindow(QMainWindow):
             channel_mapping=mapping,
             confidence=1.0,
             reference_patterns={},
-            metadata={"source": "manual_override"}
+            metadata={"source": "manual_override", "signal_mode": signal_mode}
         )
         self.calibrator._current_calibration = cal
         self._update_calibration_display()
@@ -1959,6 +1997,7 @@ class MainWindow(QMainWindow):
             result = self.calibrator.calibrate(
                 calibration_data=self._live_cal_collected,
                 device_name=self.device_combo.currentText(),
+                signal_mode=("bipolar" if self.bipolar_mode_cb.isChecked() else "monopolar"),
             )
             self.calibrator._current_calibration = result
             self._update_calibration_display()
@@ -2047,6 +2086,7 @@ class MainWindow(QMainWindow):
             # Update bracelet graphic
             if hasattr(self, 'bracelet_graphic'):
                 self.bracelet_graphic.set_num_electrodes(cal.num_channels)
+                self.bracelet_graphic.set_signal_mode(cal.metadata.get("signal_mode", "monopolar"))
                 self.bracelet_graphic.set_rotation_offset(cal.rotation_offset)
             # Show sub-score breakdown if available
             if hasattr(self, 'cal_subscores_label'):
@@ -2077,6 +2117,10 @@ class MainWindow(QMainWindow):
             self.save_ref_btn.setEnabled(False)
             self.save_ref_recompute_btn.setEnabled(False)
             if hasattr(self, 'bracelet_graphic'):
+                self.bracelet_graphic.set_num_electrodes(self._effective_num_channels())
+                self.bracelet_graphic.set_signal_mode(
+                    "bipolar" if self.bipolar_mode_cb.isChecked() else "monopolar"
+                )
                 self.bracelet_graphic.set_rotation_offset(0)
 
     # Training handlers
@@ -2967,6 +3011,24 @@ class MainWindow(QMainWindow):
                 return mode
         return "interpolate"
 
+    def _effective_num_channels(self) -> int:
+        """Return currently active output channel count."""
+        device = self.device_manager.device
+        if device and device.is_connected:
+            return int(device.num_channels)
+        physical = int(self.channels_spin.value())
+        if self.bipolar_mode_cb.isChecked() and physical % 2 == 0:
+            if physical % 32 == 0:
+                return (physical // 32) * 16
+            return physical // 2
+        return physical
+
+    def _on_bipolar_mode_toggled(self, checked: bool):
+        """Update bracelet visualization for selected signal mode."""
+        if hasattr(self, "bracelet_graphic"):
+            self.bracelet_graphic.set_num_electrodes(self._effective_num_channels())
+            self.bracelet_graphic.set_signal_mode("bipolar" if checked else "monopolar")
+
     def _on_bad_channel_mode_changed(self, *_):
         """Persist selected bad-channel handling mode in runtime config."""
         if hasattr(self, "config") and hasattr(self.config, "model"):
@@ -3021,7 +3083,6 @@ class MainWindow(QMainWindow):
         # Auto-select latest session if available
         if sessions:
             self.session_id_combo.setCurrentText(sessions[-1])
-
 
 def main():
     """Entry point for the GUI application."""

@@ -80,6 +80,69 @@ class BaseEMGDevice(QObject):
         self._is_connected = False
         self._is_streaming = False
 
+        # Keep physical/raw channel count separate from processed output count.
+        self.config.extra_settings.setdefault("physical_num_channels", config.num_channels)
+        self.config.extra_settings.setdefault("bipolar_mode", False)
+        self.config.extra_settings.setdefault("data_already_bipolar", False)
+
+    def _is_bipolar_active(self) -> bool:
+        """Return True only when bipolar transform should be applied to incoming data."""
+        return (
+            bool(self.config.extra_settings.get("bipolar_mode", False))
+            and not bool(self.config.extra_settings.get("data_already_bipolar", False))
+        )
+
+    def _get_output_channels(self, input_channels: int) -> int:
+        """Compute output channel count after optional bipolar transform."""
+        if not self._is_bipolar_active() or input_channels < 2:
+            return input_channels
+        if input_channels % 32 == 0:
+            return (input_channels // 32) * 16
+        return input_channels // 2 if input_channels % 2 == 0 else input_channels
+
+    def _normalize_samples_by_channels(self, data: np.ndarray) -> np.ndarray:
+        """Normalize incoming data to shape (samples, channels)."""
+        if data.ndim != 2:
+            return data
+
+        expected_ch = self.physical_num_channels
+        if data.shape[1] == expected_ch:
+            return data
+        if data.shape[0] == expected_ch:
+            return data.T
+
+        # Fallback heuristic for unknown packets: channels are usually the smaller axis.
+        if data.shape[0] < data.shape[1]:
+            return data.T
+        return data
+
+    def _apply_bipolar(self, data: np.ndarray) -> np.ndarray:
+        """Applies bipolar mode (top - bottom) if configured."""
+        if not self._is_bipolar_active():
+            return data
+
+        n = data.shape[1]
+        if n < 2:
+            return data
+
+        bipolar_data = []
+
+        # Preferred layout for Muovi: groups of 32 channels with top(17-32)-bottom(1-16).
+        if n % 32 == 0:
+            for i in range(0, n, 32):
+                top = data[:, i + 16:i + 32]
+                bottom = data[:, i:i + 16]
+                bipolar_data.append(top - bottom)
+
+        # Generic fallback for even channel counts.
+        elif n % 2 == 0:
+            half = n // 2
+            bipolar_data.append(data[:, half:] - data[:, :half])
+
+        if bipolar_data:
+            return np.hstack(bipolar_data).astype(data.dtype, copy=False)
+        return data
+
     @property
     def is_connected(self) -> bool:
         return self._is_connected
@@ -90,7 +153,11 @@ class BaseEMGDevice(QObject):
 
     @property
     def num_channels(self) -> int:
-        return self.config.num_channels
+        return self._get_output_channels(self.physical_num_channels)
+
+    @property
+    def physical_num_channels(self) -> int:
+        return int(self.config.extra_settings.get("physical_num_channels", self.config.num_channels))
 
     @property
     def sampling_rate(self) -> int:
@@ -120,7 +187,9 @@ class BaseEMGDevice(QObject):
         """Get device information."""
         return {
             "device_type": self.config.device_type.name,
-            "num_channels": self.config.num_channels,
+            "num_channels": self.num_channels,
+            "physical_num_channels": self.physical_num_channels,
+            "bipolar_mode": bool(self.config.extra_settings.get("bipolar_mode", False)),
             "sampling_rate": self.config.sampling_rate,
             "is_connected": self._is_connected,
             "is_streaming": self._is_streaming
@@ -183,7 +252,9 @@ if DEVICE_INTERFACES_AVAILABLE:
                 info = self._muovi.get_device_information()
                 if info:
                     self.config.sampling_rate = info.get("sampling_frequency", 2000)
-                    self.config.num_channels = info.get("biosignal_channels", self.config.num_channels)
+                    physical_channels = info.get("biosignal_channels", self.config.num_channels)
+                    self.config.num_channels = physical_channels
+                    self.config.extra_settings["physical_num_channels"] = physical_channels
 
                 # NOW we emit connected(True) because we are actually ready
                 self.connected.emit(True)
@@ -197,13 +268,10 @@ if DEVICE_INTERFACES_AVAILABLE:
             emg_data = self._muovi.extract_emg_data(data, milli_volts=True)
 
             if emg_data is not None and emg_data.size > 0:
-                # Robust shape handling.
-                # We need (samples, channels).
-                # Usually device_interfaces returns (channels, samples).
-                if emg_data.shape[0] == self.config.num_channels:
-                    emg_data = emg_data.T
+                emg_data = self._normalize_samples_by_channels(emg_data)
 
-                self.data_ready.emit(emg_data)
+                bipolar_data = self._apply_bipolar(emg_data)
+                self.data_ready.emit(bipolar_data)
 
         def _configure_for_emg(self):
             """Configure the Muovi for EMG recording."""
@@ -325,7 +393,9 @@ else:
                 info = self._muovi.get_device_information()
                 if info:
                     self.config.sampling_rate = info.get("sampling_frequency", 2000)
-                    self.config.num_channels = info.get("biosignal_channels", self.config.num_channels)
+                    physical_channels = info.get("biosignal_channels", self.config.num_channels)
+                    self.config.num_channels = physical_channels
+                    self.config.extra_settings["physical_num_channels"] = physical_channels
 
                 # FIX 2: NOW we emit connected(True) because we are actually ready
                 print("Device configured successfully. Ready to stream.")
@@ -340,13 +410,10 @@ else:
             emg_data = self._muovi.extract_emg_data(data, milli_volts=True)
 
             if emg_data is not None and emg_data.size > 0:
-                # FIX 3: Robust shape handling.
-                # We need (samples, channels).
-                # Usually device_interfaces returns (channels, samples).
-                if emg_data.shape[0] == self.config.num_channels:
-                    emg_data = emg_data.T
+                emg_data = self._normalize_samples_by_channels(emg_data)
 
-                self.data_ready.emit(emg_data)
+                bipolar_data = self._apply_bipolar(emg_data)
+                self.data_ready.emit(bipolar_data)
 
         def _configure_for_emg(self):
             params = {
@@ -619,9 +686,10 @@ class SyntheticEMGDevice(BaseEMGDevice):
                 if np.random.random() < 0.01:  # 1% chance per frame
                     burst_ch = np.random.randint(0, channels)
                     burst_amp = np.random.uniform(2, 5)
-                data[:, burst_ch] *= burst_amp
+                    data[:, burst_ch] *= burst_amp
 
-        self.data_ready.emit(data)
+        bipolar_data = self._apply_bipolar(data)
+        self.data_ready.emit(bipolar_data)
 
     def _load_session_data(self) -> None:
         """Load session data for replay, including trial info for ground truth."""
@@ -672,10 +740,22 @@ class SyntheticEMGDevice(BaseEMGDevice):
 
         # Load trials from metadata.json (trials are embedded in metadata)
         metadata_path = session_path / "metadata.json"
+        session_meta = {}
         if metadata_path.exists():
             try:
                 with open(metadata_path, 'r') as f:
                     metadata = json.load(f)
+
+                session_meta = metadata.get("metadata", {})
+                custom_meta = session_meta.get("custom_metadata", {}) if isinstance(session_meta, dict) else {}
+                if isinstance(custom_meta, dict):
+                    session_signal_mode = custom_meta.get("signal_mode")
+                    session_bipolar = bool(
+                        custom_meta.get("bipolar_mode", session_signal_mode == "bipolar")
+                    )
+                    self.config.extra_settings["data_already_bipolar"] = session_bipolar
+                    if isinstance(session_signal_mode, str):
+                        self.config.extra_settings["session_signal_mode"] = session_signal_mode
 
                 # Trials are stored directly in the metadata file
                 trials = metadata.get("trials", [])
@@ -694,10 +774,14 @@ class SyntheticEMGDevice(BaseEMGDevice):
                 print(f"Warning: Could not load trial info for ground truth: {e}")
 
         # Validate session data matches device configuration
-        if self._session_data.shape[1] != self.config.num_channels:
-            # Update config to match session data
-            print(f"Note: Adjusting channel count from {self.config.num_channels} to {self._session_data.shape[1]} to match session data")
+        if self._session_data.shape[1] != self.physical_num_channels:
+            # Update physical channel count to match replay data shape.
+            print(
+                f"Note: Adjusting channel count from {self.physical_num_channels} "
+                f"to {self._session_data.shape[1]} to match session data"
+            )
             self.config.num_channels = self._session_data.shape[1]
+            self.config.extra_settings["physical_num_channels"] = self._session_data.shape[1]
 
 
 class DeviceManager:
@@ -768,6 +852,10 @@ class DeviceManager:
                 f"Device type {device_type.name} not yet implemented. "
                 "Available: SYNTHETIC, MUOVI, MUOVI_PLUS"
             )
+
+        if "bipolar_mode" in kwargs:
+            self._device.config.extra_settings["bipolar_mode"] = kwargs["bipolar_mode"]
+        self._device.config.extra_settings.setdefault("physical_num_channels", num_channels)
 
         return self._device
 

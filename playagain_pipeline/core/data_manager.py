@@ -14,7 +14,7 @@ import numpy as np
 
 from playagain_pipeline.core.session import RecordingSession
 from playagain_pipeline.core.gesture import GestureSet
-from playagain_pipeline.models.classifier import EMGFeatureExtractor
+from playagain_pipeline.models.classifier import EMGFeatureExtractor, apply_bad_channel_strategy
 from sklearn.model_selection import train_test_split
 
 
@@ -268,6 +268,7 @@ class DataManager:
         use_per_session_rotation: bool = False,
         feature_config: Optional[Dict[str, Any]] = None,
         bad_channels: Optional[Dict[str, List[int]]] = None,
+        bad_channel_mode: str = "interpolate",
     ) -> Dict[str, Any]:
         """
         Create a machine learning dataset from recording sessions.
@@ -291,7 +292,9 @@ class DataManager:
                 pre-extracting features at dataset creation time. If provided and
                 mode is not 'raw', features are computed and stored as 2D X.
             bad_channels: Optional dict mapping session_id -> list of bad channel
-                indices (0-based). Bad channels are zeroed out per session.
+                indices (0-based).
+            bad_channel_mode: Strategy used for excluded channels.
+                One of: "interpolate" or "zero".
 
         Returns:
             Dictionary containing:
@@ -306,7 +309,19 @@ class DataManager:
             for sid in subject_ids:
                 sessions.extend(self.get_all_sessions(sid))
 
+        bad_channel_mode = (bad_channel_mode or "interpolate").lower()
+        if bad_channel_mode not in {"interpolate", "zero"}:
+            bad_channel_mode = "interpolate"
+
         per_session_rotations = {}  # session_id -> rotation_offset applied
+
+        # Ensure all sessions have compatible channel dimensions.
+        unique_channel_counts = sorted({int(s.metadata.num_channels) for s in sessions})
+        if len(unique_channel_counts) > 1:
+            raise ValueError(
+                "Selected sessions have mixed channel counts "
+                f"{unique_channel_counts}. Build separate datasets for each signal mode."
+            )
 
         # ── Helper: prepare one session's data (rotation, bad-ch, preproc) ──
         def _prepare_session_data(session: RecordingSession):
@@ -320,12 +335,11 @@ class DataManager:
             if hasattr(session.metadata, 'bad_channels') and session.metadata.bad_channels:
                 session_bad_chs = list(set(session_bad_chs) | set(session.metadata.bad_channels))
             if session_bad_chs:
-                n_ch = data.shape[1]
-                for ch_idx in session_bad_chs:
-                    if ch_idx < n_ch:
-                        left = (ch_idx - 1) % n_ch
-                        right = (ch_idx + 1) % n_ch
-                        data[:, ch_idx] = 0.5 * (data[:, left] + data[:, right])
+                data = apply_bad_channel_strategy(
+                    data,
+                    session_bad_chs,
+                    mode=bad_channel_mode,
+                )
 
             # Determine rotation to apply
             if use_per_session_rotation:
@@ -461,6 +475,23 @@ class DataManager:
             ),
             "per_session_rotation": use_per_session_rotation,
             "session_rotation_offsets": per_session_rotations,
+            "bad_channel_mode": (bad_channel_mode or "interpolate"),
+            "signal_modes_used": sorted({
+                (
+                    (s.metadata.custom_metadata.get("signal_mode")
+                     if isinstance(getattr(s.metadata, "custom_metadata", None), dict)
+                     else None)
+                    or (
+                        "bipolar"
+                        if (
+                            isinstance(getattr(s.metadata, "custom_metadata", None), dict)
+                            and s.metadata.custom_metadata.get("bipolar_mode")
+                        )
+                        else "monopolar"
+                    )
+                )
+                for s in sessions
+            }),
             "features_extracted": features_extracted,
             "feature_config": feature_config if feature_config else None,
             "feature_dim": feature_dim,
