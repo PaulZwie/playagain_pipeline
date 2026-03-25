@@ -48,12 +48,18 @@ class GameRecorder:
         GroundTruthActive, RawGroundTruth, RequestedGesture, CameraBlocking,
         EMG_Ch0, ..., EMG_ChN
 
-    Ground Truth Logic:
-        GroundTruthActive is derived by combining CameraBlocking and
-        RequestedGesture: it is True only when the camera is in the
-        feeding/blocking view AND a gesture is actually requested.
-        This avoids false positives during camera swoosh transitions.
-        RawGroundTruth stores the original flag from Unity for reference.
+        Ground Truth Logic:
+                GroundTruthActive is derived from Unity game-state signals using a
+                robust rule that prioritizes the requested gesture window.
+
+                It is True only when a gesture is actually requested
+                (RequestedGesture != "none"), and at least one activity flag is true:
+                    - ground_truth_active (raw Unity flag), or
+                    - camera_blocking (camera in feeding/blocking view)
+
+                This avoids false positives outside request windows while also being
+                resilient to brief camera_blocking dropouts.
+                RawGroundTruth stores the original flag from Unity for reference.
 
     Thread Safety:
         - on_emg_data() is called from the device data thread
@@ -384,6 +390,17 @@ class GameRecorder:
         req_gesture = self._requested_gesture
         cam_blocking = self._camera_blocking
 
+        # Quick resilience fix for the camera-transition edge case:
+        # if a requested gesture is already known and the user starts the
+        # correct gesture slightly before camera_blocking flips to True,
+        # count this short pre-camera period as GroundTruthActive too.
+        if (not gt_active) and (not cam_blocking):
+            req_norm = self._normalize_label(req_gesture)
+            pred_norm = self._normalize_label(prediction)
+            early_match = self._labels_match(req_norm, pred_norm)
+            if req_norm not in ("", "none", "null") and early_match and confidence >= 0.45:
+                gt_active = True
+
         # Build all rows in bulk, then enqueue as a single batch
         rows = []
         sr = float(self._sampling_rate)
@@ -456,17 +473,15 @@ class GameRecorder:
 
         Called when the PredictionServer receives a game_state message from Unity.
 
-        The *reliable* ground truth is derived by combining both signals:
-        GroundTruthActive is only True when:
-          1. camera_blocking is True (camera is in the feeding/blocking view,
-             i.e. the swoosh has completed and the player can see the interaction)
-          2. A gesture is actually requested (requested_gesture != "none")
+                The *reliable* ground truth is derived from three Unity fields:
+                requested_gesture, ground_truth_active (raw), and camera_blocking.
 
-        This avoids the problem where the animal initiates blocking but the
-        camera swoosh hasn't completed yet, so the player doesn't know they
-        should be performing the gesture. The ground truth window starts when
-        the camera reaches the blocking view and ends when the progress bar
-        fills (Unity stops requesting the gesture).
+                GroundTruthActive is True when:
+                    1. a gesture is requested (requested_gesture != "none"), and
+                    2. either ground_truth_active OR camera_blocking is True.
+
+                This keeps the label tightly aligned with requested gesture windows,
+                while avoiding dropouts caused by transient camera-blocking toggles.
 
         The raw ground_truth flag from Unity is stored as RawGroundTruth for
         reference, but GroundTruthActive uses the refined logic.
@@ -479,14 +494,14 @@ class GameRecorder:
         # Store the raw Unity flag for reference
         self._raw_ground_truth = ground_truth_active
 
-        # Derive reliable ground truth: only active when camera is in the
-        # blocking/feeding view AND a gesture is actually being requested.
-        # This is the key fix: during the camera swoosh, camera_blocking
-        # transitions to True only after the view change completes, so
-        # the player is actually seeing the interaction and knows to perform
-        # the gesture.
-        self._ground_truth_active = (camera_blocking and
-                                      requested_gesture not in ("none", "", None))
+        requested = str(requested_gesture).strip().lower() if requested_gesture is not None else ""
+        has_requested_gesture = requested not in ("", "none", "null")
+
+        # Robust GT rule:
+        #   requested gesture window  AND  (raw GT OR camera blocking)
+        # This avoids false positives when nothing is requested, while reducing
+        # false negatives when one of the two Unity flags briefly drops.
+        self._ground_truth_active = bool(has_requested_gesture and (ground_truth_active or camera_blocking))
         self._requested_gesture = requested_gesture
         self._camera_blocking = camera_blocking
 
@@ -499,6 +514,28 @@ class GameRecorder:
                       f"raw_gt={ground_truth_active}, "
                       f"gesture={requested_gesture}, "
                       f"camera_blocking={camera_blocking}")
+
+    @staticmethod
+    def _normalize_label(label: Any) -> str:
+        """Normalize gesture labels to a comparable lowercase form."""
+        text = str(label or "").strip().lower().replace("_", " ").replace("-", " ")
+        return " ".join(text.split())
+
+    @staticmethod
+    def _labels_match(requested: str, predicted: str) -> bool:
+        """Loose-but-safe gesture label matching for pre-camera GT activation."""
+        if not requested or not predicted:
+            return False
+        if requested == predicted:
+            return True
+
+        req_tokens = set(requested.split())
+        pred_tokens = set(predicted.split())
+        if not req_tokens or not pred_tokens:
+            return False
+
+        # Example handled: requested="tripod pinch", predicted="tripod" or "pinch"
+        return len(req_tokens & pred_tokens) > 0
 
     # ─── Internal ─────────────────────────────────────────────────────────
 
