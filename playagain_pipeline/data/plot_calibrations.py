@@ -74,6 +74,20 @@ def load_calibration(path: Path) -> dict:
     return data
 
 
+def calibration_output_stem(path: Path, cal: dict) -> str:
+    """Prefer source session metadata for exported plot names."""
+    if path.name.startswith("reference_calibration"):
+        return path.stem
+    meta = cal.get("metadata") or {}
+    session_id = meta.get("source_session_id")
+    if isinstance(session_id, str) and session_id.strip():
+        base = "calibration_" + session_id.strip()
+        if str(meta.get("signal_mode", "")).lower() == "bipolar":
+            base += "_bipolar"
+        return "".join(ch if ch.isalnum() or ch in "._-" else "-" for ch in base).strip(". ") or path.stem
+    return path.stem
+
+
 def normalize_energy(energy: np.ndarray) -> np.ndarray:
     """L2-normalise, matching the calibrator's _normalize_energy."""
     norm = np.linalg.norm(energy)
@@ -743,38 +757,51 @@ def main():
     if not args.show:
         out_dir.mkdir(parents=True, exist_ok=True)
 
-    # Load reference calibration if present
-    ref_path = cal_dir / "reference_calibration.json"
-    ref_cal  = None
-    if ref_path.exists():
+    # Load reference calibration files (legacy + mode-specific)
+    ref_files = sorted(cal_dir.glob("reference_calibration*.json"))
+    ref_by_mode = {}
+    ref_loaded = {}
+    for ref_path in ref_files:
         try:
             ref_cal = load_calibration(ref_path)
+            mode = str((ref_cal.get("metadata") or {}).get("signal_mode", "monopolar")).lower()
+            ref_by_mode[mode] = ref_cal
+            ref_loaded[ref_path] = ref_cal
             print(f"Loaded reference calibration: {ref_path}")
         except Exception as e:
-            print(f"Warning: could not load reference calibration: {e}")
+            print(f"Warning: could not load reference calibration {ref_path.name}: {e}")
 
-    # Collect all calibration JSON files (sorted chronologically by filename)
-    cal_files = sorted(cal_dir.glob("calibration_*.json")) + \
-                ([ref_path] if ref_path.exists() else [])
+    # Collect all calibration JSON files (legacy and session-based naming).
+    json_files = [p for p in cal_dir.glob("*.json") if not p.name.startswith("reference_calibration")]
+    loaded = []
+    for path in json_files:
+        try:
+            cal = load_calibration(path)
+            loaded.append((path, cal))
+        except Exception as e:
+            print(f"  Skipping {path.name}: {e}")
 
-    if not cal_files:
+    loaded.sort(key=lambda item: item[1].get("created_at", datetime.min))
+    for ref_path in ref_files:
+        ref_cal = ref_loaded.get(ref_path)
+        if ref_cal is not None:
+            loaded.append((ref_path, ref_cal))
+
+    if not loaded:
         sys.exit(f"No calibration JSON files found in {cal_dir}")
 
-    print(f"Found {len(cal_files)} calibration file(s).")
+    print(f"Found {len(loaded)} calibration file(s).")
 
     matplotlib.rcParams.update({
         "font.family": "sans-serif",
         "axes.titlepad": 6,
     })
 
-    for path in cal_files:
-        try:
-            cal = load_calibration(path)
-        except Exception as e:
-            print(f"  Skipping {path.name}: {e}")
-            continue
+    for path, cal in loaded:
 
-        is_ref_file = (path == ref_path)
+        is_ref_file = path.name.startswith("reference_calibration")
+        mode = str((cal.get("metadata") or {}).get("signal_mode", "monopolar")).lower()
+        ref_cal = ref_by_mode.get(mode)
         print(f"  Plotting {path.name}  "
               f"(offset={cal['rotation_offset']}, conf={cal['confidence']:.1%})"
               + ("  [REFERENCE]" if is_ref_file else ""))
@@ -784,7 +811,7 @@ def main():
         if args.show:
             plt.show()
         else:
-            out_path = out_dir / f"{path.stem}.png"
+            out_path = out_dir / f"{calibration_output_stem(path, cal)}.png"
             fig.savefig(out_path, dpi=args.dpi, bbox_inches="tight",
                         facecolor="white")
             print(f"    → saved {out_path}")

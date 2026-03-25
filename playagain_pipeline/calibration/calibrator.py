@@ -32,6 +32,7 @@ import json
 import numpy as np
 from scipy import signal as scipy_signal
 from datetime import datetime
+import re
 
 
 @dataclass
@@ -808,6 +809,38 @@ class AutoCalibrator:
         mode = str(signal_mode or "monopolar").strip().lower()
         return "bipolar" if mode == "bipolar" else "monopolar"
 
+    @staticmethod
+    def _sanitize_name_component(value: Any) -> str:
+        safe = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "-", str(value or "")).strip().rstrip(". ")
+        return safe or "unnamed"
+
+    def _build_calibration_path(
+        self,
+        *,
+        session_name: Optional[str],
+        signal_mode: str,
+        created_at: Optional[datetime] = None,
+    ) -> Path:
+        mode = self._normalize_signal_mode(signal_mode)
+        if session_name:
+            stem = f"calibration_{self._sanitize_name_component(session_name)}"
+            if mode == "bipolar":
+                stem = f"{stem}_{mode}"
+        else:
+            stamp = (created_at or datetime.now()).strftime("%Y%m%d_%H%M%S")
+            stem = f"calibration_{stamp}"
+
+        candidate = self.data_dir / f"{stem}.json"
+        if not candidate.exists():
+            return candidate
+
+        idx = 2
+        while True:
+            collision = self.data_dir / f"{stem}_{idx}.json"
+            if not collision.exists():
+                return collision
+            idx += 1
+
     def _reference_path(self, signal_mode: str) -> Path:
         mode = self._normalize_signal_mode(signal_mode)
         return self.data_dir / f"reference_calibration_{mode}.json"
@@ -957,6 +990,8 @@ class AutoCalibrator:
         """
         all_data = session.get_data()
         signal_mode = self._extract_session_signal_mode(session)
+        session_name = getattr(session.metadata, "session_id", None)
+        subject_id = getattr(session.metadata, "subject_id", None)
         self._load_reference_for_mode(signal_mode)
 
         # ── Try dedicated calibration-sync trials first ──────────────────────
@@ -994,8 +1029,18 @@ class AutoCalibrator:
                     plot_path=plot_path,
                 )
                 self._current_calibration = result
-                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                result.save(self.data_dir / f"calibration_{timestamp}.json")
+                result.metadata.update({
+                    "signal_mode": signal_mode,
+                    "source_session_id": session_name,
+                    "source_subject_id": subject_id,
+                })
+                result.save(
+                    self._build_calibration_path(
+                        session_name=session_name,
+                        signal_mode=signal_mode,
+                        created_at=result.created_at,
+                    )
+                )
                 return result
 
         # ── Fallback: use all valid gesture trials (older sessions) ──────────
@@ -1021,8 +1066,18 @@ class AutoCalibrator:
             plot_path=plot_path,
         )
         self._current_calibration = result
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        result.save(self.data_dir / f"calibration_{timestamp}.json")
+        result.metadata.update({
+            "signal_mode": signal_mode,
+            "source_session_id": session_name,
+            "source_subject_id": subject_id,
+        })
+        result.save(
+            self._build_calibration_path(
+                session_name=session_name,
+                signal_mode=signal_mode,
+                created_at=result.created_at,
+            )
+        )
         return result
 
     @property
