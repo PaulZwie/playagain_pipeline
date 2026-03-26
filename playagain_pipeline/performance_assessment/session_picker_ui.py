@@ -29,7 +29,7 @@ WORKSPACE_ROOT = PACKAGE_ROOT.parent
 if str(WORKSPACE_ROOT) not in sys.path:
     sys.path.insert(0, str(WORKSPACE_ROOT))
 
-from playagain_pipeline.core.data_manager_old import DataManager
+from playagain_pipeline.core.data_manager import DataManager
 
 
 # ═══════════════════════════════════════════════════════════════════════════

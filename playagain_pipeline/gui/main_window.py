@@ -22,23 +22,30 @@ import numpy as np
 from PySide6.QtCore import Qt, Slot, QTimer, QThread, Signal, QMutex, QMutexLocker
 from PySide6.QtGui import QFont, QAction
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QPushButton, QComboBox,
-                               QLineEdit, QLabel, QGroupBox, QFormLayout, QSpinBox, QMessageBox, QFileDialog, QTextEdit,
+                               QLineEdit, QLabel, QGroupBox, QFormLayout, QSpinBox, QDoubleSpinBox, QMessageBox, QFileDialog, QTextEdit,
                                QSplitter, QStatusBar, QListWidget, QScrollArea, QCheckBox,
                                QGridLayout, QApplication, QDialog, QListWidgetItem)
 
 from playagain_pipeline.calibration.calibrator import AutoCalibrator
 from playagain_pipeline.config.config import get_default_config, PipelineConfig
 from playagain_pipeline.core.data_manager import DataManager
-from playagain_pipeline.core.gesture import (create_default_gesture_set)
+from playagain_pipeline.core.gesture import GestureSet, create_default_gesture_set, create_single_gesture_set
 from playagain_pipeline.core.session import RecordingSession
 from playagain_pipeline.devices.emg_device import (DeviceManager, DeviceType, SyntheticEMGDevice)
 from playagain_pipeline.gui.widgets.emg_plot import EMGPlotWidget
 from playagain_pipeline.gui.widgets.performance_tab import PerformanceReviewTab
 from playagain_pipeline.gui.widgets.protocol_widget import ProtocolWidget
 from playagain_pipeline.models.classifier import ModelManager, BaseClassifier, apply_bad_channel_strategy
-from playagain_pipeline.protocols.protocol import (RecordingProtocol, ProtocolPhase,
-                                                   create_quick_protocol, create_standard_protocol,
-                                                   create_extended_protocol)
+from playagain_pipeline.protocols.protocol import (
+    RecordingProtocol,
+    ProtocolPhase,
+    create_quick_protocol,
+    create_standard_protocol,
+    create_extended_protocol,
+    create_pinch_protocol,
+    create_tripod_protocol,
+    create_fist_protocol,
+)
 from playagain_pipeline.prediction_server import PredictionServer, PredictionSmoother
 from playagain_pipeline.game_recorder import GameRecorder
 
@@ -185,6 +192,8 @@ class MainWindow(QMainWindow):
         self._current_session: Optional[RecordingSession] = None
         self._current_protocol: Optional[RecordingProtocol] = None
         self._current_model: Optional[BaseClassifier] = None
+        self._recording_mode: str = "preset"
+        self._manual_active: bool = False
 
         # Prediction state
         self._prediction_buffer: Optional[np.ndarray] = None
@@ -463,7 +472,8 @@ class MainWindow(QMainWindow):
         gesture_layout = QFormLayout(gesture_group)
 
         self.gesture_set_combo = QComboBox()
-        self.gesture_set_combo.addItems(["Default (4 gestures)", "Custom..."])
+        self.gesture_set_combo.addItems(["Auto (from protocol)"])
+        self.gesture_set_combo.setEnabled(False)
         gesture_layout.addRow("Gesture Set:", self.gesture_set_combo)
 
         scroll_layout.addWidget(gesture_group)
@@ -472,14 +482,82 @@ class MainWindow(QMainWindow):
         protocol_group = QGroupBox("Protocol")
         protocol_layout = QFormLayout(protocol_group)
 
+        self.recording_mode_combo = QComboBox()
+        self.recording_mode_combo.addItems([
+            "Preset Protocol",
+            "Custom Protocol",
+            "Manual Toggle",
+        ])
+        self.recording_mode_combo.currentIndexChanged.connect(self._on_recording_mode_changed)
+        protocol_layout.addRow("Mode:", self.recording_mode_combo)
+
         self.protocol_combo = QComboBox()
         self.protocol_combo.addItems([
             "Quick (3 reps)",
             "Standard (5 reps)",
             "Extended (10 reps)",
-            "Calibration Setup"
+            "Pinch (single gesture)",
+            "Tripod (single gesture)",
+            "Fist (single gesture)",
         ])
         protocol_layout.addRow("Protocol:", self.protocol_combo)
+
+        self.custom_settings_group = QGroupBox("Custom Settings")
+        custom_settings_layout = QVBoxLayout(self.custom_settings_group)
+
+        self.custom_gesture_group = QGroupBox("Custom Gestures")
+        custom_gesture_layout = QVBoxLayout(self.custom_gesture_group)
+        self.custom_calibration_cb = QCheckBox("Calibration sync once (waveout)")
+        self.custom_calibration_cb.setChecked(True)
+        self.custom_fist_cb = QCheckBox("Fist")
+        self.custom_fist_cb.setChecked(True)
+        self.custom_tripod_cb = QCheckBox("Tripod")
+        self.custom_tripod_cb.setChecked(True)
+        self.custom_pinch_cb = QCheckBox("Pinch")
+        self.custom_pinch_cb.setChecked(True)
+        custom_gesture_layout.addWidget(self.custom_calibration_cb)
+        custom_gesture_layout.addWidget(self.custom_fist_cb)
+        custom_gesture_layout.addWidget(self.custom_tripod_cb)
+        custom_gesture_layout.addWidget(self.custom_pinch_cb)
+        custom_settings_layout.addWidget(self.custom_gesture_group)
+
+        custom_timing_layout = QFormLayout()
+
+        self.custom_hold_spin = QDoubleSpinBox()
+        self.custom_hold_spin.setRange(0.5, 30.0)
+        self.custom_hold_spin.setValue(8.0)
+        self.custom_hold_spin.setSingleStep(0.5)
+        self.custom_hold_spin.setSuffix(" s")
+        custom_timing_layout.addRow("Gesture duration:", self.custom_hold_spin)
+
+        self.custom_rest_spin = QDoubleSpinBox()
+        self.custom_rest_spin.setRange(0.5, 30.0)
+        self.custom_rest_spin.setValue(5.0)
+        self.custom_rest_spin.setSingleStep(0.5)
+        self.custom_rest_spin.setSuffix(" s")
+        custom_timing_layout.addRow("Rest duration:", self.custom_rest_spin)
+
+        self.custom_reps_spin = QSpinBox()
+        self.custom_reps_spin.setRange(1, 100)
+        self.custom_reps_spin.setValue(5)
+        custom_timing_layout.addRow("Repetitions:", self.custom_reps_spin)
+        custom_settings_layout.addLayout(custom_timing_layout)
+        protocol_layout.addRow(self.custom_settings_group)
+
+        self.manual_settings_group = QGroupBox("Manual Labeling")
+        manual_settings_layout = QFormLayout(self.manual_settings_group)
+
+        self.manual_gesture_combo = QComboBox()
+        self.manual_gesture_combo.addItems(["fist", "tripod", "pinch"])
+        self.manual_gesture_combo.currentTextChanged.connect(self._on_manual_gesture_selection_changed)
+        manual_settings_layout.addRow("Gesture:", self.manual_gesture_combo)
+
+        self.manual_toggle_btn = QPushButton("Mark Gesture Active")
+        self.manual_toggle_btn.setCheckable(True)
+        self.manual_toggle_btn.setEnabled(False)
+        self.manual_toggle_btn.toggled.connect(self._on_manual_toggle_changed)
+        manual_settings_layout.addRow("Ground Truth Toggle:", self.manual_toggle_btn)
+        protocol_layout.addRow(self.manual_settings_group)
 
         scroll_layout.addWidget(protocol_group)
 
@@ -505,7 +583,126 @@ class MainWindow(QMainWindow):
         scroll.setWidget(scroll_content)
         layout.addWidget(scroll)
 
+        self._on_recording_mode_changed()
+
         return tab
+
+    def _on_recording_mode_changed(self):
+        """Update protocol controls based on selected recording mode."""
+        mode_text = self.recording_mode_combo.currentText() if hasattr(self, "recording_mode_combo") else "Preset Protocol"
+        self._recording_mode = "preset"
+        if mode_text.startswith("Custom"):
+            self._recording_mode = "custom"
+        elif mode_text.startswith("Manual"):
+            self._recording_mode = "manual"
+
+        is_preset = self._recording_mode == "preset"
+        is_custom = self._recording_mode == "custom"
+        is_manual = self._recording_mode == "manual"
+
+        self.protocol_combo.setVisible(is_preset)
+        self.custom_settings_group.setVisible(is_custom)
+        self.manual_settings_group.setVisible(is_manual)
+        self._update_manual_combo_enabled_state()
+
+    def _build_manual_gesture_set(self) -> GestureSet:
+        """Create a manual-mode gesture set that supports switching targets mid-session."""
+        base_set = create_default_gesture_set()
+        manual_set = GestureSet(name="manual")
+        manual_set.add_gesture(base_set.get_gesture("rest"))
+        for gesture_name in ["fist", "tripod", "pinch"]:
+            manual_set.add_gesture(base_set.get_gesture(gesture_name))
+        return manual_set
+
+    def _update_manual_combo_enabled_state(self):
+        """Allow manual target changes only while manual mode is in rest."""
+        if not hasattr(self, "manual_gesture_combo"):
+            return
+
+        mode_text = self.recording_mode_combo.currentText() if hasattr(self, "recording_mode_combo") else ""
+        is_manual_mode = self._recording_mode == "manual" or mode_text.startswith("Manual")
+
+        if not is_manual_mode:
+            self.manual_gesture_combo.setEnabled(True)
+            return
+
+        session_active = self._current_session is not None and self._current_session.is_recording
+        if not session_active:
+            self.manual_gesture_combo.setEnabled(True)
+            return
+
+        self.manual_gesture_combo.setEnabled(not self._manual_active)
+
+    @Slot(str)
+    def _on_manual_gesture_selection_changed(self, gesture_name: str):
+        """Log manual target changes while recording so the operator sees the next target."""
+        if self._recording_mode == "manual" and self._current_session and self._current_session.is_recording and not self._manual_active:
+            self._log(f"Next manual gesture set to: {gesture_name.strip().lower()}")
+
+    def _build_custom_gesture_set(self) -> Optional[GestureSet]:
+        """Build a custom gesture set from selected checkboxes."""
+        selected_names = []
+        if self.custom_fist_cb.isChecked():
+            selected_names.append("fist")
+        if self.custom_tripod_cb.isChecked():
+            selected_names.append("tripod")
+        if self.custom_pinch_cb.isChecked():
+            selected_names.append("pinch")
+
+        if not selected_names:
+            return None
+
+        base_set = create_default_gesture_set()
+        custom_set = GestureSet(name="custom")
+        custom_set.add_gesture(base_set.get_gesture("rest"))
+        for name in selected_names:
+            custom_set.add_gesture(base_set.get_gesture(name))
+        return custom_set
+
+    def _build_custom_protocol_config(self):
+        """Create protocol config from custom timing and repetition controls."""
+        from playagain_pipeline.protocols.protocol import ProtocolConfig
+
+        return ProtocolConfig(
+            name="custom",
+            description="User-defined custom protocol",
+            hold_time=float(self.custom_hold_spin.value()),
+            rest_time=float(self.custom_rest_spin.value()),
+            repetitions_per_gesture=int(self.custom_reps_spin.value()),
+            randomize_order=False,
+            include_calibration_sync=self.custom_calibration_cb.isChecked(),
+        )
+
+    def _start_manual_rest_trial(self):
+        """Ensure manual mode is in rest state when no gesture is toggled."""
+        if self._current_session:
+            self._current_session.start_trial("rest")
+
+    @Slot(bool)
+    def _on_manual_toggle_changed(self, is_active: bool):
+        """Toggle manual ground-truth between selected gesture and rest."""
+        if not self._current_session:
+            return
+
+        gesture_name = self.manual_gesture_combo.currentText().strip().lower()
+        if not gesture_name:
+            return
+
+        self._current_session.end_trial()
+        if is_active:
+            self._manual_active = True
+            self._current_session.start_trial(gesture_name)
+            self.manual_toggle_btn.setText("Switch to Rest")
+            self.manual_gesture_combo.setEnabled(False)
+            self._log(f"Manual label active: {gesture_name}")
+        else:
+            self._manual_active = False
+            self._start_manual_rest_trial()
+            self.manual_toggle_btn.setText("Mark Gesture Active")
+            self.manual_gesture_combo.setEnabled(True)
+            self._log("Manual label active: rest")
+
+        self._update_manual_combo_enabled_state()
 
     def _create_calibration_tab(self) -> QWidget:
         """Create the calibration tab."""
@@ -1540,24 +1737,55 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", "Participant info is required before starting a new participant.")
             return
 
-        # Create gesture set
-        gesture_set = create_default_gesture_set()
+        protocol_config = None
+        self._current_protocol = None
 
-        # Create protocol
-        if "Quick" in self.protocol_combo.currentText():
-            protocol_config = create_quick_protocol()
-        elif "Extended" in self.protocol_combo.currentText():
-            protocol_config = create_extended_protocol()
+        if self._recording_mode == "preset":
+            selected_protocol = self.protocol_combo.currentText()
+            if selected_protocol.startswith("Quick"):
+                gesture_set = create_default_gesture_set()
+                protocol_config = create_quick_protocol()
+            elif selected_protocol.startswith("Standard"):
+                gesture_set = create_default_gesture_set()
+                protocol_config = create_standard_protocol()
+            elif selected_protocol.startswith("Extended"):
+                gesture_set = create_default_gesture_set()
+                protocol_config = create_extended_protocol()
+            elif selected_protocol.startswith("Pinch"):
+                gesture_set = create_single_gesture_set("pinch")
+                protocol_config = create_pinch_protocol()
+            elif selected_protocol.startswith("Tripod"):
+                gesture_set = create_single_gesture_set("tripod")
+                protocol_config = create_tripod_protocol()
+            elif selected_protocol.startswith("Fist"):
+                gesture_set = create_single_gesture_set("fist")
+                protocol_config = create_fist_protocol()
+            else:
+                QMessageBox.warning(self, "Warning", f"Unknown protocol selected: {selected_protocol}")
+                return
+            self._current_protocol = RecordingProtocol(gesture_set, protocol_config)
+        elif self._recording_mode == "custom":
+            gesture_set = self._build_custom_gesture_set()
+            if gesture_set is None:
+                QMessageBox.warning(self, "Warning", "Please select at least one active gesture for custom protocol.")
+                return
+            protocol_config = self._build_custom_protocol_config()
+            self._current_protocol = RecordingProtocol(gesture_set, protocol_config)
         else:
-            protocol_config = create_standard_protocol()
-
-        self._current_protocol = RecordingProtocol(gesture_set, protocol_config)
+            selected_gesture = self.manual_gesture_combo.currentText().strip().lower()
+            if not selected_gesture:
+                QMessageBox.warning(self, "Warning", "Please select a manual gesture.")
+                return
+            gesture_set = self._build_manual_gesture_set()
 
         # Create session
         # Format: YYYY-MM-DD_HH-MM-SS_Nrep (Windows-safe)
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-        n_rep = protocol_config.repetitions_per_gesture
-        session_id = f"{timestamp}_{n_rep}rep"
+        if protocol_config is not None:
+            n_rep = protocol_config.repetitions_per_gesture
+            session_id = f"{timestamp}_{n_rep}rep"
+        else:
+            session_id = f"{timestamp}_manual"
 
         # Determine actual number of channels (all channels kept; strategy applied in stream path)
         bad_channels = self._get_excluded_channels()
@@ -1565,7 +1793,8 @@ class MainWindow(QMainWindow):
 
         self._current_session = RecordingSession(session_id=session_id, subject_id=subject_id,
             device_name=device.config.device_type.name, num_channels=actual_channels,
-            sampling_rate=device.sampling_rate, gesture_set=gesture_set, protocol_name=protocol_config.name)
+            sampling_rate=device.sampling_rate, gesture_set=gesture_set,
+            protocol_name=(protocol_config.name if protocol_config else "manual"))
         self._current_session.metadata.notes = self.session_notes_edit.text()
         # Store bad channels in session metadata from the start
         self._current_session.metadata.bad_channels = bad_channels
@@ -1573,18 +1802,54 @@ class MainWindow(QMainWindow):
         signal_mode = "bipolar" if self.bipolar_mode_cb.isChecked() else "monopolar"
         self._current_session.metadata.custom_metadata["bipolar_mode"] = (signal_mode == "bipolar")
         self._current_session.metadata.custom_metadata["signal_mode"] = signal_mode
+        self._current_session.metadata.custom_metadata["recording_mode"] = self._recording_mode
         if participant_info:
             self._current_session.metadata.custom_metadata["participant_info"] = participant_info
 
+        if self._recording_mode == "custom":
+            self._current_session.metadata.custom_metadata["custom_protocol"] = {
+                "include_calibration_sync": self.custom_calibration_cb.isChecked(),
+                "gestures": [
+                    name for name, selected in {
+                        "fist": self.custom_fist_cb.isChecked(),
+                        "tripod": self.custom_tripod_cb.isChecked(),
+                        "pinch": self.custom_pinch_cb.isChecked(),
+                    }.items() if selected
+                ],
+                "hold_time": float(self.custom_hold_spin.value()),
+                "rest_time": float(self.custom_rest_spin.value()),
+                "repetitions": int(self.custom_reps_spin.value()),
+            }
+        if self._recording_mode == "manual":
+            self._current_session.metadata.custom_metadata["manual_gesture"] = self.manual_gesture_combo.currentText().strip().lower()
+
         # Setup protocol widget
-        self.protocol_widget.set_protocol(self._current_protocol)
+        if self._current_protocol is not None:
+            self.protocol_widget.set_protocol(self._current_protocol)
 
         # Start recording
         self._current_session.start_recording()
-        self.protocol_widget.start()
+        if self._current_protocol is not None:
+            self.protocol_widget.start()
+        else:
+            self.protocol_widget.stop()
+            self._manual_active = False
+            self.manual_toggle_btn.blockSignals(True)
+            self.manual_toggle_btn.setChecked(False)
+            self.manual_toggle_btn.setText("Mark Gesture Active")
+            self.manual_toggle_btn.blockSignals(False)
+            self.manual_toggle_btn.setEnabled(True)
+            self.manual_gesture_combo.setEnabled(True)
+            self._start_manual_rest_trial()
+            self._log("Manual recording started. Use the toggle button to mark gesture vs. rest.")
 
         self.start_recording_btn.setEnabled(False)
         self.stop_recording_btn.setEnabled(True)
+        self.recording_mode_combo.setEnabled(False)
+        self.protocol_combo.setEnabled(False)
+        self.custom_settings_group.setEnabled(False)
+        self.manual_settings_group.setEnabled(True)
+        self._update_manual_combo_enabled_state()
         self._log(f"Started recording session: {session_id}")
 
     @Slot()
@@ -1593,6 +1858,14 @@ class MainWindow(QMainWindow):
         if self._current_session:
             self._current_session.stop_recording()
             self.protocol_widget.stop()
+            self._current_protocol = None
+            self._manual_active = False
+            if hasattr(self, "manual_toggle_btn"):
+                self.manual_toggle_btn.blockSignals(True)
+                self.manual_toggle_btn.setChecked(False)
+                self.manual_toggle_btn.setText("Mark Gesture Active")
+                self.manual_toggle_btn.blockSignals(False)
+                self.manual_toggle_btn.setEnabled(False)
 
             # Store bad channels in session metadata
             bad_channels = self._get_excluded_channels()
@@ -1630,6 +1903,10 @@ class MainWindow(QMainWindow):
 
         self.start_recording_btn.setEnabled(True)
         self.stop_recording_btn.setEnabled(False)
+        self.recording_mode_combo.setEnabled(True)
+        self.protocol_combo.setEnabled(True)
+        self.custom_settings_group.setEnabled(True)
+        self._update_manual_combo_enabled_state()
 
     @Slot(object)
     def _on_step_completed(self, step):

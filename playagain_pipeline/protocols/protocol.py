@@ -71,6 +71,7 @@ class ProtocolConfig:
     # Recording parameters
     record_during_cue: bool = False
     record_during_release: bool = False
+    include_calibration_sync: bool = True
 
     # Optional callbacks (not serialized)
     pre_trial_callback: Optional[Callable] = field(default=None, repr=False)
@@ -88,7 +89,8 @@ class ProtocolConfig:
             "repetitions_per_gesture": self.repetitions_per_gesture,
             "randomize_order": self.randomize_order,
             "record_during_cue": self.record_during_cue,
-            "record_during_release": self.record_during_release
+            "record_during_release": self.record_during_release,
+            "include_calibration_sync": self.include_calibration_sync,
         }
 
     @classmethod
@@ -141,37 +143,38 @@ class RecordingProtocol:
             is_recording=False
         ))
 
-        # Add a short rest before the calibration sync so the first cue does not
-        # start abruptly. Keep startup duration close to previous behavior by
-        # taking this time from the calibration-sync step.
-        pre_sync_rest = min(1.0, max(0.0, self.config.rest_time * 0.3))
-        sync_duration = self.config.rest_time - pre_sync_rest
+        if self.config.include_calibration_sync:
+            # Add a short rest before the calibration sync so the first cue does not
+            # start abruptly. Keep startup duration close to previous behavior by
+            # taking this time from the calibration-sync step.
+            pre_sync_rest = min(1.0, max(0.0, self.config.rest_time * 0.3))
+            sync_duration = self.config.rest_time - pre_sync_rest
 
-        if sync_duration <= 0:
-            pre_sync_rest = 0.0
-            sync_duration = self.config.rest_time
+            if sync_duration <= 0:
+                pre_sync_rest = 0.0
+                sync_duration = self.config.rest_time
 
-        if pre_sync_rest > 0:
+            if pre_sync_rest > 0:
+                self._steps.append(ProtocolStep(
+                    phase=ProtocolPhase.REST,
+                    gesture=None,
+                    duration=pre_sync_rest,
+                    message="Rest. Calibration starts next.",
+                    is_recording=False,
+                ))
+
+            # Calibration sync gesture (waveout) — recorded once per session.
+            # This is NOT part of the gesture set and will NOT be used for model
+            # training. It gives the rotation-detection calibrator a clean,
+            # high-quality waveout signal regardless of which gesture set the
+            # session was recorded with.
             self._steps.append(ProtocolStep(
-                phase=ProtocolPhase.REST,
+                phase=ProtocolPhase.CALIBRATION_SYNC,
                 gesture=None,
-                duration=pre_sync_rest,
-                message="Rest. Calibration starts next.",
-                is_recording=False,
+                duration=sync_duration,
+                message="Calibration sync: WAVE OUT now (move wrist clearly outward)",
+                is_recording=True,
             ))
-
-        # Calibration sync gesture (waveout) — recorded once per session.
-        # This is NOT part of the gesture set and will NOT be used for model
-        # training. It gives the rotation-detection calibrator a clean,
-        # high-quality waveout signal regardless of which gesture set the
-        # session was recorded with.
-        self._steps.append(ProtocolStep(
-            phase=ProtocolPhase.CALIBRATION_SYNC,
-            gesture=None,
-            duration=sync_duration,
-            message="Calibration sync: WAVE OUT now (move wrist clearly outward)",
-            is_recording=True,
-        ))
 
         # Add a rest phase before the first normal gesture
         self._steps.append(ProtocolStep(
@@ -383,4 +386,44 @@ def create_calibration_protocol() -> ProtocolConfig:
         rest_time=settings.cal_rest_time,
         repetitions_per_gesture=settings.cal_repetitions,
         randomize_order=settings.cal_randomize
+    )
+
+
+def _create_single_gesture_protocol(name: str, description: str) -> ProtocolConfig:
+    """Create a single-gesture recording protocol with longer hold/rest timing."""
+    settings = get_default_config().protocol
+    return ProtocolConfig(
+        name=name,
+        description=description,
+        preparation_time=settings.std_preparation_time,
+        cue_time=settings.std_cue_time,
+        hold_time=max(settings.std_hold_time, 10.0),
+        release_time=settings.std_release_time,
+        rest_time=max(settings.std_rest_time, 7.0),
+        repetitions_per_gesture=settings.std_repetitions,
+        randomize_order=False
+    )
+
+
+def create_pinch_protocol() -> ProtocolConfig:
+    """Create a single-gesture protocol for pinch recordings."""
+    return _create_single_gesture_protocol(
+        name="pinch",
+        description="Single-gesture protocol for pinch recording"
+    )
+
+
+def create_tripod_protocol() -> ProtocolConfig:
+    """Create a single-gesture protocol for tripod recordings."""
+    return _create_single_gesture_protocol(
+        name="tripod",
+        description="Single-gesture protocol for tripod recording"
+    )
+
+
+def create_fist_protocol() -> ProtocolConfig:
+    """Create a single-gesture protocol for fist recordings."""
+    return _create_single_gesture_protocol(
+        name="fist",
+        description="Single-gesture protocol for fist recording"
     )

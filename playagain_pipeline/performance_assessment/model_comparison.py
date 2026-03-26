@@ -51,7 +51,7 @@ from sklearn.metrics import (
 )
 from sklearn.model_selection import StratifiedKFold
 
-from playagain_pipeline.core.data_manager_old import DataManager
+from playagain_pipeline.core.data_manager import DataManager
 from playagain_pipeline.models.classifier import ModelManager
 from playagain_pipeline.performance_assessment.session_picker_ui import pick_sessions
 

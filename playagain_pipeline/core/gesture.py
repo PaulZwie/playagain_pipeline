@@ -240,6 +240,21 @@ def create_default_gesture_set() -> GestureSet:
     return gesture_set
 
 
+def create_single_gesture_set(gesture_name: str) -> GestureSet:
+    """Create a gesture set that contains only rest and one target gesture."""
+    base_set = create_default_gesture_set()
+    rest_gesture = base_set.get_gesture("rest")
+    target_gesture = base_set.get_gesture(gesture_name)
+
+    if rest_gesture is None or target_gesture is None:
+        raise ValueError(f"Unknown gesture for single-gesture set: {gesture_name}")
+
+    gesture_set = GestureSet(name=f"single_{gesture_name}")
+    gesture_set.add_gesture(rest_gesture)
+    gesture_set.add_gesture(target_gesture)
+    return gesture_set
+
+
 def create_calibration_gesture_set() -> GestureSet:
     """
     Create a gesture set specifically for calibration.
