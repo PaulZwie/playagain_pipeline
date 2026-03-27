@@ -6,7 +6,7 @@ comprehensive diagnostic figure for each one.
 
 Usage
 -----
-    python plot_calibrations.py                          # uses ./calibrations/
+    python plot_calibrations.py                          # uses ../calibrations/
     python plot_calibrations.py /path/to/calibrations/
     python plot_calibrations.py /path/to/calibrations/ --out ./plots/
     python plot_calibrations.py /path/to/calibrations/ --show
@@ -728,12 +728,17 @@ def build_figure(cal: dict, ref_cal: dict | None, is_reference_file: bool) -> pl
 # ── CLI entry point ────────────────────────────────────────────────────────────
 
 def main():
+    default_cal_dir = Path(__file__).resolve().parent.parent / "calibrations"
+
     parser = argparse.ArgumentParser(
         description="Plot diagnostic figures for all calibration JSON files."
     )
     parser.add_argument(
-        "cal_dir", nargs="?", default="calibrations",
-        help="Directory containing calibration JSON files (default: ./calibrations/)",
+        "cal_dir", nargs="?", default=None,
+        help=(
+            "Directory containing calibration JSON files "
+            f"(default: {default_cal_dir})"
+        ),
     )
     parser.add_argument(
         "--out", default=None,
@@ -749,7 +754,7 @@ def main():
     )
     args = parser.parse_args()
 
-    cal_dir = Path(args.cal_dir)
+    cal_dir = Path(args.cal_dir).expanduser() if args.cal_dir else default_cal_dir
     if not cal_dir.exists():
         sys.exit(f"Error: calibration directory not found: {cal_dir}")
 

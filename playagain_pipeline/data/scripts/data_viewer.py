@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import shutil
 import sys
 from dataclasses import asdict, dataclass, field
@@ -23,11 +24,23 @@ import numpy as np
 import pandas as pd
 from scipy import signal as scipy_signal
 
+# Allow running this file directly via `python data_viewer.py`.
+WORKSPACE_ROOT = Path(__file__).resolve().parents[3]
+if str(WORKSPACE_ROOT) not in sys.path:
+    sys.path.insert(0, str(WORKSPACE_ROOT))
+
+from playagain_pipeline.core.gesture import Gesture, GestureCategory, GestureSet, create_default_gesture_set
+from playagain_pipeline.core.session import RecordingSession, RecordingTrial
+
 # Keep a non-interactive default backend for headless mode; GUI mode switches to QtAgg.
 matplotlib.use("Agg")
 
 
-SUPPORTED_TYPES = ("sessions", "game_recordings")
+UNITY_SOURCE_TYPE = "unity_recordings"
+UNITY_DEFAULT_ROOT = Path(
+    "/Users/paul/Coding_Projects/PlayAgain-Game2/playagain-game-2/RecordedData/Users"
+)
+SUPPORTED_TYPES = ("sessions", "game_recordings", UNITY_SOURCE_TYPE)
 
 
 @dataclass
@@ -44,6 +57,7 @@ class TransformConfig:
     artifact_strength: float = 1.0
     clip_enabled: bool = False
     clip_mad_mult: float = 8.0
+    normalize_enabled: bool = False
     rectify_enabled: bool = False
     rms_envelope_enabled: bool = False
     rms_window_ms: float = 80.0
@@ -105,12 +119,33 @@ def _numeric_signal_from_columns(df: pd.DataFrame, cols: list[str]) -> np.ndarra
     return values.to_numpy(dtype=float)
 
 
+def _is_emg_csv_candidate(path: Path) -> bool:
+    name = path.name.lower()
+    parent = path.parent.name.lower()
+    if "emg" in name or "emg" in parent:
+        return True
+    try:
+        header = path.open("r", encoding="utf-8", errors="ignore").readline().lower()
+    except OSError:
+        return False
+    return "emg_ch" in header or "ch_" in header
+
+
 def discover_recordings(data_root: Path, source_type: str) -> list[Path]:
     if source_type not in SUPPORTED_TYPES:
         raise ValueError(f"Unsupported source type '{source_type}'.")
-    root = data_root / source_type
+    root = data_root if source_type == UNITY_SOURCE_TYPE else data_root / source_type
     if not root.exists():
         return []
+
+    if source_type == UNITY_SOURCE_TYPE:
+        if root.is_file() and root.suffix.lower() == ".csv":
+            return [root] if _is_emg_csv_candidate(root) else []
+        csv_files: list[Path] = []
+        for candidate in root.rglob("*.csv"):
+            if _is_emg_csv_candidate(candidate):
+                csv_files.append(candidate)
+        return sorted(csv_files)
 
     required_file = "metadata.json" if source_type == "sessions" else "config.json"
     paths: list[Path] = []
@@ -213,25 +248,8 @@ def _load_game_bundle(path: Path) -> DataBundle:
     else:
         timestamp = np.arange(signal.shape[0], dtype=float) / max(1e-9, sampling_rate)
 
-    spans: list[dict[str, Any]] = []
-    if "GroundTruthActive" in table.columns:
-        active = pd.to_numeric(table["GroundTruthActive"], errors="coerce").fillna(0).to_numpy(int)
-        labels = table.get("RequestedGesture", pd.Series(["unknown"] * len(table))).astype(str).to_numpy()
-        starts = np.flatnonzero(np.r_[False, np.diff(active) > 0])
-        ends = np.flatnonzero(np.r_[np.diff(active) < 0, False])
-        if active.size and active[0] > 0:
-            starts = np.r_[0, starts]
-        if active.size and active[-1] > 0:
-            ends = np.r_[ends, active.size - 1]
-        for st, en in zip(starts, ends, strict=False):
-            spans.append(
-                {
-                    "start": float(timestamp[st]),
-                    "end": float(timestamp[en]),
-                    "label": labels[st],
-                    "trial_type": "ground_truth_active",
-                }
-            )
+    labels, inference_meta = _infer_sample_labels(table)
+    spans = _labels_to_spans(labels, timestamp)
 
     return DataBundle(
         source_type="game_recordings",
@@ -242,7 +260,51 @@ def _load_game_bundle(path: Path) -> DataBundle:
         full_table=table,
         timestamp=timestamp,
         annotation_spans=spans,
-        metadata=config,
+        metadata={"recording_config": config, "label_inference": inference_meta},
+    )
+
+
+def _load_unity_bundle(path: Path) -> DataBundle:
+    if path.is_dir():
+        candidates = discover_recordings(path, UNITY_SOURCE_TYPE)
+        if not candidates:
+            raise FileNotFoundError(f"No EMG CSV file found in {path}")
+        csv_path = candidates[0]
+    else:
+        csv_path = path
+
+    table = pd.read_csv(csv_path)
+    signal_cols = [c for c in table.columns if c.startswith("EMG_Ch")]
+    if not signal_cols:
+        signal_cols = [c for c in table.columns if c.lower().startswith("ch_")]
+    if not signal_cols:
+        raise ValueError(f"No EMG channel columns found in {csv_path}")
+
+    signal = _numeric_signal_from_columns(table, signal_cols)
+    sampling_rate = _infer_sampling_rate(table)
+    if "Timestamp" in table.columns:
+        timestamp = (
+            pd.to_numeric(table["Timestamp"], errors="coerce")
+            .interpolate(limit_direction="both")
+            .fillna(0.0)
+            .to_numpy(float)
+        )
+    else:
+        timestamp = np.arange(signal.shape[0], dtype=float) / max(1e-9, sampling_rate)
+
+    labels, inference_meta = _infer_sample_labels(table)
+    spans = _labels_to_spans(labels, timestamp)
+
+    return DataBundle(
+        source_type=UNITY_SOURCE_TYPE,
+        source_path=csv_path,
+        sampling_rate=sampling_rate,
+        signal=signal,
+        signal_columns=signal_cols,
+        full_table=table,
+        timestamp=timestamp,
+        annotation_spans=spans,
+        metadata={"unity_csv": str(csv_path), "label_inference": inference_meta},
     )
 
 
@@ -251,7 +313,228 @@ def load_bundle(source_type: str, path: Path) -> DataBundle:
         return _load_session_bundle(path)
     if source_type == "game_recordings":
         return _load_game_bundle(path)
+    if source_type == UNITY_SOURCE_TYPE:
+        return _load_unity_bundle(path)
     raise ValueError(f"Unsupported source type '{source_type}'")
+
+
+def _infer_sampling_rate(table: pd.DataFrame, default_fs: float = 2000.0) -> float:
+    if "Timestamp" not in table.columns or len(table) < 4:
+        return default_fs
+    ts = pd.to_numeric(table["Timestamp"], errors="coerce").interpolate(limit_direction="both").fillna(0.0).to_numpy(float)
+    dts = np.diff(ts)
+    dts = dts[np.isfinite(dts) & (dts > 1e-6)]
+    if dts.size == 0:
+        return default_fs
+    return max(1.0, 1.0 / float(np.median(dts)))
+
+
+def _normalize_label(value: Any) -> str:
+    text = str(value).strip().lower()
+    if text in {"", "none", "nan", "null", "unknown", "idle"}:
+        return "rest"
+    return text.replace(" ", "_")
+
+
+def _binary_activity_from_table(table: pd.DataFrame) -> tuple[np.ndarray, dict[str, Any]]:
+    for col in ("GroundTruthActive", "GroundTruth", "GestureActive"):
+        if col in table.columns:
+            values = pd.to_numeric(table[col], errors="coerce").fillna(0.0).to_numpy(float)
+            return values > 0.5, {"activity_source": col}
+
+    if "RMS" in table.columns:
+        rms = pd.to_numeric(table["RMS"], errors="coerce").interpolate(limit_direction="both").fillna(0.0).to_numpy(float)
+        baseline = float(np.median(rms))
+        mad = float(np.median(np.abs(rms - baseline)))
+        threshold = baseline + 2.5 * max(1e-12, mad)
+        if np.mean(rms >= threshold) < 0.005:
+            threshold = float(np.quantile(rms, 0.9))
+        return rms >= threshold, {"activity_source": "RMS", "rms_threshold": threshold}
+
+    return np.zeros(len(table), dtype=bool), {"activity_source": "none"}
+
+
+def _infer_sample_labels(table: pd.DataFrame) -> tuple[np.ndarray, dict[str, Any]]:
+    n_rows = len(table)
+    if n_rows == 0:
+        return np.array([], dtype=object), {"label_source": "empty"}
+
+    active, meta = _binary_activity_from_table(table)
+    labels = np.full(n_rows, "rest", dtype=object)
+
+    if "RequestedGesture" in table.columns:
+        requested = table["RequestedGesture"].astype(str).map(_normalize_label).to_numpy(dtype=object)
+        labels = np.where(active, requested, "rest")
+        labels = np.where(np.isin(labels, ["none", "unknown", "idle"]), "rest", labels)
+        meta["label_source"] = "RequestedGesture+activity"
+    else:
+        labels = np.where(active, "fist", "rest")
+        meta["label_source"] = "activity_proxy_fist_rest"
+
+    return labels, meta
+
+
+def _labels_to_spans(labels: np.ndarray, timestamp: np.ndarray, min_duration_sec: float = 0.08) -> list[dict[str, Any]]:
+    spans: list[dict[str, Any]] = []
+    if labels.size == 0 or timestamp.size == 0:
+        return spans
+
+    start_idx = 0
+    current = str(labels[0])
+    for idx in range(1, labels.size + 1):
+        at_end = idx == labels.size
+        if not at_end and str(labels[idx]) == current:
+            continue
+
+        end_idx = idx
+        if end_idx > start_idx:
+            start_time = float(timestamp[start_idx])
+            end_time = float(timestamp[end_idx - 1])
+            if (end_time - start_time) >= min_duration_sec:
+                spans.append({"start": start_time, "end": end_time, "label": current, "trial_type": "gesture"})
+
+        if not at_end:
+            start_idx = idx
+            current = str(labels[idx])
+    return spans
+
+
+def _safe_name(text: str) -> str:
+    return re.sub(r'[^A-Za-z0-9_.-]+', '_', text.strip()).strip('._') or "unnamed"
+
+
+def _guess_subject_id(path: Path) -> str:
+    for part in [path.name, *path.parts[::-1]]:
+        if re.fullmatch(r"VP[_-]?\d+", str(part), flags=re.IGNORECASE):
+            return str(part).replace("-", "_")
+    return "VP_00"
+
+
+def _build_gesture_set(labels: set[str]) -> GestureSet:
+    base = create_default_gesture_set()
+    ordered = sorted(labels, key=lambda x: (x != "rest", x != "fist", x))
+    gesture_set = GestureSet(name="viewer_derived")
+    for label in ordered:
+        known = base.get_gesture(label)
+        if known is not None:
+            gesture = Gesture(
+                name=known.name,
+                display_name=known.display_name,
+                description=known.description,
+                category=known.category,
+                image_path=known.image_path,
+                emoji=known.emoji,
+                label_id=known.label_id,
+                duration_hint=known.duration_hint,
+                metadata=dict(known.metadata),
+            )
+        else:
+            gesture = Gesture(
+                name=label,
+                display_name=label.replace("_", " ").title(),
+                category=GestureCategory.CUSTOM,
+            )
+        gesture_set.add_gesture(gesture)
+    return gesture_set
+
+
+def export_bundle_as_session(
+    bundle: DataBundle,
+    signal_to_export: np.ndarray,
+    keep_labels: set[str] | None,
+    subject_id: str,
+    session_id: str,
+    destination_root: Path | None = None,
+) -> Path:
+    if signal_to_export.shape != bundle.signal.shape:
+        raise ValueError("Signal to export must match loaded signal shape.")
+
+    spans = sorted(bundle.annotation_spans, key=lambda sp: (_safe_float(sp.get("start"), 0.0), _safe_float(sp.get("end"), 0.0)))
+    if keep_labels is not None:
+        spans = [sp for sp in spans if _normalize_label(sp.get("label", "")) in keep_labels]
+    if not spans:
+        raise ValueError("No spans available after filtering labels.")
+
+    kept_chunks: list[np.ndarray] = []
+    exported_trials: list[tuple[str, int, int]] = []
+    cursor = 0
+    n_samples = signal_to_export.shape[0]
+
+    for sp in spans:
+        label = _normalize_label(sp.get("label", "rest"))
+        st = _safe_float(sp.get("start"), 0.0)
+        en = _safe_float(sp.get("end"), st)
+        start_idx = int(np.searchsorted(bundle.timestamp, st, side="left"))
+        end_idx = int(np.searchsorted(bundle.timestamp, en, side="right"))
+        start_idx = max(0, min(start_idx, n_samples - 1))
+        end_idx = max(start_idx + 1, min(end_idx, n_samples))
+        chunk = signal_to_export[start_idx:end_idx]
+        if chunk.size == 0:
+            continue
+        kept_chunks.append(chunk)
+        exported_trials.append((label, cursor, cursor + chunk.shape[0]))
+        cursor += chunk.shape[0]
+
+    if not kept_chunks or not exported_trials:
+        raise ValueError("No data remained after span conversion.")
+
+    kept_signal = np.vstack(kept_chunks)
+    labels = {lbl for lbl, _, _ in exported_trials}
+    gesture_set = _build_gesture_set(labels)
+
+    session = RecordingSession(
+        session_id=session_id,
+        subject_id=subject_id,
+        device_name=str(bundle.metadata.get("recording_config", {}).get("recording", {}).get("device_name", "MUOVI")),
+        num_channels=kept_signal.shape[1],
+        sampling_rate=int(round(bundle.sampling_rate)),
+        gesture_set=gesture_set,
+        protocol_name="viewer_derived",
+    )
+    session._data_chunks = [kept_signal]
+    session._current_sample = kept_signal.shape[0]
+    session.trials = []
+
+    for idx, (label, start_smp, end_smp) in enumerate(exported_trials):
+        gesture = gesture_set.get_gesture(label)
+        if gesture is None:
+            continue
+        session.trials.append(
+            RecordingTrial(
+                trial_id=idx,
+                gesture_name=label,
+                gesture_label=int(gesture.label_id),
+                start_sample=start_smp,
+                end_sample=end_smp,
+                start_time=start_smp / max(1e-9, bundle.sampling_rate),
+                end_time=end_smp / max(1e-9, bundle.sampling_rate),
+                is_valid=True,
+                trial_type="gesture",
+            )
+        )
+
+    session.metadata.notes = (
+        f"Derived in data_viewer from {bundle.source_type}: {bundle.source_path}. "
+        f"Keep labels: {sorted(keep_labels) if keep_labels is not None else 'all'}"
+    )
+    session.metadata.custom_metadata = {
+        "source_type": bundle.source_type,
+        "source_path": str(bundle.source_path),
+        "source_sampling_rate": bundle.sampling_rate,
+        "label_inference": bundle.metadata.get("label_inference", {}),
+    }
+
+    dest_root = script_default_data_root() / "sessions" if destination_root is None else destination_root
+    subject_dir = dest_root / _safe_name(subject_id)
+    subject_dir.mkdir(parents=True, exist_ok=True)
+    base = _safe_name(session_id)
+    target = subject_dir / base
+    suffix = 1
+    while target.exists():
+        target = subject_dir / f"{base}_{suffix:02d}"
+        suffix += 1
+    session.save(target)
+    return target
 
 
 def _apply_notch(data: np.ndarray, fs: float, freq: float, q: float) -> np.ndarray:
@@ -301,6 +584,14 @@ def _robust_clip(data: np.ndarray, mad_mult: float) -> np.ndarray:
     return np.clip(data, median - limit, median + limit)
 
 
+def _normalize_channels(data: np.ndarray) -> np.ndarray:
+    center = np.nanmean(data, axis=0, keepdims=True)
+    scale = np.nanstd(data, axis=0, keepdims=True)
+    scale = np.where(scale < 1e-12, 1.0, scale)
+    normalized = (data - center) / scale
+    return np.nan_to_num(normalized, nan=0.0, posinf=0.0, neginf=0.0)
+
+
 def _rms_envelope(data: np.ndarray, fs: float, window_ms: float) -> np.ndarray:
     window = max(1, int(fs * window_ms / 1000.0))
     kernel = np.ones(window, dtype=float) / window
@@ -348,6 +639,10 @@ def apply_transform_pipeline(
     if config.clip_enabled:
         data = _robust_clip(data, config.clip_mad_mult)
         trace.append(TransformTrace("robust_clip", {"mad_multiplier": config.clip_mad_mult}))
+
+    if config.normalize_enabled:
+        data = _normalize_channels(data)
+        trace.append(TransformTrace("normalize", {"mode": "zscore_per_channel"}))
 
     if config.rectify_enabled:
         data = np.abs(data)
@@ -437,10 +732,15 @@ def export_transformed_bundle(
 ) -> Path:
     source = bundle.source_path
     stamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    new_name = f"{source.name}_viewer_export_{stamp}"
+    source_stem = source.stem if source.is_file() else source.name
+    new_name = f"{source_stem}_viewer_export_{stamp}"
 
     destination = source.parent / new_name if destination_root is None else destination_root / new_name
-    shutil.copytree(source, destination)
+    if source.is_dir():
+        shutil.copytree(source, destination)
+    else:
+        destination.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source, destination / source.name)
 
     if bundle.source_type == "sessions":
         data_csv = destination / "data.csv"
@@ -456,6 +756,14 @@ def export_transformed_bundle(
 
     elif bundle.source_type == "game_recordings":
         csv_file = destination / "recording.csv"
+        table = pd.read_csv(csv_file)
+        for idx, col in enumerate(bundle.signal_columns):
+            if col in table.columns and idx < transformed_signal.shape[1]:
+                table[col] = transformed_signal[:, idx]
+        table.to_csv(csv_file, index=False)
+
+    elif bundle.source_type == UNITY_SOURCE_TYPE:
+        csv_file = destination / source.name
         table = pd.read_csv(csv_file)
         for idx, col in enumerate(bundle.signal_columns):
             if col in table.columns and idx < transformed_signal.shape[1]:
@@ -501,6 +809,7 @@ def _import_qt_modules() -> dict[str, Any]:
             QPushButton,
             QSlider,
             QSpinBox,
+            QScrollArea,
             QSplitter,
             QStatusBar,
             QTabWidget,
@@ -529,6 +838,7 @@ def _import_qt_modules() -> dict[str, Any]:
             QPushButton,
             QSlider,
             QSpinBox,
+            QScrollArea,
             QSplitter,
             QStatusBar,
             QTabWidget,
@@ -561,6 +871,7 @@ def _import_qt_modules() -> dict[str, Any]:
         "QPushButton": QPushButton,
         "QSlider": QSlider,
         "QSpinBox": QSpinBox,
+        "QScrollArea": QScrollArea,
         "QSplitter": QSplitter,
         "QStatusBar": QStatusBar,
         "QTabWidget": QTabWidget,
@@ -590,6 +901,7 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
     QLabel = qt["QLabel"]
     QSlider = qt["QSlider"]
     QSpinBox = qt["QSpinBox"]
+    QScrollArea = qt["QScrollArea"]
     QDoubleSpinBox = qt["QDoubleSpinBox"]
     QCheckBox = qt["QCheckBox"]
     QTabWidget = qt["QTabWidget"]
@@ -612,6 +924,11 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
             self.transformed_signal = np.empty((0, 0), dtype=float)
             self.transform_cfg = TransformConfig()
             self.display_cfg = DisplayConfig()
+            self.external_plot_window: Any | None = None
+            self.external_figure: Any | None = None
+            self.external_canvas: Any | None = None
+            self.external_ax_raw: Any | None = None
+            self.external_ax_proc: Any | None = None
 
             self.setWindowTitle(f"Data Viewer ({qt['qt_api']})")
             self.resize(1920, 1120)
@@ -624,15 +941,28 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
             splitter = QSplitter(Qt.Orientation.Horizontal)
             root_layout.addWidget(splitter)
 
+            def _scroll_wrap(widget: QWidget) -> QWidget:
+                scroll = QScrollArea()
+                scroll.setWidgetResizable(True)
+                scroll.setWidget(widget)
+                wrapper = QWidget()
+                wrapper_layout = QVBoxLayout(wrapper)
+                wrapper_layout.setContentsMargins(0, 0, 0, 0)
+                wrapper_layout.addWidget(scroll)
+                return wrapper
+
             left_panel = QWidget()
             left_layout = QVBoxLayout(left_panel)
             left_panel.setMinimumWidth(320)
-            splitter.addWidget(left_panel)
+            splitter.addWidget(_scroll_wrap(left_panel))
 
             right_panel = QWidget()
             right_layout = QVBoxLayout(right_panel)
             splitter.addWidget(right_panel)
             splitter.setSizes([320, 1600])
+
+            self.controls_tabs = QTabWidget()
+            right_layout.addWidget(self.controls_tabs)
 
             browse_group = QGroupBox("Dataset Browser")
             browse_form = QFormLayout(browse_group)
@@ -693,8 +1023,8 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
             left_layout.addStretch(1)
 
             controls_group = QGroupBox("Refined Controls")
-            controls_group.setMaximumHeight(190)
             controls_form = QFormLayout(controls_group)
+            controls_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
             self.window_sec_spin = QDoubleSpinBox()
             self.window_sec_spin.setRange(0.2, 120.0)
@@ -736,16 +1066,21 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
             self.show_ann_cb.stateChanged.connect(self._update_plot_only)
             self.normalize_cb = QCheckBox("Normalize")
             self.normalize_cb.setChecked(True)
+            self.normalize_cb.setToolTip("Display-only scaling for easier visual comparison; does not change exported data")
             self.normalize_cb.stateChanged.connect(self._update_plot_only)
             for cb in (self.show_raw_cb, self.show_processed_cb, self.show_ann_cb, self.normalize_cb):
                 display_layout.addWidget(cb)
             controls_form.addRow("Display", display_flags)
 
-            right_layout.addWidget(controls_group)
+            self.popout_plot_btn = QPushButton("Open Plot Window")
+            self.popout_plot_btn.clicked.connect(self._open_plot_window)
+            controls_form.addRow("Plot", self.popout_plot_btn)
+
+            self.controls_tabs.addTab(_scroll_wrap(controls_group), "View")
 
             transform_group = QGroupBox("Transform Pipeline")
-            transform_group.setMaximumHeight(360)
             transform_form = QFormLayout(transform_group)
+            transform_form.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.ExpandingFieldsGrow)
 
             self.notch_cb = QCheckBox("Enable notch")
             self.notch_cb.setChecked(True)
@@ -800,6 +1135,10 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
             self.clip_mad.setValue(8.0)
             transform_form.addRow("Clip MAD", self.clip_mad)
 
+            self.proc_normalize_cb = QCheckBox("Normalize channels (processing)")
+            self.proc_normalize_cb.setToolTip("Applies per-channel z-score normalization to processed data and exports")
+            transform_form.addRow(self.proc_normalize_cb)
+
             self.rectify_cb = QCheckBox("Rectify")
             transform_form.addRow(self.rectify_cb)
 
@@ -824,7 +1163,49 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
             for btn in (self.apply_btn, self.reset_btn, self.export_btn, self.report_btn):
                 actions_layout.addWidget(btn)
             transform_form.addRow(actions)
-            right_layout.addWidget(transform_group)
+            self.controls_tabs.addTab(_scroll_wrap(transform_group), "Transforms")
+
+            fit_group = QGroupBox("Session Fit / Curation")
+            fit_form = QFormLayout(fit_group)
+
+            self.fit_subject_line = QLineEdit()
+            fit_form.addRow("Subject ID", self.fit_subject_line)
+
+            self.fit_session_line = QLineEdit()
+            fit_form.addRow("Session ID", self.fit_session_line)
+
+            self.fit_keep_labels_line = QLineEdit("rest,fist")
+            self.fit_keep_labels_line.setToolTip("Comma-separated labels to keep in curated export")
+            fit_form.addRow("Keep labels", self.fit_keep_labels_line)
+
+            self.fit_use_processed_cb = QCheckBox("Use processed signal")
+            self.fit_use_processed_cb.setChecked(True)
+            fit_form.addRow("Signal", self.fit_use_processed_cb)
+
+            fit_actions = QWidget()
+            fit_actions_layout = QHBoxLayout(fit_actions)
+            fit_actions_layout.setContentsMargins(0, 0, 0, 0)
+            self.export_all_session_btn = QPushButton("Export Full Session Fit")
+            self.export_all_session_btn.setText("Export Full Session (All Labels)")
+            self.export_all_session_btn.setToolTip("Exports all detected spans/labels into a fitted session")
+            self.export_all_session_btn.clicked.connect(self._export_full_session_fit)
+            self.export_curated_session_btn = QPushButton("Export Curated (Keep Labels)")
+            self.export_curated_session_btn.setToolTip(
+                "Exports only labels listed in 'Keep labels' (for example: rest,fist)"
+            )
+            self.export_curated_session_btn.clicked.connect(self._export_curated_session_fit)
+            fit_actions_layout.addWidget(self.export_all_session_btn)
+            fit_actions_layout.addWidget(self.export_curated_session_btn)
+            fit_form.addRow(fit_actions)
+
+            export_help = QLabel(
+                "Full Session keeps all inferred labels. Curated keeps only 'Keep labels'. "
+                "Both exports use the selected Signal mode (raw or processed)."
+            )
+            export_help.setWordWrap(True)
+            fit_form.addRow(export_help)
+
+            self.controls_tabs.addTab(_scroll_wrap(fit_group), "Session Fit")
 
             self.tabs = QTabWidget()
             right_layout.addWidget(self.tabs, stretch=1)
@@ -912,7 +1293,18 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
             self._refresh_datasets()
 
         def _pick_dataset_folder(self) -> None:
-            chosen = QFileDialog.getExistingDirectory(self, "Select session/game folder", str(self.data_root))
+            if self.source_type == UNITY_SOURCE_TYPE:
+                chosen_file, _ = QFileDialog.getOpenFileName(
+                    self,
+                    "Select Unity EMG CSV",
+                    str(self.data_root),
+                    "CSV Files (*.csv);;All Files (*)",
+                )
+                if chosen_file:
+                    self._select_dataset_by_path(Path(chosen_file))
+                    return
+
+            chosen = QFileDialog.getExistingDirectory(self, "Select dataset folder", str(self.data_root))
             if chosen:
                 self._select_dataset_by_path(Path(chosen))
 
@@ -935,7 +1327,56 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
 
             self._populate_channels()
             self._populate_annotations()
+            self._update_fit_defaults()
             self._recompute_and_plot()
+
+        def _update_fit_defaults(self) -> None:
+            if self.bundle is None:
+                return
+            self.fit_subject_line.setText(_guess_subject_id(self.bundle.source_path))
+            source_name = self.bundle.source_path.stem if self.bundle.source_path.is_file() else self.bundle.source_path.name
+            self.fit_session_line.setText(f"{_safe_name(source_name)}_fit")
+
+        def _signal_for_fit_export(self) -> np.ndarray:
+            if self.bundle is None:
+                return np.empty((0, 0), dtype=float)
+            if self.fit_use_processed_cb.isChecked() and self.transformed_signal.shape == self.bundle.signal.shape:
+                return self.transformed_signal
+            return self.bundle.signal
+
+        def _export_full_session_fit(self) -> None:
+            self._export_session_fit(keep_labels=None)
+
+        def _export_curated_session_fit(self) -> None:
+            labels = {
+                _normalize_label(token)
+                for token in self.fit_keep_labels_line.text().split(",")
+                if token.strip()
+            }
+            if not labels:
+                QMessageBox.warning(self, "Missing labels", "Provide at least one label to keep.")
+                return
+            self._export_session_fit(keep_labels=labels)
+
+        def _export_session_fit(self, keep_labels: set[str] | None) -> None:
+            if self.bundle is None:
+                return
+            subject_id = self.fit_subject_line.text().strip() or _guess_subject_id(self.bundle.source_path)
+            session_id = self.fit_session_line.text().strip()
+            if not session_id:
+                QMessageBox.warning(self, "Missing session id", "Please set a target session id.")
+                return
+            try:
+                dst = export_bundle_as_session(
+                    bundle=self.bundle,
+                    signal_to_export=self._signal_for_fit_export(),
+                    keep_labels=keep_labels,
+                    subject_id=subject_id,
+                    session_id=session_id,
+                )
+                self.statusBar().showMessage(f"Session exported: {dst}", 7000)
+            except Exception as exc:
+                QMessageBox.critical(self, "Session export failed", str(exc))
 
         def _current_transform_config(self) -> TransformConfig:
             return TransformConfig(
@@ -951,6 +1392,7 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
                 artifact_strength=float(self.artifact_strength.value()),
                 clip_enabled=self.clip_cb.isChecked(),
                 clip_mad_mult=float(self.clip_mad.value()),
+                normalize_enabled=self.proc_normalize_cb.isChecked(),
                 rectify_enabled=self.rectify_cb.isChecked(),
                 rms_envelope_enabled=self.rms_cb.isChecked(),
                 rms_window_ms=float(self.rms_window.value()),
@@ -992,6 +1434,7 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
             self.artifact_strength.setValue(1.0)
             self.clip_cb.setChecked(False)
             self.clip_mad.setValue(8.0)
+            self.proc_normalize_cb.setChecked(False)
             self.rectify_cb.setChecked(False)
             self.rms_cb.setChecked(False)
             self.rms_window.setValue(80.0)
@@ -1008,6 +1451,110 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
             if not np.any(mask):
                 mask = t >= max(0.0, end_sec - 1.0)
             return mask
+
+        def _open_plot_window(self) -> None:
+            if self.external_plot_window is None:
+                popout = QMainWindow(self)
+                popout.setWindowTitle("Data Viewer - Plot Window")
+                popout.resize(1400, 900)
+
+                container = QWidget(popout)
+                layout = QVBoxLayout(container)
+                fig = Figure(figsize=(14, 8), dpi=100)
+                canvas = FigureCanvasQTAgg(fig)
+                toolbar = NavigationToolbar2QT(canvas, popout)
+                layout.addWidget(toolbar)
+                layout.addWidget(canvas)
+                popout.setCentralWidget(container)
+
+                self.external_plot_window = popout
+                self.external_figure = fig
+                self.external_canvas = canvas
+                self.external_ax_raw = fig.add_subplot(211)
+                self.external_ax_proc = fig.add_subplot(212, sharex=self.external_ax_raw)
+                popout.destroyed.connect(self._clear_external_plot_refs)
+
+            self.external_plot_window.show()
+            self.external_plot_window.raise_()
+            self.external_plot_window.activateWindow()
+            self._update_plot_only()
+
+        def _clear_external_plot_refs(self, *_: Any) -> None:
+            self.external_plot_window = None
+            self.external_figure = None
+            self.external_canvas = None
+            self.external_ax_raw = None
+            self.external_ax_proc = None
+
+        def _render_signal_axes(
+            self,
+            ax_raw: Any,
+            ax_proc: Any,
+            t: np.ndarray,
+            raw: np.ndarray,
+            proc: np.ndarray,
+            channels: list[int],
+            display_cfg: DisplayConfig,
+        ) -> None:
+            ax_raw.clear()
+            ax_proc.clear()
+
+            spacing = max(0.5, display_cfg.y_spacing)
+            for idx, ch in enumerate(channels):
+                raw_ch = raw[:, idx]
+                proc_ch = proc[:, idx]
+                if display_cfg.normalize_channels:
+                    raw_std = np.nanstd(raw_ch) or 1.0
+                    proc_std = np.nanstd(proc_ch) or 1.0
+                    raw_ch = raw_ch / raw_std
+                    proc_ch = proc_ch / proc_std
+                offset = idx * spacing
+
+                if display_cfg.show_raw:
+                    ax_raw.plot(
+                        t,
+                        raw_ch + offset,
+                        linewidth=0.8,
+                        alpha=display_cfg.raw_alpha,
+                        label=self.bundle.signal_columns[ch],
+                    )
+                if display_cfg.show_processed:
+                    ax_proc.plot(
+                        t,
+                        proc_ch + offset,
+                        linewidth=0.9,
+                        label=self.bundle.signal_columns[ch],
+                    )
+
+            if display_cfg.show_annotations and self.bundle is not None:
+                start = float(t[0])
+                end = float(t[-1])
+                for span in self.bundle.annotation_spans:
+                    st = float(span["start"])
+                    en = float(span["end"])
+                    if en < start or st > end:
+                        continue
+                    ax_raw.axvspan(st, en, alpha=0.10, color="tab:orange")
+                    ax_proc.axvspan(st, en, alpha=0.10, color="tab:orange")
+
+            ax_raw.set_title("Raw signals")
+            ax_proc.set_title(
+                "Processed signals | "
+                + ", ".join(step.name for step in self.trace)
+                if self.trace
+                else "Processed signals"
+            )
+            ax_proc.set_xlabel("Time [s]")
+            ax_raw.set_ylabel("Amplitude + offset")
+            ax_proc.set_ylabel("Amplitude + offset")
+            ax_raw.grid(alpha=0.25)
+            ax_proc.grid(alpha=0.25)
+
+            if len(channels) <= 10:
+                if display_cfg.show_raw:
+                    ax_raw.legend(loc="upper right", fontsize=8)
+                if display_cfg.show_processed:
+                    ax_proc.legend(loc="upper right", fontsize=8)
 
         def _update_plot_only(self) -> None:
             if self.bundle is None:
@@ -1029,68 +1576,27 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
                 raw = raw[::ds]
                 proc = proc[::ds]
 
-            self.ax_raw.clear()
-            self.ax_proc.clear()
-
-            spacing = max(0.5, display_cfg.y_spacing)
-            for idx, ch in enumerate(channels):
-                raw_ch = raw[:, idx]
-                proc_ch = proc[:, idx]
-                if display_cfg.normalize_channels:
-                    raw_std = np.nanstd(raw_ch) or 1.0
-                    proc_std = np.nanstd(proc_ch) or 1.0
-                    raw_ch = raw_ch / raw_std
-                    proc_ch = proc_ch / proc_std
-                offset = idx * spacing
-
-                if display_cfg.show_raw:
-                    self.ax_raw.plot(
-                        t,
-                        raw_ch + offset,
-                        linewidth=0.8,
-                        alpha=display_cfg.raw_alpha,
-                        label=self.bundle.signal_columns[ch],
-                    )
-                if display_cfg.show_processed:
-                    self.ax_proc.plot(
-                        t,
-                        proc_ch + offset,
-                        linewidth=0.9,
-                        label=self.bundle.signal_columns[ch],
-                    )
-
-            if display_cfg.show_annotations:
-                start = float(t[0])
-                end = float(t[-1])
-                for span in self.bundle.annotation_spans:
-                    st = float(span["start"])
-                    en = float(span["end"])
-                    if en < start or st > end:
-                        continue
-                    self.ax_raw.axvspan(st, en, alpha=0.10, color="tab:orange")
-                    self.ax_proc.axvspan(st, en, alpha=0.10, color="tab:orange")
-
-            self.ax_raw.set_title("Raw signals")
-            self.ax_proc.set_title(
-                "Processed signals | "
-                + ", ".join(step.name for step in self.trace)
-                if self.trace
-                else "Processed signals"
-            )
-            self.ax_proc.set_xlabel("Time [s]")
-            self.ax_raw.set_ylabel("Amplitude + offset")
-            self.ax_proc.set_ylabel("Amplitude + offset")
-            self.ax_raw.grid(alpha=0.25)
-            self.ax_proc.grid(alpha=0.25)
-
-            if len(channels) <= 10:
-                if display_cfg.show_raw:
-                    self.ax_raw.legend(loc="upper right", fontsize=8)
-                if display_cfg.show_processed:
-                    self.ax_proc.legend(loc="upper right", fontsize=8)
-
+            self._render_signal_axes(self.ax_raw, self.ax_proc, t, raw, proc, channels, display_cfg)
             self.figure.tight_layout()
             self.canvas.draw_idle()
+
+            if (
+                self.external_figure is not None
+                and self.external_canvas is not None
+                and self.external_ax_raw is not None
+                and self.external_ax_proc is not None
+            ):
+                self._render_signal_axes(
+                    self.external_ax_raw,
+                    self.external_ax_proc,
+                    t,
+                    raw,
+                    proc,
+                    channels,
+                    display_cfg,
+                )
+                self.external_figure.tight_layout()
+                self.external_canvas.draw_idle()
 
         def _update_metadata_tab(self) -> None:
             if self.bundle is None:
@@ -1161,6 +1667,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--type", choices=SUPPORTED_TYPES, default="sessions", help="Data type to browse")
     parser.add_argument("--path", type=Path, help="Specific session/game_recording path")
     parser.add_argument("--data-root", type=Path, default=script_default_data_root(), help="Root containing sessions/ and game_recordings/")
+    parser.add_argument(
+        "--unity-root",
+        type=Path,
+        default=UNITY_DEFAULT_ROOT,
+        help="Root folder (or CSV file) for Unity EMG recordings",
+    )
     parser.add_argument("--channels", default="1-8", help="Used in --no-gui mode")
     parser.add_argument("--no-gui", action="store_true", help="Run transform pipeline and print summary without opening UI")
     parser.add_argument("--export", action="store_true", help="Export transformed data copy")
@@ -1168,10 +1680,11 @@ def build_arg_parser() -> argparse.ArgumentParser:
 
 
 def run_no_gui(args: argparse.Namespace) -> int:
+    effective_root = args.unity_root.resolve() if args.type == UNITY_SOURCE_TYPE else args.data_root.resolve()
     if args.path is not None:
         selected_path = args.path.resolve()
     else:
-        candidates = discover_recordings(args.data_root.resolve(), args.type)
+        candidates = discover_recordings(effective_root, args.type)
         selected_path = _ask_user_to_pick(candidates, f"Available {args.type} datasets:")
 
     bundle = load_bundle(args.type, selected_path)
@@ -1208,7 +1721,7 @@ def run_gui(args: argparse.Namespace) -> int:
 
     app = QApplication(sys.argv)
     window = MainWindow(
-        data_root=args.data_root.resolve(),
+        data_root=(args.unity_root.resolve() if args.type == UNITY_SOURCE_TYPE else args.data_root.resolve()),
         source_type=args.type,
         initial_path=args.path.resolve() if args.path else None,
     )

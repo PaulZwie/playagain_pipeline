@@ -50,16 +50,16 @@ class GameRecorder:
 
         Ground Truth Logic:
                 GroundTruthActive is derived from Unity game-state signals using a
-                robust rule that prioritizes the requested gesture window.
+                small deterministic state machine.
 
-                It is True only when a gesture is actually requested
-                (RequestedGesture != "none"), and at least one activity flag is true:
-                    - ground_truth_active (raw Unity flag), or
-                    - camera_blocking (camera in feeding/blocking view)
+                It is True only while a gesture is requested, and one of these is true:
+                    - Unity raw ground_truth flag is true, or
+                    - camera_blocking is true, or
+                    - the request just started and we are inside a short pre-block grace window.
 
-                This avoids false positives outside request windows while also being
-                resilient to brief camera_blocking dropouts.
-                RawGroundTruth stores the original flag from Unity for reference.
+                The grace window makes labels robust when request and camera updates
+                arrive slightly out of sync (e.g., user starts gesture just before block).
+                RawGroundTruth stores the original Unity flag for reference.
 
     Thread Safety:
         - on_emg_data() is called from the device data thread
@@ -112,6 +112,10 @@ class GameRecorder:
         self._raw_ground_truth = False
         self._requested_gesture = "none"
         self._camera_blocking = False
+
+        # GT timing state for robust camera-transition handling
+        self._gt_pre_block_grace_s = 0.35
+        self._gt_request_started_at_monotonic: Optional[float] = None
 
         # Class names for probability columns in CSV header
         self._class_names: List[str] = []
@@ -296,6 +300,7 @@ class GameRecorder:
         self._raw_ground_truth = False
         self._requested_gesture = "none"
         self._camera_blocking = False
+        self._gt_request_started_at_monotonic = None
 
         # Start background writer thread
         self._writer_thread = threading.Thread(
@@ -390,16 +395,8 @@ class GameRecorder:
         req_gesture = self._requested_gesture
         cam_blocking = self._camera_blocking
 
-        # Quick resilience fix for the camera-transition edge case:
-        # if a requested gesture is already known and the user starts the
-        # correct gesture slightly before camera_blocking flips to True,
-        # count this short pre-camera period as GroundTruthActive too.
-        if (not gt_active) and (not cam_blocking):
-            req_norm = self._normalize_label(req_gesture)
-            pred_norm = self._normalize_label(prediction)
-            early_match = self._labels_match(req_norm, pred_norm)
-            if req_norm not in ("", "none", "null") and early_match and confidence >= 0.45:
-                gt_active = True
+        # Ground truth is derived only in on_game_state.
+        # Keep on_emg_data a pure snapshot/write path for deterministic recording.
 
         # Build all rows in bulk, then enqueue as a single batch
         rows = []
@@ -473,69 +470,61 @@ class GameRecorder:
 
         Called when the PredictionServer receives a game_state message from Unity.
 
-                The *reliable* ground truth is derived from three Unity fields:
-                requested_gesture, ground_truth_active (raw), and camera_blocking.
+        The recorder computes GroundTruthActive from request-window semantics:
+            - no requested gesture -> always False
+            - requested gesture present -> True if raw_gt or camera_blocking
+            - if request just started, also allow a short pre-block grace window
 
-                GroundTruthActive is True when:
-                    1. a gesture is requested (requested_gesture != "none"), and
-                    2. either ground_truth_active OR camera_blocking is True.
-
-                This keeps the label tightly aligned with requested gesture windows,
-                while avoiding dropouts caused by transient camera-blocking toggles.
-
-        The raw ground_truth flag from Unity is stored as RawGroundTruth for
-        reference, but GroundTruthActive uses the refined logic.
+        This handles out-of-sync request/camera updates without coupling to model
+        predictions and avoids false positives outside request windows.
 
         Args:
-            ground_truth_active: True if a gesture is currently requested (raw Unity flag).
-            requested_gesture: Name of the requested gesture (e.g., "fist").
+            ground_truth_active: Raw Unity flag (request active on Unity side).
+            requested_gesture: Name of requested gesture (e.g., "fist" or "none").
             camera_blocking: True if camera is in interaction/feeding view.
         """
-        # Store the raw Unity flag for reference
-        self._raw_ground_truth = ground_truth_active
+        self._raw_ground_truth = bool(ground_truth_active)
+        self._camera_blocking = bool(camera_blocking)
 
-        requested = str(requested_gesture).strip().lower() if requested_gesture is not None else ""
-        has_requested_gesture = requested not in ("", "none", "null")
+        requested_norm = self._normalize_label(requested_gesture)
+        has_requested_gesture = requested_norm not in ("", "none", "null")
 
-        # Robust GT rule:
-        #   requested gesture window  AND  (raw GT OR camera blocking)
-        # This avoids false positives when nothing is requested, while reducing
-        # false negatives when one of the two Unity flags briefly drops.
-        self._ground_truth_active = bool(has_requested_gesture and (ground_truth_active or camera_blocking))
-        self._requested_gesture = requested_gesture
-        self._camera_blocking = camera_blocking
+        now = time.monotonic()
+        previous_requested = self._normalize_label(self._requested_gesture)
+        if has_requested_gesture and previous_requested != requested_norm:
+            self._gt_request_started_at_monotonic = now
+        elif not has_requested_gesture:
+            self._gt_request_started_at_monotonic = None
+
+        in_pre_block_grace = False
+        if has_requested_gesture and self._gt_request_started_at_monotonic is not None:
+            in_pre_block_grace = (now - self._gt_request_started_at_monotonic) <= self._gt_pre_block_grace_s
+
+        self._ground_truth_active = bool(
+            has_requested_gesture and (
+                self._raw_ground_truth
+                or self._camera_blocking
+                or in_pre_block_grace
+            )
+        )
+        self._requested_gesture = requested_norm if has_requested_gesture else "none"
 
         if self._is_recording and self._debug_ground_truth:
-            now = time.monotonic()
-            if now - self._last_gt_log_time >= 1.0:
-                self._last_gt_log_time = now
+            now_log = time.monotonic()
+            if now_log - self._last_gt_log_time >= 1.0:
+                self._last_gt_log_time = now_log
                 print(f"[GameRecorder] Ground truth update: "
                       f"reliable_active={self._ground_truth_active}, "
-                      f"raw_gt={ground_truth_active}, "
-                      f"gesture={requested_gesture}, "
-                      f"camera_blocking={camera_blocking}")
+                      f"raw_gt={self._raw_ground_truth}, "
+                      f"gesture={self._requested_gesture}, "
+                      f"camera_blocking={self._camera_blocking}, "
+                      f"pre_block_grace={in_pre_block_grace}")
 
     @staticmethod
     def _normalize_label(label: Any) -> str:
         """Normalize gesture labels to a comparable lowercase form."""
         text = str(label or "").strip().lower().replace("_", " ").replace("-", " ")
         return " ".join(text.split())
-
-    @staticmethod
-    def _labels_match(requested: str, predicted: str) -> bool:
-        """Loose-but-safe gesture label matching for pre-camera GT activation."""
-        if not requested or not predicted:
-            return False
-        if requested == predicted:
-            return True
-
-        req_tokens = set(requested.split())
-        pred_tokens = set(predicted.split())
-        if not req_tokens or not pred_tokens:
-            return False
-
-        # Example handled: requested="tripod pinch", predicted="tripod" or "pinch"
-        return len(req_tokens & pred_tokens) > 0
 
     # ─── Internal ─────────────────────────────────────────────────────────
 
