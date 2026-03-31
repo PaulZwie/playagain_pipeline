@@ -1218,6 +1218,10 @@ class MainWindow(QMainWindow):
 
         tools_menu.addSeparator()
 
+        q_train_action = QAction("Quattrocento Training…", self)
+        q_train_action.triggered.connect(self._on_quattrocento_training)
+        tools_menu.addAction(q_train_action)
+
         bracelet_viz_action = QAction("Bracelet Visualization...", self)
         bracelet_viz_action.triggered.connect(self._on_bracelet_visualization)
         tools_menu.addAction(bracelet_viz_action)
@@ -1537,6 +1541,19 @@ class MainWindow(QMainWindow):
         layout.addWidget(close_btn)
 
         dialog.exec()
+
+    @Slot()
+    def _on_quattrocento_training(self):
+        from playagain_pipeline.gui.widgets.quattrocento_training_dialog import (
+            QuattrocentoTrainingDialog,
+        )
+        dialog = QuattrocentoTrainingDialog(
+            model_manager=self.model_manager,
+            data_dir=self.data_dir,
+            parent=self,
+        )
+        dialog.exec()
+        self._refresh_models()
 
     @Slot()
     def _on_connect_device(self):
@@ -3360,6 +3377,126 @@ class MainWindow(QMainWindow):
         # Auto-select latest session if available
         if sessions:
             self.session_id_combo.setCurrentText(sessions[-1])
+
+    def _apply_app_theme(self):
+        """Apply a consistent, modern dark-adaptive theme to the whole app."""
+        self.setStyleSheet("""
+            QMainWindow, QDialog {
+                background: #1e1e2e;
+                color: #e2e8f0;
+            }
+            QTabWidget::pane {
+                border: 1px solid #3f3f5c;
+                border-radius: 6px;
+                background: #2a2a3e;
+            }
+            QTabBar::tab {
+                background: #1e1e2e;
+                color: #94a3b8;
+                padding: 6px 14px;
+                border: 1px solid #3f3f5c;
+                border-bottom: none;
+                border-top-left-radius: 5px;
+                border-top-right-radius: 5px;
+                margin-right: 2px;
+                font-size: 11px;
+            }
+            QTabBar::tab:selected {
+                background: #2a2a3e;
+                color: #06b6d4;
+                border-bottom: 2px solid #06b6d4;
+            }
+            QGroupBox {
+                background: #2a2a3e;
+                border: 1px solid #3f3f5c;
+                border-radius: 7px;
+                font-weight: 600;
+                color: #e2e8f0;
+                padding-top: 14px;
+                margin-top: 5px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+                color: #06b6d4;
+                font-size: 11px;
+            }
+            QPushButton {
+                background: #313145;
+                color: #e2e8f0;
+                border: 1px solid #3f3f5c;
+                border-radius: 5px;
+                padding: 5px 12px;
+                font-size: 12px;
+            }
+            QPushButton:hover { border-color: #06b6d4; color: #06b6d4; }
+            QPushButton:pressed { background: #3f3f5c; }
+            QPushButton:disabled { color: #4b5563; border-color: #2d2d40; }
+            QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit {
+                background: #1e1e2e;
+                color: #e2e8f0;
+                border: 1px solid #3f3f5c;
+                border-radius: 4px;
+                padding: 3px 6px;
+                selection-background-color: #7c3aed;
+            }
+            QComboBox:focus, QLineEdit:focus,
+            QSpinBox:focus, QDoubleSpinBox:focus {
+                border-color: #7c3aed;
+            }
+            QComboBox::drop-down { border: none; }
+            QListWidget, QTableWidget {
+                background: #1e1e2e;
+                color: #e2e8f0;
+                border: 1px solid #3f3f5c;
+                border-radius: 5px;
+                alternate-background-color: #252538;
+                selection-background-color: #7c3aed;
+            }
+            QProgressBar {
+                background: #1e1e2e;
+                border: 1px solid #3f3f5c;
+                border-radius: 4px;
+                height: 12px;
+                text-align: center;
+                font-size: 10px;
+                color: #e2e8f0;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                    stop:0 #7c3aed, stop:1 #06b6d4);
+                border-radius: 3px;
+            }
+            QCheckBox, QRadioButton { color: #e2e8f0; spacing: 6px; }
+            QCheckBox::indicator, QRadioButton::indicator {
+                border: 1px solid #3f3f5c;
+                background: #1e1e2e;
+                border-radius: 3px;
+                width: 13px; height: 13px;
+            }
+            QCheckBox::indicator:checked, QRadioButton::indicator:checked {
+                background: #7c3aed; border-color: #7c3aed;
+            }
+            QLabel { color: #e2e8f0; }
+            QHeaderView::section {
+                background: #2a2a3e; color: #94a3b8;
+                border: none; padding: 4px 8px; font-size: 10px;
+            }
+            QStatusBar { background: #13131f; color: #94a3b8; font-size: 11px; }
+            QMenuBar { background: #13131f; color: #e2e8f0; }
+            QMenuBar::item:selected { background: #2a2a3e; }
+            QMenu { background: #2a2a3e; border: 1px solid #3f3f5c; color: #e2e8f0; }
+            QMenu::item:selected { background: #7c3aed; }
+            QScrollBar:vertical {
+                background: #1e1e2e; width: 8px; margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #3f3f5c; border-radius: 4px; min-height: 20px;
+            }
+            QSplitter::handle { background: #3f3f5c; }
+        """)
+
 
 def main():
     """Entry point for the GUI application."""
