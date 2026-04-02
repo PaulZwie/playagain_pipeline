@@ -7,7 +7,6 @@ Combines all components into a unified interface for:
 - Real-time prediction
 """
 
-import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -15,6 +14,7 @@ from typing import Optional
 # Resolve local packages (device_interfaces, gui_custom_elements) via automatic
 # sibling-directory search so hard-coded Mac paths are no longer needed.
 from playagain_pipeline.utils.platform_utils import inject_local_packages, print_platform_info
+
 inject_local_packages()
 print_platform_info()
 
@@ -22,9 +22,10 @@ import numpy as np
 from PySide6.QtCore import Qt, Slot, QTimer, QThread, Signal, QMutex, QMutexLocker
 from PySide6.QtGui import QFont, QAction
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QPushButton, QComboBox,
-                               QLineEdit, QLabel, QGroupBox, QFormLayout, QSpinBox, QDoubleSpinBox, QMessageBox, QFileDialog, QTextEdit,
+                               QLineEdit, QLabel, QGroupBox, QFormLayout, QSpinBox, QDoubleSpinBox, QMessageBox,
+                               QFileDialog, QTextEdit,
                                QSplitter, QStatusBar, QListWidget, QScrollArea, QCheckBox,
-                               QGridLayout, QApplication, QDialog, QListWidgetItem)
+                               QApplication, QDialog)
 
 from playagain_pipeline.calibration.calibrator import AutoCalibrator
 from playagain_pipeline.config.config import get_default_config, PipelineConfig
@@ -48,6 +49,7 @@ from playagain_pipeline.protocols.protocol import (
 )
 from playagain_pipeline.prediction_server import PredictionServer, PredictionSmoother
 from playagain_pipeline.game_recorder import GameRecorder
+from playagain_pipeline.gui.gui_style import apply_app_style
 
 
 class PredictionWorker(QThread):
@@ -130,7 +132,8 @@ class ParticipantInfoDialog(QDialog):
         self.handedness_combo = QComboBox()
         self.handedness_combo.addItems(["Unknown", "Left", "Right", "Ambidextrous"])
         handedness = self.participant_info.get("handedness", "Unknown")
-        self.handedness_combo.setCurrentText(handedness if handedness in {"Unknown", "Left", "Right", "Ambidextrous"} else "Unknown")
+        self.handedness_combo.setCurrentText(
+            handedness if handedness in {"Unknown", "Left", "Right", "Ambidextrous"} else "Unknown")
         form.addRow("Handedness:", self.handedness_combo)
 
         self.notes_edit = QTextEdit(self.participant_info.get("notes", ""))
@@ -182,6 +185,9 @@ class MainWindow(QMainWindow):
         self.data_dir = self._pipeline_dir / "data"
         self.data_dir.mkdir(exist_ok=True)
 
+        # Runtime config (bright theme default unless overridden by file).
+        self.config = get_default_config()
+
         # Initialize managers
         self.data_manager = DataManager(self.data_dir)
         self.device_manager = DeviceManager()
@@ -220,14 +226,15 @@ class MainWindow(QMainWindow):
         self._live_cal_active = False
         self._live_cal_gestures: list = []
         self._live_cal_current_idx = 0
-        self._live_cal_buffer: list = []        # accumulated EMG chunks for current gesture
-        self._live_cal_collected: dict = {}     # gesture -> np.ndarray
+        self._live_cal_buffer: list = []  # accumulated EMG chunks for current gesture
+        self._live_cal_collected: dict = {}  # gesture -> np.ndarray
         self._live_cal_timer: Optional[QTimer] = None
         self._live_cal_countdown = 0
         self._live_cal_remaining = 0
 
         # Setup UI
         self._setup_ui()
+        self._apply_app_theme()
         self._setup_connections()
 
         # Connect thread-safe server prediction signal to UI update
@@ -239,13 +246,13 @@ class MainWindow(QMainWindow):
         self._status_timer.start(1000)
 
         # Load configuration
-        self.config = get_default_config()
         # Try to load from file if exists
         config_path = self._pipeline_dir / "config.json"
         if config_path.exists():
             try:
                 self.config = PipelineConfig.load(config_path)
                 self._log("Loaded configuration from file")
+                self._apply_app_theme()
             except Exception as e:
                 self._log(f"Failed to load config, using defaults: {e}")
 
@@ -303,12 +310,26 @@ class MainWindow(QMainWindow):
         # Log area
         log_group = QGroupBox("Log")
         log_layout = QVBoxLayout(log_group)
+
+        # Create a horizontal layout for the title/clear button and the log text itself
+        log_header_layout = QHBoxLayout()
+        log_header_layout.addStretch()
+        clear_log_btn = QPushButton("Clear")
+        clear_log_btn.setFixedHeight(20)
+        clear_log_btn.setFixedWidth(50)
+        clear_log_btn.clicked.connect(self.log_text.clear if hasattr(self, 'log_text') else lambda: None)
+        log_header_layout.addWidget(clear_log_btn)
+        log_layout.addLayout(log_header_layout)
+
         self.log_text = QTextEdit()
+        clear_log_btn.clicked.disconnect()
+        clear_log_btn.clicked.connect(self.log_text.clear)
+
         self.log_text.setReadOnly(True)
         self.log_text.setMinimumHeight(200)
         self.log_text.setMaximumHeight(300)
         self.log_text.setStyleSheet(
-            "QTextEdit { font-family: monospace; font-size: 11px; "
+            "QTextEdit {font-size: 11px; "
             "background-color: #1e1e1e; color: #d4d4d4; "
             "border: 1px solid #444; border-radius: 3px; padding: 4px; }"
         )
@@ -393,7 +414,8 @@ class MainWindow(QMainWindow):
         device_layout = QFormLayout(device_group)
 
         self.device_combo = QComboBox()
-        self.device_combo.addItems(["Synthetic", "Muovi", "Muovi Plus"])
+        self.device_combo.addItems(["Synthetic", "Quattrocento Replay", "Muovi", "Muovi Plus"])
+        self.device_combo.currentTextChanged.connect(self._on_device_selection_changed)
         device_layout.addRow("Device:", self.device_combo)
 
         self.channels_spin = QSpinBox()
@@ -431,6 +453,22 @@ class MainWindow(QMainWindow):
         self.session_id_combo = QComboBox()
         self.session_id_combo.setEnabled(False)
         device_layout.addRow("Session:", self.session_id_combo)
+
+        # Quattrocento replay options
+        self.quattro_root_edit = QLineEdit(str(self.data_dir / "quattrocento"))
+        self.quattro_root_edit.setEnabled(False)
+        self.quattro_root_btn = QPushButton("Browse…")
+        self.quattro_root_btn.setEnabled(False)
+        self.quattro_root_btn.clicked.connect(self._pick_quattrocento_root)
+        q_root_row = QHBoxLayout()
+        q_root_row.addWidget(self.quattro_root_edit)
+        q_root_row.addWidget(self.quattro_root_btn)
+        device_layout.addRow("Q4 root:", q_root_row)
+
+        self.quattro_side_combo = QComboBox()
+        self.quattro_side_combo.addItems(["left", "right", "both"])
+        self.quattro_side_combo.setEnabled(False)
+        device_layout.addRow("Q4 side:", self.quattro_side_combo)
 
         # Note: channel enable/disable is done via the checkboxes in the EMG plot
         channel_note = QLabel("Channel Status: Use checkboxes in EMG plot to enable/disable channels")
@@ -567,11 +605,13 @@ class MainWindow(QMainWindow):
 
         self.start_recording_btn = QPushButton("Start Recording")
         self.start_recording_btn.setFixedHeight(36)
+        self.start_recording_btn.setShortcut("Ctrl+R")
         self.start_recording_btn.clicked.connect(self._on_start_recording)
         control_layout.addWidget(self.start_recording_btn)
 
         self.stop_recording_btn = QPushButton("Stop Recording")
         self.stop_recording_btn.setFixedHeight(36)
+        self.stop_recording_btn.setShortcut("Ctrl+S")
         self.stop_recording_btn.setEnabled(False)
         self.stop_recording_btn.clicked.connect(self._on_stop_recording)
         control_layout.addWidget(self.stop_recording_btn)
@@ -584,12 +624,14 @@ class MainWindow(QMainWindow):
         layout.addWidget(scroll)
 
         self._on_recording_mode_changed()
+        self._on_device_selection_changed(self.device_combo.currentText())
 
         return tab
 
     def _on_recording_mode_changed(self):
         """Update protocol controls based on selected recording mode."""
-        mode_text = self.recording_mode_combo.currentText() if hasattr(self, "recording_mode_combo") else "Preset Protocol"
+        mode_text = self.recording_mode_combo.currentText() if hasattr(self,
+                                                                       "recording_mode_combo") else "Preset Protocol"
         self._recording_mode = "preset"
         if mode_text.startswith("Custom"):
             self._recording_mode = "custom"
@@ -920,76 +962,188 @@ class MainWindow(QMainWindow):
         return tab
 
     def _create_training_tab(self) -> QWidget:
-        """Create the model training tab."""
+        """Create the improved model training tab."""
         tab = QWidget()
-        layout = QVBoxLayout(tab)
+        outer = QVBoxLayout(tab)
+        outer.setContentsMargins(6, 6, 6, 6)
 
-        # Dataset selection
-        dataset_group = QGroupBox("Dataset")
-        dataset_layout = QVBoxLayout(dataset_group)
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        outer.addWidget(splitter)
 
+        # ── Top half: Dataset management ──────────────────────────────────────
+        top_widget = QWidget()
+        top_lay = QVBoxLayout(top_widget)
+        top_lay.setContentsMargins(0, 0, 0, 0)
+
+        ds_grp = QGroupBox("Datasets")
+        ds_lay = QVBoxLayout(ds_grp)
+
+        # Toolbar
+        ds_toolbar = QHBoxLayout()
         self.refresh_datasets_btn = QPushButton("Refresh")
-        self.refresh_datasets_btn.setFixedHeight(36)
+        self.refresh_datasets_btn.setFixedHeight(28)
         self.refresh_datasets_btn.clicked.connect(self._refresh_datasets)
-        dataset_layout.addWidget(self.refresh_datasets_btn)
+        ds_toolbar.addWidget(self.refresh_datasets_btn)
+
+        self.create_dataset_btn = QPushButton("＋  New Dataset…")
+        self.create_dataset_btn.setFixedHeight(28)
+        self.create_dataset_btn.setStyleSheet(
+            "QPushButton{background:#1a3a1a;color:#22c55e;"
+            "border:1px solid #22c55e;border-radius:5px;padding:4px 10px;}"
+            "QPushButton:hover{background:#22c55e;color:#fff;}")
+        self.create_dataset_btn.clicked.connect(self._on_create_dataset)
+        ds_toolbar.addWidget(self.create_dataset_btn)
+
+        self.delete_dataset_btn = QPushButton("Delete")
+        self.delete_dataset_btn.setFixedHeight(28)
+        self.delete_dataset_btn.setStyleSheet(
+            "QPushButton{color:#ef4444;border-color:#ef4444;border-radius:5px;padding:4px 10px;}"
+            "QPushButton:hover{background:#ef4444;color:#fff;}")
+        self.delete_dataset_btn.clicked.connect(self._on_delete_dataset)
+        ds_toolbar.addWidget(self.delete_dataset_btn)
+
+        ds_toolbar.addStretch()
+
+        # Dataset info label (updates on selection)
+        self._ds_info_lbl = QLabel("Select a dataset to see info")
+        self._ds_info_lbl.setStyleSheet(
+            "color:#94a3b8;font-size:10px;font-style:italic;")
+        ds_toolbar.addWidget(self._ds_info_lbl)
+        ds_lay.addLayout(ds_toolbar)
 
         self.dataset_list = QListWidget()
         self.dataset_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        dataset_layout.addWidget(self.dataset_list)
+        self.dataset_list.setAlternatingRowColors(True)
+        self.dataset_list.setMinimumHeight(90)
+        self.dataset_list.currentItemChanged.connect(self._on_dataset_selection_changed)
+        ds_lay.addWidget(self.dataset_list)
 
-        self.create_dataset_btn = QPushButton("Create Dataset from Sessions...")
-        self.create_dataset_btn.setFixedHeight(36)
-        self.create_dataset_btn.clicked.connect(self._on_create_dataset)
-        dataset_layout.addWidget(self.create_dataset_btn)
+        top_lay.addWidget(ds_grp)
+        splitter.addWidget(top_widget)
 
-        self.delete_dataset_btn = QPushButton("Delete Selected Dataset(s)")
-        self.delete_dataset_btn.setFixedHeight(36)
-        self.delete_dataset_btn.clicked.connect(self._on_delete_dataset)
-        self.delete_dataset_btn.setStyleSheet("QPushButton { color: red; }")
-        dataset_layout.addWidget(self.delete_dataset_btn)
+        # ── Bottom half: Model training ───────────────────────────────────────
+        bot_widget = QWidget()
+        bot_lay = QVBoxLayout(bot_widget)
+        bot_lay.setContentsMargins(0, 0, 0, 0)
 
-        layout.addWidget(dataset_group)
+        model_grp = QGroupBox("Model Training")
+        model_outer = QVBoxLayout(model_grp)
 
-        # Model selection
-        model_group = QGroupBox("Model")
-        model_layout = QFormLayout(model_group)
+        # Model type grid with annotations
+        model_type_lbl = QLabel("Model type:")
+        model_type_lbl.setStyleSheet("color:#94a3b8;font-size:10px;")
+        model_outer.addWidget(model_type_lbl)
 
+        model_type_row = QHBoxLayout()
         self.model_type_combo = QComboBox()
-        self.model_type_combo.addItems(["SVM", "Random Forest", "LDA", "CatBoost", "MLP", "CNN", "AttentionNet", "MSTNet"])
-        model_layout.addRow("Model Type:", self.model_type_combo)
 
-        train_btn_layout = QHBoxLayout()
-        self.train_btn = QPushButton("Train Model")
+        _MODEL_ANNOTATIONS = [
+            ("SVM", "Fast, linear/RBF. Great baseline for small datasets."),
+            ("Random Forest", "Robust, handles noise well. Good for multi-class."),
+            ("LDA", "Very fast, works well on linearly separable EMG data."),
+            ("CatBoost", "Powerful gradient boosting. Often best on tabular features."),
+            ("MLP", "Neural network. Best when you have 10k+ windows."),
+            ("CNN", "Learns spatial EMG patterns. Requires raw windows."),
+            ("AttentionNet", "Transformer attention. Strongest for temporal patterns."),
+            ("MSTNet", "Multi-scale temporal net. State-of-the-art for HD-EMG."),
+        ]
+        for name, _ in _MODEL_ANNOTATIONS:
+            self.model_type_combo.addItem(name)
+
+        self._model_hint_lbl = QLabel("")
+        self._model_hint_lbl.setStyleSheet(
+            "color:#94a3b8;font-size:10px;font-style:italic;")
+        self._model_hint_lbl.setWordWrap(True)
+
+        def _update_model_hint(idx):
+            if 0 <= idx < len(_MODEL_ANNOTATIONS):
+                self._model_hint_lbl.setText(_MODEL_ANNOTATIONS[idx][1])
+
+        self.model_type_combo.currentIndexChanged.connect(_update_model_hint)
+        _update_model_hint(0)
+
+        model_type_row.addWidget(self.model_type_combo, stretch=1)
+        model_outer.addLayout(model_type_row)
+        model_outer.addWidget(self._model_hint_lbl)
+
+        # Train buttons
+        train_btn_row = QHBoxLayout()
+
+        self.train_btn = QPushButton("▶ Quick Train (80/20 split)")
         self.train_btn.setFixedHeight(36)
+        self.train_btn.setStyleSheet(
+            "QPushButton{background:#1a2e4a;color:#06b6d4;"
+            "border:1px solid #06b6d4;border-radius:6px;"
+            "font-weight:700;font-size:12px;padding:6px 18px;}"
+            "QPushButton:hover{background:#06b6d4;color:#fff;}"
+            "QPushButton:disabled{color:#4b5563;border-color:#2d2d40;background:#1e1e2e;}")
+        self.train_btn.setShortcut("Ctrl+T")
+        self.train_btn.setToolTip("Train on selected dataset with default 80/20 split (Ctrl+T)")
         self.train_btn.clicked.connect(self._on_train_model)
-        train_btn_layout.addWidget(self.train_btn)
-        model_layout.addRow(train_btn_layout)
+        train_btn_row.addWidget(self.train_btn)
 
-        layout.addWidget(model_group)
+        adv_train_btn = QPushButton("Advanced Training...")
+        adv_train_btn.setFixedHeight(36)
+        adv_train_btn.setToolTip("Open advanced training dialog with full CV, augmentation, etc.")
+        adv_train_btn.clicked.connect(self._on_advanced_training)
+        train_btn_row.addWidget(adv_train_btn)
 
-        # Trained models
-        models_group = QGroupBox("Trained Models")
-        models_layout = QVBoxLayout(models_group)
+        model_outer.addLayout(train_btn_row)
+        bot_lay.addWidget(model_grp)
+
+        # ── Trained models ────────────────────────────────────────────────────
+        saved_grp = QGroupBox("Saved Models")
+        saved_lay = QVBoxLayout(saved_grp)
+
+        models_toolbar = QHBoxLayout()
+        self.refresh_models_btn = QPushButton("Refresh")
+        self.refresh_models_btn.setFixedHeight(26)
+        self.refresh_models_btn.clicked.connect(self._refresh_models)
+        models_toolbar.addWidget(self.refresh_models_btn)
+
+        self.delete_model_btn = QPushButton("Delete Selected")
+        self.delete_model_btn.setFixedHeight(26)
+        self.delete_model_btn.setStyleSheet(
+            "QPushButton{color:#ef4444;border-color:#ef4444;}"
+            "QPushButton:hover{background:#ef4444;color:#fff;}")
+        self.delete_model_btn.clicked.connect(self._on_delete_model)
+        models_toolbar.addWidget(self.delete_model_btn)
+        models_toolbar.addStretch()
+        saved_lay.addLayout(models_toolbar)
 
         self.models_list = QListWidget()
         self.models_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        models_layout.addWidget(self.models_list)
+        self.models_list.setAlternatingRowColors(True)
+        self.models_list.setMinimumHeight(80)
+        saved_lay.addWidget(self.models_list)
 
-        self.refresh_models_btn = QPushButton("Refresh")
-        self.refresh_models_btn.setFixedHeight(36)
-        self.refresh_models_btn.clicked.connect(self._refresh_models)
-        models_layout.addWidget(self.refresh_models_btn)
+        bot_lay.addWidget(saved_grp)
+        splitter.addWidget(bot_widget)
+        splitter.setSizes([200, 320])
 
-        self.delete_model_btn = QPushButton("Delete Selected Model(s)")
-        self.delete_model_btn.setFixedHeight(36)
-        self.delete_model_btn.clicked.connect(self._on_delete_model)
-        self.delete_model_btn.setStyleSheet("QPushButton { color: red; }")
-        models_layout.addWidget(self.delete_model_btn)
-
-        layout.addWidget(models_group)
-
-        layout.addStretch()
         return tab
+
+    def _on_dataset_selection_changed(self, current, previous):
+        """Update dataset info label when selection changes."""
+        if current is None:
+            self._ds_info_lbl.setText("Select a dataset to see info")
+            return
+        name = current.text()
+        try:
+            meta = self.data_manager.load_dataset(name).get("metadata", {})
+            n_samples = meta.get("num_samples", "?")
+            n_classes = meta.get("num_classes", "?")
+            n_channels = meta.get("num_channels", "?")
+            sr = meta.get("sampling_rate", "?")
+            ws_ms = meta.get("window_size_ms", "?")
+            label_names = meta.get("label_names", {})
+            classes_str = ", ".join(label_names.values()) if label_names else str(n_classes)
+            self._ds_info_lbl.setText(
+                f"{n_samples:,} windows  ·  {n_classes} classes  ·  "
+                f"{n_channels}ch  ·  {sr}Hz  ·  {ws_ms}ms  |  {classes_str}"
+            )
+        except Exception:
+            self._ds_info_lbl.setText(name)
 
     def _create_prediction_tab(self) -> QWidget:
         """Create the real-time prediction tab."""
@@ -1013,8 +1167,6 @@ class MainWindow(QMainWindow):
         self.load_model_btn.setFixedHeight(36)
         self.load_model_btn.clicked.connect(self._on_load_model)
         model_layout.addRow(self.load_model_btn)
-
-
 
         # Pretrained model workflow guide
         pretrained_info = QLabel(
@@ -1307,20 +1459,19 @@ class MainWindow(QMainWindow):
         timestamp = datetime.now().strftime("%H:%M:%S")
         # Color-code by content keywords for quick visual scanning
         if any(k in message.lower() for k in ("error", "failed", "critical")):
-            color = "#f48771"   # red-ish
+            color = "#f48771"  # red-ish
         elif any(k in message.lower() for k in ("warning", "mismatch", "skipped")):
-            color = "#e5c07b"   # amber
+            color = "#e5c07b"  # amber
         elif any(k in message.lower() for k in ("complete", "success", "loaded", "saved", "started", "connected")):
-            color = "#98c379"   # green
+            color = "#98c379"  # green
         else:
-            color = "#d4d4d4"   # default light grey
+            color = "#d4d4d4"  # default light grey
         ts_html = f'<span style="color:#858585;">[{timestamp}]</span>'
         msg_html = f'<span style="color:{color};">{message}</span>'
         self.log_text.append(f"{ts_html} {msg_html}")
-
-
-
-
+        self.log_text.verticalScrollBar().setValue(
+            self.log_text.verticalScrollBar().maximum()
+        )
 
     def closeEvent(self, event):
         """Handle window close."""
@@ -1349,13 +1500,32 @@ class MainWindow(QMainWindow):
         event.accept()
 
     def _update_status(self):
-        """Update status bar."""
+        """Update status bar with device, recording, and prediction state."""
         device = self.device_manager.device
-        if device and device.is_connected:
-            status = "Connected" if not device.is_streaming else "Streaming"
-            self.device_status_label.setText(f"Device: {status} ({device.num_channels}ch @ {device.sampling_rate}Hz)")
+
+        # Recording indicator
+        is_recording = (self._current_session is not None and
+                        self._current_session.is_recording)
+        if is_recording:
+            # Blink the indicator
+            if not hasattr(self, "_rec_blink"):
+                self._rec_blink = True
+            self._rec_blink = not self._rec_blink
+            blink = "🔴" if self._rec_blink else "⭕"
+            rec_txt = f" {blink} RECORDING"
         else:
-            self.device_status_label.setText("Device: Not connected")
+            rec_txt = ""
+
+        if device and device.is_connected:
+            streaming = device.is_streaming
+            status = "Streaming" if streaming else "Connected"
+            self.device_status_label.setText(
+                f"Device: {status}  "
+                f"{device.num_channels}ch @ {device.sampling_rate}Hz"
+                f"{rec_txt}"
+            )
+        else:
+            self.device_status_label.setText(f"Device: Not connected{rec_txt}")
 
     @Slot()
     def _on_export_dataset(self):
@@ -1420,7 +1590,8 @@ class MainWindow(QMainWindow):
             "device": {
                 "num_channels": self.channels_spin.value(),
                 "sampling_rate": self.sampling_rate_spin.value()
-            }
+            },
+            "ui_theme": getattr(self.config, "ui_theme", "bright"),
         }
 
         dialog = ConfigurationDialog(current_config, self)
@@ -1441,10 +1612,13 @@ class MainWindow(QMainWindow):
                 idx = self.device_combo.findText(dev["type"])
                 if idx >= 0:
                     self.device_combo.setCurrentIndex(idx)
+                self.config.device.device_type = str(dev["type"]).lower().replace(" ", "_")
             if "num_channels" in dev:
                 self.channels_spin.setValue(dev["num_channels"])
+                self.config.device.num_channels = int(dev["num_channels"])
             if "sampling_rate" in dev:
                 self.sampling_rate_spin.setValue(dev["sampling_rate"])
+                self.config.device.sampling_rate = int(dev["sampling_rate"])
 
         # Apply recording settings
         if "recording" in config:
@@ -1457,6 +1631,15 @@ class MainWindow(QMainWindow):
             cal = config["calibration"]
             if self.calibrator and self.calibrator.current_calibration:
                 self.calibrator.current_calibration.rotation_offset = cal.get("rotation_offset", 0)
+
+        if "ui_theme" in config:
+            self.config.ui_theme = str(config["ui_theme"])
+            self._apply_app_theme()
+
+        try:
+            self.config.save(self._pipeline_dir / "config.json")
+        except Exception as e:
+            self._log(f"Could not save config: {e}")
 
     @Slot()
     def _on_advanced_training(self):
@@ -1566,6 +1749,8 @@ class MainWindow(QMainWindow):
             device_type = DeviceType.MUOVI
         elif device_text == "Muovi Plus":
             device_type = DeviceType.MUOVI_PLUS
+        elif device_text == "Quattrocento Replay":
+            device_type = DeviceType.QUATTROCENTO
         else:
             device_type = DeviceType.SYNTHETIC
 
@@ -1573,7 +1758,7 @@ class MainWindow(QMainWindow):
             # 2. Create the device instance through the manager
             # This will clean up any existing device automatically
             kwargs = {
-                "num_channels": self.channels_spin.value(), 
+                "num_channels": self.channels_spin.value(),
                 "sampling_rate": self.sampling_rate_spin.value(),
                 "bipolar_mode": self.bipolar_mode_cb.isChecked()
             }
@@ -1581,7 +1766,13 @@ class MainWindow(QMainWindow):
             # Add session replay parameters for synthetic device
             if device_type == DeviceType.SYNTHETIC and self.use_session_data_cb.isChecked():
                 kwargs.update({"use_session_data": True, "session_subject_id": self.session_subject_combo.currentText(),
-                    "session_id": self.session_id_combo.currentText(), "data_dir": str(self.data_dir)})
+                               "session_id": self.session_id_combo.currentText(), "data_dir": str(self.data_dir)})
+            elif device_type == DeviceType.QUATTROCENTO:
+                kwargs.update({
+                    "quattrocento_root": self.quattro_root_edit.text().strip(),
+                    "quattrocento_side": self.quattro_side_combo.currentText().strip().lower(),
+                    "data_dir": str(self.data_dir),
+                })
 
             device = self.device_manager.create_device(device_type, **kwargs)
 
@@ -1809,9 +2000,10 @@ class MainWindow(QMainWindow):
         actual_channels = device.num_channels
 
         self._current_session = RecordingSession(session_id=session_id, subject_id=subject_id,
-            device_name=device.config.device_type.name, num_channels=actual_channels,
-            sampling_rate=device.sampling_rate, gesture_set=gesture_set,
-            protocol_name=(protocol_config.name if protocol_config else "manual"))
+                                                 device_name=device.config.device_type.name,
+                                                 num_channels=actual_channels,
+                                                 sampling_rate=device.sampling_rate, gesture_set=gesture_set,
+                                                 protocol_name=(protocol_config.name if protocol_config else "manual"))
         self._current_session.metadata.notes = self.session_notes_edit.text()
         # Store bad channels in session metadata from the start
         self._current_session.metadata.bad_channels = bad_channels
@@ -1838,7 +2030,8 @@ class MainWindow(QMainWindow):
                 "repetitions": int(self.custom_reps_spin.value()),
             }
         if self._recording_mode == "manual":
-            self._current_session.metadata.custom_metadata["manual_gesture"] = self.manual_gesture_combo.currentText().strip().lower()
+            self._current_session.metadata.custom_metadata[
+                "manual_gesture"] = self.manual_gesture_combo.currentText().strip().lower()
 
         # Setup protocol widget
         if self._current_protocol is not None:
@@ -2057,27 +2250,27 @@ class MainWindow(QMainWindow):
                 # Auto-save as new reference since the old one is useless
                 self.calibrator.save_as_reference(result)
                 QMessageBox.information(self, "New Reference Saved",
-                    f"Calibration from session '{session_id}' complete!\n\n"
-                    f"The previous reference calibration was incompatible:\n"
-                    f"{incompat}\n\n"
-                    f"This session has been saved as the new reference.\n"
-                    f"Future sessions with the same gestures will detect\n"
-                    f"bracelet rotation relative to this recording.")
+                                        f"Calibration from session '{session_id}' complete!\n\n"
+                                        f"The previous reference calibration was incompatible:\n"
+                                        f"{incompat}\n\n"
+                                        f"This session has been saved as the new reference.\n"
+                                        f"Future sessions with the same gestures will detect\n"
+                                        f"bracelet rotation relative to this recording.")
             elif not self.calibrator.has_reference:
                 self._log(f"  No reference found. Saving as reference.")
                 self.calibrator.save_as_reference(result)
                 QMessageBox.information(self, "Reference Saved",
-                    f"Calibration from session '{session_id}' complete!\n\n"
-                    f"No existing reference was found, so this session has\n"
-                    f"been saved as the new reference calibration.\n\n"
-                    f"Future sessions will detect bracelet rotation\n"
-                    f"relative to this recording.")
+                                        f"Calibration from session '{session_id}' complete!\n\n"
+                                        f"No existing reference was found, so this session has\n"
+                                        f"been saved as the new reference calibration.\n\n"
+                                        f"Future sessions will detect bracelet rotation\n"
+                                        f"relative to this recording.")
             else:
                 QMessageBox.information(self, "Calibration Complete",
-                    f"Calibration from session '{session_id}' complete!\n\n"
-                    f"Rotation offset: {result.rotation_offset} channels\n"
-                    f"Confidence: {result.confidence:.2%}\n\n"
-                    f"Save as reference to use for future sessions.")
+                                        f"Calibration from session '{session_id}' complete!\n\n"
+                                        f"Rotation offset: {result.rotation_offset} channels\n"
+                                        f"Confidence: {result.confidence:.2%}\n\n"
+                                        f"Save as reference to use for future sessions.")
 
         except Exception as e:
             self._log(f"Calibration error: {e}")
@@ -2114,7 +2307,7 @@ class MainWindow(QMainWindow):
     def _on_load_calibration(self):
         """Load a calibration file."""
         file_path, _ = QFileDialog.getOpenFileName(self, "Load Calibration", str(self.data_dir / "calibrations"),
-            "JSON Files (*.json)")
+                                                   "JSON Files (*.json)")
         if file_path:
             from playagain_pipeline.calibration.calibrator import CalibrationResult
             cal = CalibrationResult.load(Path(file_path))
@@ -2176,8 +2369,8 @@ class MainWindow(QMainWindow):
         self._live_cal_current_idx = 0
         self._live_cal_buffer = []
         self._live_cal_collected = {}
-        self._live_cal_active = False   # will be set True when countdown reaches 0
-        self._live_cal_countdown = 3    # 3-second countdown before first gesture
+        self._live_cal_active = False  # will be set True when countdown reaches 0
+        self._live_cal_countdown = 3  # 3-second countdown before first gesture
 
         self.start_live_cal_btn.setEnabled(False)
         self.cancel_live_cal_btn.setEnabled(True)
@@ -2305,14 +2498,14 @@ class MainWindow(QMainWindow):
             self._live_cal_update_status(status)
             self._live_cal_show_gesture_prompt(
                 "COMPLETE", "", f"Rotation: {result.rotation_offset} ch, "
-                f"Confidence: {result.confidence:.0%}", color="#4CAF50"
+                                f"Confidence: {result.confidence:.0%}", color="#4CAF50"
             )
 
             QMessageBox.information(self, "Live Calibration Complete",
-                f"Rotation offset: {result.rotation_offset} channels\n"
-                f"Confidence: {result.confidence:.2%}\n\n"
-                f"Calibration applied. You can now load a pretrained model\n"
-                f"and start prediction.")
+                                    f"Rotation offset: {result.rotation_offset} channels\n"
+                                    f"Confidence: {result.confidence:.2%}\n\n"
+                                    f"Calibration applied. You can now load a pretrained model\n"
+                                    f"and start prediction.")
         except Exception as e:
             self._live_cal_update_status(f"Error: {e}")
             self._log(f"Live calibration error: {e}")
@@ -2568,6 +2761,7 @@ class MainWindow(QMainWindow):
 
         def on_name_edited(text):
             state["manual_edit"] = True
+
         name_edit.textEdited.connect(on_name_edited)
 
         def update_dataset_name():
@@ -2584,7 +2778,7 @@ class MainWindow(QMainWindow):
                     new_name = f"{selected_items[0].text()}"
                 else:
                     new_name = f"{len(selected_items)}_subjects"
-            else: # Session tab
+            else:  # Session tab
                 selected_items = session_list.selectedItems()
                 if not selected_items:
                     new_name = "dataset_no_session"
@@ -2681,6 +2875,7 @@ class MainWindow(QMainWindow):
                 apply_cal_cb.setEnabled(False)
             else:
                 apply_cal_cb.setEnabled(has_cal)
+
         per_session_rot_cb.toggled.connect(_on_per_session_toggled)
 
         # ── Feature extraction options ─────────────────────────────────────
@@ -2695,7 +2890,8 @@ class MainWindow(QMainWindow):
         )
         feature_group_layout.addWidget(extract_features_cb)
 
-        from PySide6.QtWidgets import QRadioButton, QButtonGroup, QListWidget as QListWidgetD, QListWidgetItem as QListWidgetItemD
+        from PySide6.QtWidgets import QRadioButton, QButtonGroup, QListWidget as QListWidgetD, \
+            QListWidgetItem as QListWidgetItemD
         feat_btn_group = QButtonGroup(dialog)
         feat_radio_default = QRadioButton("All Features (Default)")
         feat_radio_default.setChecked(True)
@@ -2718,6 +2914,7 @@ class MainWindow(QMainWindow):
 
         def _on_feat_mode_changed():
             feat_list.setEnabled(feat_radio_custom.isChecked())
+
         feat_radio_custom.toggled.connect(lambda: _on_feat_mode_changed())
         extract_features_cb.toggled.connect(lambda checked: (
             feat_radio_default.setEnabled(checked),
@@ -2847,7 +3044,7 @@ class MainWindow(QMainWindow):
             window_samples = dataset['metadata']['window_samples']
 
             self._log(f"Dataset loaded: {num_samples} samples, {num_classes} classes, "
-                     f"{num_channels} channels, {window_samples} samples/window")
+                      f"{num_channels} channels, {window_samples} samples/window")
 
             # Create model
             model_type_text = self.model_type_combo.currentText()
@@ -2878,7 +3075,7 @@ class MainWindow(QMainWindow):
             )
 
             self._log(f"Splitting data: Train={len(X_train)} samples, "
-                     f"Validation={len(X_val)} samples")
+                      f"Validation={len(X_val)} samples")
 
             # Train
             self._log(f"Starting training ({model_type})...")
@@ -2931,9 +3128,9 @@ class MainWindow(QMainWindow):
             # Warn if channel count differs from model's trained channel count
             model_ch = self._current_model.metadata.num_channels
             if model_ch > 0 and num_ch != model_ch:
-                    self._log(
-                        f"  Channel mismatch: device has {num_ch} ch, model trained on {model_ch} ch."
-                    )
+                self._log(
+                    f"  Channel mismatch: device has {num_ch} ch, model trained on {model_ch} ch."
+                )
 
         except Exception as e:
             self._log(f"Error loading model: {e}")
@@ -3361,6 +3558,27 @@ class MainWindow(QMainWindow):
             # Load available sessions for the selected subject
             self._load_available_sessions()
 
+    @Slot(str)
+    def _on_device_selection_changed(self, device_text: str):
+        """Toggle replay controls based on selected device."""
+        is_synth = device_text == "Synthetic"
+        is_q4 = device_text == "Quattrocento Replay"
+
+        self.use_session_data_cb.setEnabled(is_synth)
+        if not is_synth:
+            self.use_session_data_cb.setChecked(False)
+
+        self.quattro_root_edit.setEnabled(is_q4)
+        self.quattro_root_btn.setEnabled(is_q4)
+        self.quattro_side_combo.setEnabled(is_q4)
+
+    @Slot()
+    def _pick_quattrocento_root(self):
+        start_dir = self.quattro_root_edit.text().strip() or str(self.data_dir)
+        chosen = QFileDialog.getExistingDirectory(self, "Select Quattrocento root", start_dir)
+        if chosen:
+            self.quattro_root_edit.setText(chosen)
+
     def _load_available_sessions(self):
         """Load available session IDs for the selected subject."""
         subject = self.session_subject_combo.currentText()
@@ -3379,123 +3597,8 @@ class MainWindow(QMainWindow):
             self.session_id_combo.setCurrentText(sessions[-1])
 
     def _apply_app_theme(self):
-        """Apply a consistent, modern dark-adaptive theme to the whole app."""
-        self.setStyleSheet("""
-            QMainWindow, QDialog {
-                background: #1e1e2e;
-                color: #e2e8f0;
-            }
-            QTabWidget::pane {
-                border: 1px solid #3f3f5c;
-                border-radius: 6px;
-                background: #2a2a3e;
-            }
-            QTabBar::tab {
-                background: #1e1e2e;
-                color: #94a3b8;
-                padding: 6px 14px;
-                border: 1px solid #3f3f5c;
-                border-bottom: none;
-                border-top-left-radius: 5px;
-                border-top-right-radius: 5px;
-                margin-right: 2px;
-                font-size: 11px;
-            }
-            QTabBar::tab:selected {
-                background: #2a2a3e;
-                color: #06b6d4;
-                border-bottom: 2px solid #06b6d4;
-            }
-            QGroupBox {
-                background: #2a2a3e;
-                border: 1px solid #3f3f5c;
-                border-radius: 7px;
-                font-weight: 600;
-                color: #e2e8f0;
-                padding-top: 14px;
-                margin-top: 5px;
-            }
-            QGroupBox::title {
-                subcontrol-origin: margin;
-                left: 10px;
-                padding: 0 5px;
-                color: #06b6d4;
-                font-size: 11px;
-            }
-            QPushButton {
-                background: #313145;
-                color: #e2e8f0;
-                border: 1px solid #3f3f5c;
-                border-radius: 5px;
-                padding: 5px 12px;
-                font-size: 12px;
-            }
-            QPushButton:hover { border-color: #06b6d4; color: #06b6d4; }
-            QPushButton:pressed { background: #3f3f5c; }
-            QPushButton:disabled { color: #4b5563; border-color: #2d2d40; }
-            QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit {
-                background: #1e1e2e;
-                color: #e2e8f0;
-                border: 1px solid #3f3f5c;
-                border-radius: 4px;
-                padding: 3px 6px;
-                selection-background-color: #7c3aed;
-            }
-            QComboBox:focus, QLineEdit:focus,
-            QSpinBox:focus, QDoubleSpinBox:focus {
-                border-color: #7c3aed;
-            }
-            QComboBox::drop-down { border: none; }
-            QListWidget, QTableWidget {
-                background: #1e1e2e;
-                color: #e2e8f0;
-                border: 1px solid #3f3f5c;
-                border-radius: 5px;
-                alternate-background-color: #252538;
-                selection-background-color: #7c3aed;
-            }
-            QProgressBar {
-                background: #1e1e2e;
-                border: 1px solid #3f3f5c;
-                border-radius: 4px;
-                height: 12px;
-                text-align: center;
-                font-size: 10px;
-                color: #e2e8f0;
-            }
-            QProgressBar::chunk {
-                background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
-                    stop:0 #7c3aed, stop:1 #06b6d4);
-                border-radius: 3px;
-            }
-            QCheckBox, QRadioButton { color: #e2e8f0; spacing: 6px; }
-            QCheckBox::indicator, QRadioButton::indicator {
-                border: 1px solid #3f3f5c;
-                background: #1e1e2e;
-                border-radius: 3px;
-                width: 13px; height: 13px;
-            }
-            QCheckBox::indicator:checked, QRadioButton::indicator:checked {
-                background: #7c3aed; border-color: #7c3aed;
-            }
-            QLabel { color: #e2e8f0; }
-            QHeaderView::section {
-                background: #2a2a3e; color: #94a3b8;
-                border: none; padding: 4px 8px; font-size: 10px;
-            }
-            QStatusBar { background: #13131f; color: #94a3b8; font-size: 11px; }
-            QMenuBar { background: #13131f; color: #e2e8f0; }
-            QMenuBar::item:selected { background: #2a2a3e; }
-            QMenu { background: #2a2a3e; border: 1px solid #3f3f5c; color: #e2e8f0; }
-            QMenu::item:selected { background: #7c3aed; }
-            QScrollBar:vertical {
-                background: #1e1e2e; width: 8px; margin: 0;
-            }
-            QScrollBar::handle:vertical {
-                background: #3f3f5c; border-radius: 4px; min-height: 20px;
-            }
-            QSplitter::handle { background: #3f3f5c; }
-        """)
+        """Apply the shared dark theme consistently across tabs and dialogs."""
+        apply_app_style(self, getattr(self.config, "ui_theme", "bright"))
 
 
 def main():

@@ -790,7 +790,7 @@ def export_transformed_bundle(
 
 def _import_qt_modules() -> dict[str, Any]:
     try:
-        from PyQt6.QtCore import Qt
+        from PyQt6.QtCore import Qt, QTimer
         from PyQt6.QtWidgets import (
             QApplication,
             QCheckBox,
@@ -819,7 +819,7 @@ def _import_qt_modules() -> dict[str, Any]:
         )
         qt_api = "PyQt6"
     except ImportError:
-        from PySide6.QtCore import Qt
+        from PySide6.QtCore import Qt, QTimer
         from PySide6.QtWidgets import (
             QApplication,
             QCheckBox,
@@ -854,6 +854,7 @@ def _import_qt_modules() -> dict[str, Any]:
 
     return {
         "Qt": Qt,
+        "QTimer": QTimer,
         "QApplication": QApplication,
         "QCheckBox": QCheckBox,
         "QComboBox": QComboBox,
@@ -929,10 +930,15 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
             self.external_canvas: Any | None = None
             self.external_ax_raw: Any | None = None
             self.external_ax_proc: Any | None = None
+            self._plot_update_pending = False
 
             self.setWindowTitle(f"Data Viewer ({qt['qt_api']})")
             self.resize(1920, 1120)
             self.setStatusBar(QStatusBar())
+
+            self._plot_update_timer = qt["QTimer"](self)
+            self._plot_update_timer.setSingleShot(True)
+            self._plot_update_timer.timeout.connect(self._update_plot_only_now)
 
             root_widget = QWidget()
             root_layout = QVBoxLayout(root_widget)
@@ -1290,6 +1296,8 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
 
         def _on_type_changed(self, text: str) -> None:
             self.source_type = text
+            if text == UNITY_SOURCE_TYPE:
+                self.root_line.setText(str(UNITY_DEFAULT_ROOT))
             self._refresh_datasets()
 
         def _pick_dataset_folder(self) -> None:
@@ -1486,6 +1494,11 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
             self.external_ax_raw = None
             self.external_ax_proc = None
 
+        def _update_plot_only(self) -> None:
+            # Debounce UI-driven redraw bursts (slider + channel multiselect).
+            self._plot_update_pending = True
+            self._plot_update_timer.start(40)
+
         def _render_signal_axes(
             self,
             ax_raw: Any,
@@ -1556,9 +1569,12 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
                 if display_cfg.show_processed:
                     ax_proc.legend(loc="upper right", fontsize=8)
 
-        def _update_plot_only(self) -> None:
+        def _update_plot_only_now(self) -> None:
             if self.bundle is None:
                 return
+            if not self._plot_update_pending:
+                return
+            self._plot_update_pending = False
 
             display_cfg = self._current_display_config()
             channels = self._selected_channels()
@@ -1571,13 +1587,15 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
             proc = self.transformed_signal[mask][:, channels] if self.transformed_signal.size else raw
 
             ds = display_cfg.downsample_factor
+            # Keep plotting responsive on long windows/high sampling rates.
+            if t.size > 4000:
+                ds = max(ds, int(np.ceil(t.size / 4000.0)))
             if ds > 1:
                 t = t[::ds]
                 raw = raw[::ds]
                 proc = proc[::ds]
 
             self._render_signal_axes(self.ax_raw, self.ax_proc, t, raw, proc, channels, display_cfg)
-            self.figure.tight_layout()
             self.canvas.draw_idle()
 
             if (
@@ -1595,7 +1613,6 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
                     channels,
                     display_cfg,
                 )
-                self.external_figure.tight_layout()
                 self.external_canvas.draw_idle()
 
         def _update_metadata_tab(self) -> None:

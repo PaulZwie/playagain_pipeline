@@ -39,6 +39,7 @@ if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from playagain_pipeline.core.data_manager import DataManager
+from playagain_pipeline.gui.gui_style import apply_app_style
 from playagain_pipeline.models.classifier import ModelManager
 from playagain_pipeline.models.feature_pipeline import get_registered_features
 
@@ -758,6 +759,7 @@ class PerformanceReviewTab(QWidget):
         self._worker: Optional[ComparisonWorker] = None
         self._last_output_dir: Optional[str] = None
         self._build_ui()
+        apply_app_style(self)
         self.refresh_sessions()
 
     # ──────────────────────────────────────────────────────────────────

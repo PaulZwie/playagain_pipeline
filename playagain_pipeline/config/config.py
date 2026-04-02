@@ -175,6 +175,7 @@ class PipelineConfig:
     protocol: ProtocolSettings = field(default_factory=ProtocolSettings)
 
     # GUI settings
+    ui_theme: str = "bright"
     display_time: float = 5.0
     update_rate_hz: int = 30
 
@@ -285,6 +286,7 @@ class PipelineConfig:
                 "cal_repetitions": self.protocol.cal_repetitions,
                 "cal_randomize": self.protocol.cal_randomize
             },
+            "ui_theme": self.ui_theme,
             "display_time": self.display_time,
             "update_rate_hz": self.update_rate_hz
         }
@@ -414,6 +416,7 @@ class PipelineConfig:
                 cal_randomize=p.get("cal_randomize", config.protocol.cal_randomize)
             )
 
+        config.ui_theme = data.get("ui_theme", config.ui_theme)
         config.display_time = data.get("display_time", config.display_time)
         config.update_rate_hz = data.get("update_rate_hz", config.update_rate_hz)
 

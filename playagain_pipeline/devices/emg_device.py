@@ -9,6 +9,7 @@ from abc import abstractmethod
 from typing import Optional, Dict, Any, Callable
 from enum import Enum, auto
 from dataclasses import dataclass
+from pathlib import Path
 import numpy as np
 from PySide6.QtCore import QObject, Signal, QTimer, QMutex, QMutexLocker
 
@@ -784,6 +785,155 @@ class SyntheticEMGDevice(BaseEMGDevice):
             self.config.extra_settings["physical_num_channels"] = self._session_data.shape[1]
 
 
+class QuattrocentoReplayDevice(BaseEMGDevice):
+    """Replay Quattrocento CSV recordings as a live stream with trigger-based labels."""
+
+    def __init__(
+        self,
+        root_dir: str,
+        side: str = "left",
+        samples_per_frame: int = 100,
+        parent: Optional[QObject] = None,
+    ):
+        config = DeviceConfig(
+            device_type=DeviceType.QUATTROCENTO,
+            num_channels=192,
+            sampling_rate=2048,
+            samples_per_frame=samples_per_frame,
+        )
+        super().__init__(config, parent)
+        self._root_dir = Path(root_dir).expanduser()
+        self._side = (side or "left").lower()
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._emit_frame)
+        self._data = np.empty((0, 0), dtype=np.float32)
+        self._idx = 0
+        self._trials: list[tuple[int, int, str]] = []
+        self._current_ground_truth = "Unknown"
+
+    def connect_device(self) -> bool:
+        try:
+            self._load_replay_data()
+            if self._data.size == 0:
+                raise ValueError("No Quattrocento samples loaded")
+            self._is_connected = True
+            self.connected.emit(True)
+            return True
+        except Exception as e:
+            self.error.emit(f"Quattrocento load error: {e}")
+            self._is_connected = False
+            self.connected.emit(False)
+            return False
+
+    def disconnect(self) -> None:
+        self.stop_streaming()
+        self._is_connected = False
+        self.connected.emit(False)
+
+    def start_streaming(self) -> bool:
+        if not self._is_connected:
+            self.error.emit("Device not connected")
+            return False
+        frame_duration_ms = int(1000 * self.config.samples_per_frame / max(1, self.config.sampling_rate))
+        self._timer.start(max(1, frame_duration_ms))
+        self._is_streaming = True
+        return True
+
+    def stop_streaming(self) -> None:
+        self._timer.stop()
+        self._is_streaming = False
+
+    def _load_replay_data(self) -> None:
+        from playagain_pipeline.gui.widgets.quattrocento_loader import (
+            QuattrocentoFileLoader,
+            QuattrocentoSubjectLoader,
+        )
+
+        loader = QuattrocentoSubjectLoader(self._root_dir, side=self._side)
+        recs = sorted(loader.scan(verbose=False), key=lambda r: (r.subject_id, r.timestamp, r.path.name))
+        if not recs:
+            raise FileNotFoundError(f"No Quattrocento CSV files found under {self._root_dir}")
+
+        chunks: list[np.ndarray] = []
+        trials: list[tuple[int, int, str]] = []
+        cursor = 0
+        target_ch: Optional[int] = None
+        target_sr: Optional[int] = None
+
+        for rec in recs:
+            payload = QuattrocentoFileLoader.load_raw_with_meta(rec)
+            signal = payload["signal"]
+            if signal.size == 0:
+                continue
+
+            if target_ch is None:
+                target_ch = int(signal.shape[1])
+                target_sr = int(round(rec.sampling_rate))
+
+            if signal.shape[1] != target_ch:
+                if signal.shape[1] > target_ch:
+                    signal = signal[:, :target_ch]
+                else:
+                    pad = np.zeros((signal.shape[0], target_ch - signal.shape[1]), dtype=signal.dtype)
+                    signal = np.hstack([signal, pad])
+
+            segments = QuattrocentoFileLoader.extract_trigger_segments(
+                trigger=payload["trigger"],
+                ref_rms=payload["ref_rms"],
+                sampling_rate=rec.sampling_rate,
+                min_gap_ms=250,
+                use_rms_selection=False,
+            )
+            if not segments:
+                trials.append((cursor, cursor + signal.shape[0], rec.gesture))
+            else:
+                for seg_start, seg_end in segments:
+                    trials.append((cursor + int(seg_start), cursor + int(seg_end), rec.gesture))
+
+            chunks.append(signal.astype(np.float32, copy=False))
+            cursor += int(signal.shape[0])
+
+        if not chunks:
+            raise ValueError("Found recordings, but no valid EMG samples")
+
+        self._data = np.vstack(chunks)
+        self._idx = 0
+        self._trials = trials
+        self.config.num_channels = int(self._data.shape[1])
+        self.config.extra_settings["physical_num_channels"] = int(self._data.shape[1])
+        if target_sr is not None and target_sr > 0:
+            self.config.sampling_rate = target_sr
+
+    def _ground_truth_for_idx(self, sample_index: int) -> str:
+        for start, end, label in self._trials:
+            if start <= sample_index < end:
+                return label
+        return "Unknown"
+
+    def _emit_frame(self) -> None:
+        if self._data.size == 0:
+            return
+        samples = int(self.config.samples_per_frame)
+        end_idx = self._idx + samples
+        if end_idx <= len(self._data):
+            frame = self._data[self._idx:end_idx]
+            cur_idx = self._idx
+            self._idx = end_idx if end_idx < len(self._data) else 0
+        else:
+            head = self._data[self._idx:]
+            tail = self._data[: end_idx - len(self._data)]
+            frame = np.vstack([head, tail])
+            cur_idx = self._idx
+            self._idx = end_idx - len(self._data)
+
+        new_gt = self._ground_truth_for_idx(cur_idx)
+        if new_gt != self._current_ground_truth:
+            self._current_ground_truth = new_gt
+            self.ground_truth_changed.emit(new_gt)
+
+        self.data_ready.emit(self._apply_bipolar(frame))
+
+
 class DeviceManager:
     """
     Manages EMG device connections and provides a unified interface.
@@ -847,10 +997,16 @@ class DeviceManager:
                 ip_address=kwargs.get("ip_address", "0.0.0.0"),
                 port=kwargs.get("port", 54321)
             )
+        elif device_type == DeviceType.QUATTROCENTO:
+            self._device = QuattrocentoReplayDevice(
+                root_dir=kwargs.get("quattrocento_root", kwargs.get("data_dir", "gesture_pipeline_data")),
+                side=kwargs.get("quattrocento_side", "left"),
+                samples_per_frame=kwargs.get("samples_per_frame", 100),
+            )
         else:
             raise NotImplementedError(
                 f"Device type {device_type.name} not yet implemented. "
-                "Available: SYNTHETIC, MUOVI, MUOVI_PLUS"
+                "Available: SYNTHETIC, QUATTROCENTO, MUOVI, MUOVI_PLUS"
             )
 
         if "bipolar_mode" in kwargs:

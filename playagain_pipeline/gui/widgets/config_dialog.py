@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, Signal, Slot, QRectF, QPointF
 from PySide6.QtGui import QPainter, QColor, QPen, QBrush, QFont
+from playagain_pipeline.gui.gui_style import apply_app_style
 
 
 class BraceletVisualizationWidget(QWidget):
@@ -233,6 +234,7 @@ class ConfigurationDialog(QDialog):
         self.current_config = current_config or {}
 
         self._setup_ui()
+        apply_app_style(self, self.current_config.get("ui_theme", "bright"))
         self.setWindowTitle("Pipeline Configuration")
         self.setMinimumSize(700, 500)
 
@@ -369,6 +371,16 @@ class ConfigurationDialog(QDialog):
 
         tabs.addTab(model_widget, "Model")
 
+        # Appearance tab
+        appearance_widget = QWidget()
+        appearance_layout = QFormLayout(appearance_widget)
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItem("Bright", "bright")
+        self.theme_combo.addItem("Dark", "dark")
+        self.theme_combo.currentIndexChanged.connect(self._on_theme_changed)
+        appearance_layout.addRow("Theme:", self.theme_combo)
+        tabs.addTab(appearance_widget, "Appearance")
+
         layout.addWidget(tabs)
 
         # Dialog buttons
@@ -405,6 +417,10 @@ class ConfigurationDialog(QDialog):
         config = self.get_config()
         self.config_changed.emit(config)
 
+    @Slot()
+    def _on_theme_changed(self):
+        apply_app_style(self, self.theme_combo.currentData())
+
     def get_config(self) -> Dict[str, Any]:
         """Get the current configuration."""
         return {
@@ -429,7 +445,8 @@ class ConfigurationDialog(QDialog):
                 "default_type": self.default_model_combo.currentText(),
                 "test_ratio": self.test_ratio_spin.value(),
                 "auto_save": self.auto_save_check.isChecked()
-            }
+            },
+            "ui_theme": self.theme_combo.currentData(),
         }
 
     def _load_config(self, config: Dict[str, Any]):
@@ -477,3 +494,8 @@ class ConfigurationDialog(QDialog):
                 self.test_ratio_spin.setValue(mod["test_ratio"])
             if "auto_save" in mod:
                 self.auto_save_check.setChecked(mod["auto_save"])
+
+        if "ui_theme" in config:
+            idx = self.theme_combo.findData(config["ui_theme"])
+            if idx >= 0:
+                self.theme_combo.setCurrentIndex(idx)
