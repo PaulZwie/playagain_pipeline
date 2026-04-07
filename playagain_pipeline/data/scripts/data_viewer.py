@@ -31,6 +31,7 @@ if str(WORKSPACE_ROOT) not in sys.path:
 
 from playagain_pipeline.core.gesture import Gesture, GestureCategory, GestureSet, create_default_gesture_set
 from playagain_pipeline.core.session import RecordingSession, RecordingTrial
+from playagain_pipeline.gui.widgets.quattrocento_loader import QuattrocentoFileLoader, QuattrocentoSubjectLoader
 
 # Keep a non-interactive default backend for headless mode; GUI mode switches to QtAgg.
 matplotlib.use("Agg")
@@ -40,7 +41,8 @@ UNITY_SOURCE_TYPE = "unity_recordings"
 UNITY_DEFAULT_ROOT = Path(
     "/Users/paul/Coding_Projects/PlayAgain-Game2/playagain-game-2/RecordedData/Users"
 )
-SUPPORTED_TYPES = ("sessions", "game_recordings", UNITY_SOURCE_TYPE)
+QUATTROCENTO_SOURCE_TYPE = "quattrocento"
+SUPPORTED_TYPES = ("sessions", "game_recordings", UNITY_SOURCE_TYPE, QUATTROCENTO_SOURCE_TYPE)
 
 
 @dataclass
@@ -131,9 +133,44 @@ def _is_emg_csv_candidate(path: Path) -> bool:
     return "emg_ch" in header or "ch_" in header
 
 
+def _is_quattrocento_csv_candidate(path: Path) -> bool:
+    name = path.name.lower()
+    if not name.startswith("vhi_recording_") or not name.endswith(".csv"):
+        return False
+    try:
+        header = path.open("r", encoding="utf-8", errors="ignore").readline().lower()
+    except OSError:
+        return False
+    return "trigger_manual" in header or "ref_signal_rms" in header or "emg_ch_" in header
+
+
 def discover_recordings(data_root: Path, source_type: str) -> list[Path]:
     if source_type not in SUPPORTED_TYPES:
         raise ValueError(f"Unsupported source type '{source_type}'.")
+
+    if source_type == QUATTROCENTO_SOURCE_TYPE:
+        candidate_roots: list[Path] = []
+        if data_root.is_file() and data_root.suffix.lower() == ".csv":
+            return [data_root] if _is_quattrocento_csv_candidate(data_root) else []
+        if (data_root / source_type).exists():
+            candidate_roots.append(data_root / source_type)
+        if data_root.exists():
+            candidate_roots.append(data_root)
+
+        seen: set[Path] = set()
+        for root in candidate_roots:
+            if root in seen or not root.exists() or not root.is_dir():
+                continue
+            seen.add(root)
+            try:
+                loader = QuattrocentoSubjectLoader(root, side="both")
+                recs = loader.scan(verbose=False, include_sample_counts=False)
+            except Exception:
+                continue
+            if recs:
+                return sorted({rec.path for rec in recs})
+        return []
+
     root = data_root if source_type == UNITY_SOURCE_TYPE else data_root / source_type
     if not root.exists():
         return []
@@ -212,6 +249,86 @@ def _load_session_bundle(path: Path) -> DataBundle:
         full_table=full_table,
         timestamp=timestamp,
         annotation_spans=spans,
+        metadata=metadata,
+    )
+
+
+def _load_quattrocento_bundle(path: Path) -> DataBundle:
+    if path.is_dir():
+        loader = QuattrocentoSubjectLoader(path, side="both")
+        recs = loader.scan(verbose=False, include_sample_counts=False)
+        if not recs:
+            raise FileNotFoundError(f"No Quattrocento CSV recordings found in {path}")
+        rec = recs[0]
+    else:
+        subject_id = _guess_subject_id(path)
+        rec = QuattrocentoFileLoader.load_recording(path, subject_id=subject_id, include_sample_count=True)
+
+    payload = QuattrocentoFileLoader.load_raw_with_meta(rec)
+    signal = payload["signal"]
+    if signal.ndim != 2:
+        raise ValueError(f"Expected 2D EMG signal in {rec.path}, got shape {signal.shape}")
+
+    signal_cols = [f"EMG_Ch_{idx + 1:03d}" for idx in range(signal.shape[1])]
+    time_s = np.asarray(payload["time_s"], dtype=float).reshape(-1)
+    if time_s.size == signal.shape[0] and np.isfinite(time_s).any():
+        timestamp = time_s - float(np.nanmin(time_s))
+    else:
+        timestamp = np.arange(signal.shape[0], dtype=float) / max(1e-9, float(rec.sampling_rate))
+
+    segments = QuattrocentoFileLoader.extract_trigger_segments(
+        trigger=payload["trigger"],
+        ref_rms=payload["ref_rms"],
+        sampling_rate=float(rec.sampling_rate),
+        min_gap_ms=250,
+        use_rms_selection=False,
+    )
+    annotation_spans = [
+        {
+            "start": float(timestamp[start]),
+            "end": float(timestamp[min(end - 1, timestamp.size - 1)]),
+            "label": rec.gesture,
+            "trial_type": rec.trial_label,
+        }
+        for start, end in segments
+        if timestamp.size and end > start
+    ]
+    if not annotation_spans and timestamp.size:
+        annotation_spans = [
+            {
+                "start": float(timestamp[0]),
+                "end": float(timestamp[-1]),
+                "label": rec.gesture,
+                "trial_type": rec.trial_label,
+            }
+        ]
+
+    metadata = {
+        "recording": {
+            "subject_id": rec.subject_id,
+            "timestamp": rec.timestamp.isoformat() if getattr(rec, "timestamp", None) else None,
+            "gesture_raw": rec.gesture_raw,
+            "gesture": rec.gesture,
+            "trial_label": rec.trial_label,
+            "task": rec.task,
+            "side": rec.side,
+            "n_samples": rec.n_samples,
+            "n_channels": rec.n_channels,
+            "sampling_rate": rec.sampling_rate,
+            "header_rows": rec.header_rows,
+        },
+        "trigger_segments": len(segments),
+    }
+
+    return DataBundle(
+        source_type=QUATTROCENTO_SOURCE_TYPE,
+        source_path=rec.path,
+        sampling_rate=float(rec.sampling_rate),
+        signal=signal,
+        signal_columns=signal_cols,
+        full_table=pd.DataFrame(signal, columns=signal_cols),
+        timestamp=timestamp,
+        annotation_spans=annotation_spans,
         metadata=metadata,
     )
 
@@ -315,6 +432,8 @@ def load_bundle(source_type: str, path: Path) -> DataBundle:
         return _load_game_bundle(path)
     if source_type == UNITY_SOURCE_TYPE:
         return _load_unity_bundle(path)
+    if source_type == QUATTROCENTO_SOURCE_TYPE:
+        return _load_quattrocento_bundle(path)
     raise ValueError(f"Unsupported source type '{source_type}'")
 
 
@@ -567,9 +686,9 @@ def _apply_motion_artifact_removal(data: np.ndarray, fs: float, cutoff_hz: float
     wn = min(max(cutoff_hz / max(1e-9, nyq), 1e-4), 0.99)
     if data.shape[0] < 24:
         return data
-    b, a = scipy_signal.butter(2, wn, btype="low", output="ba")
+    sos = scipy_signal.butter(2, wn, btype="low", output="sos")
     try:
-        baseline = scipy_signal.filtfilt(b, a, data, axis=0)
+        baseline = scipy_signal.sosfiltfilt(sos, data, axis=0)
     except ValueError:
         return data
     strength = min(max(strength, 0.0), 2.0)
@@ -1298,6 +1417,8 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
             self.source_type = text
             if text == UNITY_SOURCE_TYPE:
                 self.root_line.setText(str(UNITY_DEFAULT_ROOT))
+            elif text == QUATTROCENTO_SOURCE_TYPE:
+                self.root_line.setText(str(self.data_root / QUATTROCENTO_SOURCE_TYPE))
             self._refresh_datasets()
 
         def _pick_dataset_folder(self) -> None:
@@ -1311,6 +1432,17 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
                 if chosen_file:
                     self._select_dataset_by_path(Path(chosen_file))
                     return
+
+            if self.source_type == QUATTROCENTO_SOURCE_TYPE:
+                chosen = QFileDialog.getExistingDirectory(
+                    self,
+                    "Select Quattrocento recordings folder",
+                    str(self.data_root / QUATTROCENTO_SOURCE_TYPE),
+                )
+                if chosen:
+                    self.root_line.setText(chosen)
+                    self._refresh_datasets()
+                return
 
             chosen = QFileDialog.getExistingDirectory(self, "Select dataset folder", str(self.data_root))
             if chosen:
@@ -1513,14 +1645,21 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
             ax_proc.clear()
 
             spacing = max(0.5, display_cfg.y_spacing)
+            if display_cfg.normalize_channels and raw.size and proc.size:
+                raw_scales = np.nanstd(raw, axis=0)
+                proc_scales = np.nanstd(proc, axis=0)
+                raw_scales = np.where(raw_scales > 0.0, raw_scales, 1.0)
+                proc_scales = np.where(proc_scales > 0.0, proc_scales, 1.0)
+            else:
+                raw_scales = None
+                proc_scales = None
+
             for idx, ch in enumerate(channels):
                 raw_ch = raw[:, idx]
                 proc_ch = proc[:, idx]
-                if display_cfg.normalize_channels:
-                    raw_std = np.nanstd(raw_ch) or 1.0
-                    proc_std = np.nanstd(proc_ch) or 1.0
-                    raw_ch = raw_ch / raw_std
-                    proc_ch = proc_ch / proc_std
+                if raw_scales is not None and proc_scales is not None:
+                    raw_ch = raw_ch / raw_scales[idx]
+                    proc_ch = proc_ch / proc_scales[idx]
                 offset = idx * spacing
 
                 if display_cfg.show_raw:
@@ -1682,7 +1821,7 @@ def _build_main_window_class(qt: dict[str, Any]) -> type:
 def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Standalone interactive data viewer")
     parser.add_argument("--type", choices=SUPPORTED_TYPES, default="sessions", help="Data type to browse")
-    parser.add_argument("--path", type=Path, help="Specific session/game_recording path")
+    parser.add_argument("--path", type=Path, help="Specific session/game_recording/Quattrocento path")
     parser.add_argument("--data-root", type=Path, default=script_default_data_root(), help="Root containing sessions/ and game_recordings/")
     parser.add_argument(
         "--unity-root",
