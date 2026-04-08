@@ -50,6 +50,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
 # ─── constants ────────────────────────────────────────────────────────────────
 
 _DEFAULT_PRIMARY_CONFIG: Tuple[int, int] = (408, 64)
+_DEFAULT_INTRA_SPLIT_RATIOS: Tuple[float, float, float] = (0.70, 0.15, 0.15)
 
 _MODEL_TYPES = [
     ("SVM",           "svm"),
@@ -70,7 +71,7 @@ _DEFAULT_LABEL_ORDER = [
 
 # ─── colour palette ───────────────────────────────────────────────────────────
 
-_C_DARK = {
+_C = {
     "bg":      "#1e1e2e",
     "panel":   "#2a2a3e",
     "card":    "#313145",
@@ -88,30 +89,7 @@ _C_DARK = {
     "excl":    "#6b7280",
 }
 
-_C_BRIGHT = {
-    "bg":      "#f6f8fc",
-    "panel":   "#ffffff",
-    "card":    "#eef2ff",
-    "accent":  "#6d28d9",
-    "accent2": "#0284c7",
-    "success": "#16a34a",
-    "warning": "#d97706",
-    "danger":  "#dc2626",
-    "text":    "#111827",
-    "muted":   "#4b5563",
-    "border":  "#c7d2fe",
-    "train":   "#16a34a",
-    "val":     "#d97706",
-    "test":    "#dc2626",
-    "excl":    "#6b7280",
-}
-
-_C = dict(_C_DARK)
-
-
-def _rebuild_style_tokens() -> None:
-    global _PANEL_STYLE, _BTN_PRIMARY, _BTN_SECONDARY
-    _PANEL_STYLE = f"""
+_PANEL_STYLE = f"""
     QGroupBox {{
         background: {_C['panel']};
         border: 1px solid {_C['border']};
@@ -128,7 +106,7 @@ def _rebuild_style_tokens() -> None:
         color: {_C['accent2']};
     }}
 """
-    _BTN_PRIMARY = f"""
+_BTN_PRIMARY = f"""
     QPushButton {{
         background: {_C['accent']};
         color: white;
@@ -141,7 +119,7 @@ def _rebuild_style_tokens() -> None:
     QPushButton:hover {{ background: #6d28d9; }}
     QPushButton:disabled {{ background: #3f3f5c; color: #6b7280; }}
 """
-    _BTN_SECONDARY = f"""
+_BTN_SECONDARY = f"""
     QPushButton {{
         background: {_C['panel']};
         color: {_C['text']};
@@ -151,11 +129,6 @@ def _rebuild_style_tokens() -> None:
     }}
     QPushButton:hover {{ border-color: {_C['accent2']}; color: {_C['accent2']}; }}
 """
-
-_PANEL_STYLE = ""
-_BTN_PRIMARY = ""
-_BTN_SECONDARY = ""
-_rebuild_style_tokens()
 
 
 # ─── data helpers ─────────────────────────────────────────────────────────────
@@ -185,6 +158,19 @@ def _augment_windows(X: np.ndarray, noise_std: float = 0.005,
             if s != 0:
                 aug[i] = np.roll(aug[i], s, axis=0)
     return aug
+
+
+def _split_bounds(total_windows: int,
+                  ratios: Tuple[float, float, float] = _DEFAULT_INTRA_SPLIT_RATIOS) -> Tuple[int, int]:
+    """Return (train_end, val_end) for deterministic intra-trial slicing."""
+    if total_windows <= 1:
+        return total_windows, total_windows
+    train_ratio, val_ratio, _ = ratios
+    train_end = int(total_windows * train_ratio)
+    val_end = int(total_windows * (train_ratio + val_ratio))
+    train_end = max(1, min(train_end, total_windows - 1))
+    val_end = max(train_end, min(val_end, total_windows))
+    return train_end, val_end
 
 
 class _Normaliser:
@@ -241,11 +227,12 @@ class _TrainWorker(QThread):
         time_shift: int,
         channel_reduce: str,
         channel_reduce_n: int,
-        class_weight: str,   # "none" | "balanced"
+        class_weight: str,
         early_stopping_patience: int,
-        use_trigger_segmentation: bool,
-        use_rms_selection: bool,
-        trigger_min_gap_ms: int,
+        use_trigger_segments: bool = True,
+        onset_delay_ms: float = 150.0,
+        intra_trial_split: bool = False,
+        split_ratios: Tuple[float, float, float] = _DEFAULT_INTRA_SPLIT_RATIOS,
     ):
         super().__init__()
         self._loader    = loader
@@ -267,24 +254,35 @@ class _TrainWorker(QThread):
         self._ch_n       = channel_reduce_n
         self._class_weight = class_weight
         self._es_patience  = early_stopping_patience
-        self._use_trigger_segmentation = bool(use_trigger_segmentation)
-        self._use_rms_selection = bool(use_rms_selection)
-        self._trigger_min_gap_ms = int(trigger_min_gap_ms)
+        self._use_trigger  = use_trigger_segments
+        self._onset_delay  = onset_delay_ms
+        self._intra_trial_split = intra_trial_split
+        self._split_ratios = split_ratios
+        self._test_split_counts: Optional[List[int]] = None
 
     def run(self):
         try:
             from sklearn.metrics import f1_score, classification_report, precision_score, recall_score
+            self._test_split_counts = None
 
             # ── Load ──────────────────────────────────────────────────────
+            # Build ONE shared label map from the union of all splits so that
+            # train / val / test use identical integer class indices even when
+            # a subject in one split is missing a gesture that another has.
             self.progress.emit(5, "Loading training data…")
-            X_train, y_train, label_names = self._load(self._train_recs)
+            all_recs_for_map = (self._train_recs +
+                                (self._val_recs  or []) +
+                                (self._test_recs or []))
+            shared_g2l, label_names = self._build_g2l(all_recs_for_map)
+
+            X_train, y_train, _ = self._load(self._train_recs, shared_g2l, split_role="train")
             self.progress.emit(18, f"Loaded {len(X_train):,} training windows")
 
-            X_test, y_test, _ = (self._load(self._test_recs) if self._test_recs else
+            X_test, y_test, _ = (self._load(self._test_recs, shared_g2l, split_role="test") if self._test_recs else
                 (np.empty((0, self._ws, self._nc), np.float32),
                  np.empty(0, np.int64), label_names))
 
-            X_val, y_val, _ = (self._load(self._val_recs) if self._val_recs else
+            X_val, y_val, _ = (self._load(self._val_recs, shared_g2l, split_role="val") if self._val_recs else
                 (np.empty((0, self._ws, self._nc), np.float32),
                  np.empty(0, np.int64), label_names))
 
@@ -489,36 +487,63 @@ class _TrainWorker(QThread):
 
     # ── loaders ──────────────────────────────────────────────────────────────
 
-    def _load(self, recs: list) -> Tuple[np.ndarray, np.ndarray, Dict[int, str]]:
-        from playagain_pipeline.gui.widgets.quattrocento_loader import QuattrocentoFileLoader
+    @staticmethod
+    def _build_g2l(recs: list) -> Tuple[Dict[str, int], Dict[int, str]]:
+        """Build a gesture→label mapping from a list of records.
+
+        Always called on the UNION of all splits so that train, val and test
+        share identical integer class indices.
+        """
         gestures = sorted({r.gesture for r in recs},
                           key=lambda g: (_DEFAULT_LABEL_ORDER.index(g)
                                          if g in _DEFAULT_LABEL_ORDER else 999))
         g2l = {g: i for i, g in enumerate(gestures)}
         label_names = {int(v): k for k, v in g2l.items()}
-        X_parts: List[np.ndarray] = []
-        y_parts: List[np.ndarray] = []
+        return g2l, label_names
+
+    def _load(self, recs: list,
+              g2l: Optional[Dict[str, int]] = None,
+              split_role: Optional[str] = None) -> Tuple[np.ndarray, np.ndarray, Dict[int, str]]:
+        """Load windows for *recs* using the provided *g2l* mapping.
+
+        If *g2l* is None a local mapping is built from *recs* only (legacy
+        behaviour, kept for internal callers that already own a consistent map).
+        Pass a shared mapping built from all splits to avoid label-index
+        mismatches between train / val / test.
+        """
+        from playagain_pipeline.gui.widgets.quattrocento_loader import QuattrocentoFileLoader
+        if g2l is None:
+            g2l, _ = self._build_g2l(recs)
+        label_names = {int(v): k for k, v in g2l.items()}
+        total = sum(r.n_windows for r in recs)
+        X = np.empty((total, self._ws, self._nc), dtype=np.float32)
+        y = np.empty(total, dtype=np.int64)
+        wp = 0
+        test_counts: List[int] = []
         for rec in recs:
             wins = QuattrocentoFileLoader.load_windows(
                 rec,
-                use_trigger_segmentation=self._use_trigger_segmentation,
-                use_rms_selection=self._use_rms_selection,
-                trigger_min_gap_ms=self._trigger_min_gap_ms,
+                use_trigger_segments=getattr(self, '_use_trigger', False),
+                onset_delay_ms=getattr(self, '_onset_delay', 150.0),
             )
-            rec.n_windows = int(wins.shape[0])
+            if self._intra_trial_split and split_role in {"train", "val", "test"}:
+                tr_end, va_end = _split_bounds(len(wins), self._split_ratios)
+                if split_role == "train":
+                    wins = wins[:tr_end]
+                elif split_role == "val":
+                    wins = wins[tr_end:va_end]
+                else:
+                    wins = wins[va_end:]
+            if split_role == "test":
+                test_counts.append(len(wins))
             lbl  = g2l[rec.gesture]
-            if wins.size == 0:
-                continue
-            resized = np.stack([_resize_window(w, self._ws, self._nc) for w in wins], axis=0)
-            X_parts.append(resized)
-            y_parts.append(np.full(resized.shape[0], lbl, dtype=np.int64))
-        if not X_parts:
-            return (
-                np.empty((0, self._ws, self._nc), dtype=np.float32),
-                np.empty(0, dtype=np.int64),
-                label_names,
-            )
-        return np.concatenate(X_parts, axis=0), np.concatenate(y_parts, axis=0), label_names
+            for w in wins:
+                X[wp] = _resize_window(w, self._ws, self._nc)
+                y[wp] = lbl
+                wp += 1
+        if split_role == "test":
+            self._test_split_counts = test_counts
+        return X[:wp], y[:wp], label_names
 
     def _apply_channel_reduce(self, X_tr, X_v, X_te):
         n_keep = min(self._ch_n, X_tr.shape[2])
@@ -544,6 +569,12 @@ class _TrainWorker(QThread):
                    label_names: dict, norm: _Normaliser) -> List[Tuple[float, float]]:
         from sklearn.model_selection import StratifiedKFold
         from sklearn.metrics import f1_score
+        # ⚠ K-Fold CV operates only on the training-subject windows that were
+        # passed in.  All folds therefore see data from the same subjects,
+        # which gives a within-subject accuracy estimate.  This will look much
+        # higher than cross-subject test performance and is NOT a reliable
+        # predictor of how the model generalises to new subjects.  Use LOSO
+        # whenever train / test are split by subject.
         skf = StratifiedKFold(n_splits=self._cv_folds, shuffle=True, random_state=42)
         results = []
         for fold_i, (tr_idx, va_idx) in enumerate(skf.split(X, y)):
@@ -573,7 +604,16 @@ class _TrainWorker(QThread):
 
     def _run_loso(self, label_names: dict) -> List[Tuple[float, float]]:
         from sklearn.metrics import f1_score
-        all_recs = self._train_recs + self._test_recs
+        all_recs = []
+        seen = set()
+        for rec in (self._train_recs + self._test_recs):
+            key = str(getattr(rec, "path", id(rec)))
+            if key in seen:
+                continue
+            seen.add(key)
+            all_recs.append(rec)
+        # Build the shared label map once so every fold uses the same indices.
+        shared_g2l, _ = self._build_g2l(all_recs)
         subjects = sorted({r.subject_id for r in all_recs})
         results = []
         for si, subj in enumerate(subjects):
@@ -582,8 +622,8 @@ class _TrainWorker(QThread):
             test_r  = [r for r in all_recs if r.subject_id == subj]
             if not train_r or not test_r:
                 continue
-            Xtr, ytr, _ = self._load(train_r)
-            Xte, yte, _ = self._load(test_r)
+            Xtr, ytr, _ = self._load(train_r, shared_g2l)
+            Xte, yte, _ = self._load(test_r,  shared_g2l)
             norm = _Normaliser(self._norm).fit(Xtr)
             Xtr = norm.transform(Xtr)
             Xte = norm.transform(Xte)
@@ -606,8 +646,9 @@ class _TrainWorker(QThread):
         from sklearn.metrics import f1_score
         result: Dict[str, Dict[str, float]] = {}
         wp = 0
-        for rec in self._test_recs:
-            n = rec.n_windows
+        test_counts = self._test_split_counts if self._test_split_counts is not None else []
+        for i, rec in enumerate(self._test_recs):
+            n = test_counts[i] if i < len(test_counts) else rec.n_windows
             if wp + n > len(X_test):
                 break
             X_s = X_test[wp:wp+n]
@@ -631,9 +672,7 @@ class _LearningCurveWorker(QThread):
     error    = Signal(str)
 
     def __init__(self, loader, train_recs, test_recs, model_manager, model_type,
-                 ws, nc, sr, norm_mode, feat_cfg, label_order,
-                 use_trigger_segmentation: bool, use_rms_selection: bool,
-                 trigger_min_gap_ms: int):
+                 ws, nc, sr, norm_mode, feat_cfg, label_order):
         super().__init__()
         self._loader = loader
         self._train_recs = train_recs
@@ -646,41 +685,35 @@ class _LearningCurveWorker(QThread):
         self._norm_mode = norm_mode
         self._feat_cfg  = feat_cfg
         self._label_order = label_order
-        self._use_trigger_segmentation = bool(use_trigger_segmentation)
-        self._use_rms_selection = bool(use_rms_selection)
-        self._trigger_min_gap_ms = int(trigger_min_gap_ms)
 
     def run(self):
         try:
             from playagain_pipeline.gui.widgets.quattrocento_loader import QuattrocentoFileLoader
             from sklearn.metrics import f1_score
 
-            def load_all(r_list):
-                gestures = sorted({r.gesture for r in r_list},
+            def load_all(r_list, g2l):
+                total = sum(r.n_windows for r in r_list)
+                X = np.empty((total, self._ws, self._nc), np.float32)
+                y = np.empty(total, np.int64)
+                wp = 0
+                for rec in r_list:
+                    wins = QuattrocentoFileLoader.load_windows(rec)
+                    lbl = g2l[rec.gesture]
+                    for w in wins:
+                        X[wp] = _resize_window(w, self._ws, self._nc)
+                        y[wp] = lbl
+                        wp += 1
+                return X[:wp], y[:wp]
+
+            # Build one shared map from all records so train and test indices align.
+            all_recs = self._train_recs + self._test_recs
+            all_gestures = sorted({r.gesture for r in all_recs},
                                   key=lambda g: (self._label_order.index(g)
                                                  if g in self._label_order else 999))
-                g2l = {g: i for i, g in enumerate(gestures)}
-                X_parts: List[np.ndarray] = []
-                y_parts: List[np.ndarray] = []
-                for rec in r_list:
-                    wins = QuattrocentoFileLoader.load_windows(
-                        rec,
-                        use_trigger_segmentation=self._use_trigger_segmentation,
-                        use_rms_selection=self._use_rms_selection,
-                        trigger_min_gap_ms=self._trigger_min_gap_ms,
-                    )
-                    lbl = g2l[rec.gesture]
-                    if wins.size == 0:
-                        continue
-                    resized = np.stack([_resize_window(w, self._ws, self._nc) for w in wins], axis=0)
-                    X_parts.append(resized)
-                    y_parts.append(np.full(resized.shape[0], lbl, dtype=np.int64))
-                if not X_parts:
-                    return np.empty((0, self._ws, self._nc), np.float32), np.empty(0, np.int64)
-                return np.concatenate(X_parts, axis=0), np.concatenate(y_parts, axis=0)
+            shared_g2l = {g: i for i, g in enumerate(all_gestures)}
 
             self.progress.emit(5, "Loading test data…")
-            X_te, y_te = load_all(self._test_recs)
+            X_te, y_te = load_all(self._test_recs, shared_g2l)
 
             steps = [int(len(self._train_recs) * f)
                      for f in [0.1, 0.2, 0.35, 0.5, 0.65, 0.8, 1.0]]
@@ -690,7 +723,7 @@ class _LearningCurveWorker(QThread):
             for si, step in enumerate(steps):
                 self.progress.emit(10 + si * 12, f"Step {si+1}/{len(steps)}: {step} files…")
                 sub_recs = self._train_recs[:step]
-                X_tr, y_tr = load_all(sub_recs)
+                X_tr, y_tr = load_all(sub_recs, shared_g2l)
                 norm = _Normaliser(self._norm_mode).fit(X_tr)
                 X_tr2 = norm.transform(X_tr)
                 X_te2 = norm.transform(X_te)
@@ -710,56 +743,6 @@ class _LearningCurveWorker(QThread):
         except Exception as exc:
             import traceback
             self.error.emit(traceback.format_exc())
-
-
-class _ScanWorker(QThread):
-    """Lightweight Quattrocento metadata scan for responsive directory discovery."""
-
-    progress = Signal(int, str)
-    scan_finished = Signal(object)
-    error = Signal(str)
-    cancelled = Signal()
-
-    def __init__(self, root: Path, side: str, window_ms: int, nc_target: int):
-        super().__init__()
-        self._root = Path(root)
-        self._side = str(side).strip().lower()
-        self._window_ms = int(window_ms)
-        self._nc_target = int(nc_target)
-
-    def run(self):
-        try:
-            from playagain_pipeline.gui.widgets.quattrocento_loader import QuattrocentoSubjectLoader
-
-            loader = QuattrocentoSubjectLoader(self._root, side=self._side, window_ms=self._window_ms)
-
-            def _on_progress(current: int, total: int, message: str):
-                pct = int(round(100.0 * current / max(1, total)))
-                self.progress.emit(max(0, min(100, pct)), message)
-
-            all_recs = loader.scan(
-                verbose=False,
-                include_sample_counts=False,
-                progress_callback=_on_progress,
-                should_cancel=self.isInterruptionRequested,
-            )
-
-            if self.isInterruptionRequested():
-                self.cancelled.emit()
-                return
-
-            primary = [r for r in all_recs if r.n_channels == self._nc_target] if self._nc_target > 0 else all_recs
-            self.scan_finished.emit({
-                "loader": loader,
-                "primary": primary,
-                "skipped": len(all_recs) - len(primary),
-                "side": self._side,
-                "window_ms": self._window_ms,
-            })
-        except InterruptedError:
-            self.cancelled.emit()
-        except Exception as exc:
-            self.error.emit(str(exc))
 
 
 # ─── matplotlib canvases ──────────────────────────────────────────────────────
@@ -1113,103 +1096,17 @@ class QuattrocentoTrainingDialog(QDialog):
         self._loader        = None
         self._worker: Optional[_TrainWorker]         = None
         self._lc_worker: Optional[_LearningCurveWorker] = None
-        self._scan_worker: Optional[_ScanWorker] = None
         self._trained_model = None
         self._results       = None
         self._all_runs: List[_ModelRun] = []
 
-        theme = "bright"
-        if parent is not None and hasattr(parent, "config"):
-            theme = str(getattr(parent.config, "ui_theme", "bright"))
-        self._set_theme(theme)
-
         self.setWindowTitle("Quattrocento Training & Evaluation")
         self.setMinimumSize(1280, 820)
-        self._apply_dark_theme()
-        self._setup_ui()
-        self._try_auto_detect()
-
-    def _set_theme(self, theme: str) -> None:
-        global _C
-        _C = dict(_C_BRIGHT if (theme or "bright").lower() == "bright" else _C_DARK)
-        _rebuild_style_tokens()
-
-    def _apply_dark_theme(self):
-        self.setStyleSheet(f"""
-            QDialog, QWidget {{
-                background: {_C['bg']};
-                color: {_C['text']};
-                font-size: 12px;
-            }}
-            QTabWidget::pane {{
-                border: 1px solid {_C['border']};
-                border-radius: 6px;
-                background: {_C['panel']};
-            }}
-            QTabBar::tab {{
-                background: {_C['bg']};
-                color: {_C['muted']};
-                padding: 6px 16px;
-                border: 1px solid {_C['border']};
-                border-bottom: none;
-                border-top-left-radius: 5px;
-                border-top-right-radius: 5px;
-                margin-right: 2px;
-            }}
-            QTabBar::tab:selected {{
-                background: {_C['panel']};
-                color: {_C['accent2']};
-                border-color: {_C['accent2']};
-            }}
-            QListWidget, QTableWidget, QTextEdit {{
-                background: {_C['bg']};
-                color: {_C['text']};
-                border: 1px solid {_C['border']};
-                border-radius: 5px;
-                selection-background-color: {_C['accent']};
-            }}
-            QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {{
-                background: {_C['bg']};
-                color: {_C['text']};
-                border: 1px solid {_C['border']};
-                border-radius: 4px;
-                padding: 3px 6px;
-            }}
-            QComboBox:hover, QLineEdit:focus, QSpinBox:focus, QDoubleSpinBox:focus {{
-                border-color: {_C['accent2']};
-            }}
-            QComboBox::drop-down {{ border: none; }}
-            QProgressBar {{
-                background: {_C['bg']};
-                border: 1px solid {_C['border']};
-                border-radius: 4px;
-                height: 14px;
-                text-align: center;
-                color: {_C['text']};
-            }}
-            QProgressBar::chunk {{
-                background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
-                    stop:0 {_C['accent']}, stop:1 {_C['accent2']});
-                border-radius: 3px;
-            }}
-            QCheckBox, QRadioButton {{ color: {_C['text']}; spacing: 6px; }}
-            QCheckBox::indicator, QRadioButton::indicator {{
-                border: 1px solid {_C['border']};
-                background: {_C['bg']};
-                border-radius: 3px;
-                width: 13px; height: 13px;
-            }}
-            QCheckBox::indicator:checked, QRadioButton::indicator:checked {{
-                background: {_C['accent']};
-                border-color: {_C['accent']};
-            }}
-            QHeaderView::section {{
-                background: {_C['panel']};
-                color: {_C['muted']};
-                border: none;
-                padding: 4px 8px;
-                font-size: 11px;
-            }}
+        from playagain_pipeline.gui.gui_style import apply_app_style
+        apply_app_style(self, theme="dark")
+        # Overlay a few extra rules that the training dialog needs on top of
+        # the shared stylesheet (splitter handle, scrollbar, font-size tweak).
+        self.setStyleSheet(self.styleSheet() + f"""
             QSplitter::handle {{ background: {_C['border']}; width: 1px; }}
             QScrollBar:vertical {{
                 background: {_C['bg']}; width: 8px; margin: 0;
@@ -1217,7 +1114,10 @@ class QuattrocentoTrainingDialog(QDialog):
             QScrollBar::handle:vertical {{
                 background: {_C['border']}; border-radius: 4px; min-height: 20px;
             }}
+            QDialog, QWidget {{ font-size: 12px; }}
         """)
+        self._setup_ui()
+        self._try_auto_detect()
 
     # ─── UI ────────────────────────────────────────────────────────────────────
 
@@ -1226,17 +1126,23 @@ class QuattrocentoTrainingDialog(QDialog):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(8)
 
+        self._main_splitter = QSplitter(Qt.Orientation.Horizontal)
+        self._main_splitter.setChildrenCollapsible(True)
+        root.addWidget(self._main_splitter)
+
         # Left panel
         left_scroll = QScrollArea()
         left_scroll.setWidgetResizable(True)
-        left_scroll.setFixedWidth(420)
+        left_scroll.setMinimumWidth(0)
         left_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._left_scroll = left_scroll
         left_content = QWidget()
+        left_content.setMinimumWidth(460)
         left_lay = QVBoxLayout(left_content)
         left_lay.setContentsMargins(4, 4, 4, 4)
         left_lay.setSpacing(8)
         left_scroll.setWidget(left_content)
-        root.addWidget(left_scroll)
+        self._main_splitter.addWidget(left_scroll)
 
         # ── 1. Data Root ─────────────────────────────────────────────────────
         root_grp = QGroupBox("1 · Data Source")
@@ -1248,23 +1154,14 @@ class QuattrocentoTrainingDialog(QDialog):
         self._root_edit.setPlaceholderText("Path to quattrocento folder…")
         self._root_edit.setReadOnly(True)
         dir_row.addWidget(self._root_edit)
-        self._browse_btn = QPushButton("…")
-        self._browse_btn.setStyleSheet(_BTN_SECONDARY)
-        self._browse_btn.setFixedWidth(34)
-        self._browse_btn.clicked.connect(self._on_browse)
-        dir_row.addWidget(self._browse_btn)
+        browse_btn = QPushButton("…")
+        browse_btn.setStyleSheet(_BTN_SECONDARY)
+        browse_btn.setFixedWidth(34)
+        browse_btn.clicked.connect(self._on_browse)
+        dir_row.addWidget(browse_btn)
         rgl.addLayout(dir_row)
 
         scan_row = QHBoxLayout()
-        side_lbl = QLabel("Side:")
-        side_lbl.setStyleSheet(f"color:{_C['muted']};font-size:10px;")
-        scan_row.addWidget(side_lbl)
-        self._side_combo = QComboBox()
-        self._side_combo.addItems(["left", "right", "both"])
-        self._side_combo.setToolTip("Choose which electrode side(s) to include while scanning.")
-        self._side_combo.setMaximumWidth(84)
-        scan_row.addWidget(self._side_combo)
-
         self._scan_btn = QPushButton("Scan Directory")
         self._scan_btn.setStyleSheet(_BTN_SECONDARY)
         self._scan_btn.setFixedHeight(28)
@@ -1290,56 +1187,55 @@ class QuattrocentoTrainingDialog(QDialog):
             spin.setToolTip(tip)
             scan_row.addWidget(spin)
             setattr(self, attr, spin)
+
+        side_lbl = QLabel("Side:")
+        side_lbl.setStyleSheet(f"color:{_C['muted']};font-size:10px;")
+        scan_row.addWidget(side_lbl)
+        self._side_combo = QComboBox()
+        self._side_combo.addItems(["left", "right", "both"])
+        self._side_combo.setMaximumWidth(60)
+        self._side_combo.setToolTip("Which electrode side to load")
+        scan_row.addWidget(self._side_combo)
         rgl.addLayout(scan_row)
+
+        # Trigger / RMS segmentation controls
+        seg_row = QHBoxLayout()
+        self._use_trigger_cb = QCheckBox("Trigger segmentation")
+        self._use_trigger_cb.setChecked(True)
+        self._use_trigger_cb.setToolTip(
+            "Extract individual gesture repetitions using the trigger column\n"
+            "(or RMS fallback). Recommended for Quattrocento data with children.\n"
+            "Each file typically contains ~5 repetitions of the gesture."
+        )
+        seg_row.addWidget(self._use_trigger_cb)
+
+        delay_lbl = QLabel("Onset delay:")
+        delay_lbl.setStyleSheet(f"color:{_C['muted']};font-size:10px;")
+        seg_row.addWidget(delay_lbl)
+        self._onset_delay_spin = QSpinBox()
+        self._onset_delay_spin.setRange(0, 1000)
+        self._onset_delay_spin.setValue(150)
+        self._onset_delay_spin.setSuffix(" ms")
+        self._onset_delay_spin.setMaximumWidth(85)
+        self._onset_delay_spin.setToolTip(
+            "Shift RMS-detected onset forward to compensate for\n"
+            "children's reaction-time lag (default 150 ms)."
+        )
+        seg_row.addWidget(self._onset_delay_spin)
+        seg_row.addStretch()
+        rgl.addLayout(seg_row)
 
         self._scan_info = QLabel("No directory selected.")
         self._scan_info.setStyleSheet(f"color:{_C['muted']};font-size:10px;")
         self._scan_info.setWordWrap(True)
         rgl.addWidget(self._scan_info)
-
-        self._scan_progress = QProgressBar()
-        self._scan_progress.setRange(0, 100)
-        self._scan_progress.setValue(0)
-        self._scan_progress.setVisible(False)
-        self._scan_progress.setFixedHeight(8)
-        rgl.addWidget(self._scan_progress)
         left_lay.addWidget(root_grp)
 
         self._ws_spin.valueChanged.connect(self._on_config_changed)
         self._nc_spin.valueChanged.connect(self._on_config_changed)
-        self._side_combo.currentIndexChanged.connect(self._on_config_changed)
-
-        trigger_grp = QGroupBox("Trigger & RMS segmentation")
-        trigger_grp.setStyleSheet(_PANEL_STYLE)
-        tgl = QFormLayout(trigger_grp)
-        self._use_trigger_cb = QCheckBox("Use trigger-based gesture segments")
-        self._use_trigger_cb.setChecked(True)
-        self._use_trigger_cb.setToolTip(
-            "If enabled, only trigger-marked parts are used instead of full recordings."
-        )
-        tgl.addRow(self._use_trigger_cb)
-
-        self._use_rms_cb = QCheckBox("Keep only strongest repetition (RMS)")
-        self._use_rms_cb.setChecked(False)
-        self._use_rms_cb.setToolTip(
-            "Use RMS to pick the strongest repetition per recording."
-        )
-        tgl.addRow(self._use_rms_cb)
-
-        self._trigger_gap_spin = QSpinBox()
-        self._trigger_gap_spin.setRange(10, 5000)
-        self._trigger_gap_spin.setValue(250)
-        self._trigger_gap_spin.setSuffix(" ms")
-        self._trigger_gap_spin.setToolTip("Minimum gap to split two trigger segments.")
-        tgl.addRow("Trigger min gap:", self._trigger_gap_spin)
-        left_lay.addWidget(trigger_grp)
-
-        self._use_trigger_cb.toggled.connect(self._on_config_changed)
-        self._use_rms_cb.toggled.connect(self._on_config_changed)
-        self._trigger_gap_spin.valueChanged.connect(self._on_config_changed)
 
         # ── 2. Gesture & Subject Filters ─────────────────────────────────────
-        filter_grp = QGroupBox("2 · Gesture & Subject Filters")
+        filter_grp = QGroupBox("2 · Gesture, Subject & Condition Filters")
         filter_grp.setStyleSheet(_PANEL_STYLE)
         fgl = QVBoxLayout(filter_grp)
 
@@ -1376,6 +1272,34 @@ class QuattrocentoTrainingDialog(QDialog):
             b.setFixedHeight(20); b.clicked.connect(fn); sb_row.addWidget(b)
         sb_row.addStretch()
         fgl.addLayout(sb_row)
+
+        # Condition filter (healthy / paralysed / …)
+        # Hidden by default; appears automatically after scan if conditions are found.
+        self._cond_container = QWidget()
+        cond_inner = QVBoxLayout(self._cond_container)
+        cond_inner.setContentsMargins(0, 0, 0, 0)
+        cond_inner.setSpacing(2)
+
+        cond_lbl = QLabel("Condition:")
+        cond_lbl.setStyleSheet(f"color:{_C['muted']};font-size:10px;")
+        cond_inner.addWidget(cond_lbl)
+
+        self._cond_list = QListWidget()
+        self._cond_list.setSelectionMode(QAbstractItemView.SelectionMode.MultiSelection)
+        self._cond_list.setMaximumHeight(58)
+        self._cond_list.itemSelectionChanged.connect(self._update_preview)
+        cond_inner.addWidget(self._cond_list)
+
+        cond_btn_row = QHBoxLayout()
+        for lbl, fn in [("All", self._cond_list.selectAll),
+                        ("None", self._cond_list.clearSelection)]:
+            b = QPushButton(lbl); b.setStyleSheet(_BTN_SECONDARY)
+            b.setFixedHeight(20); b.clicked.connect(fn); cond_btn_row.addWidget(b)
+        cond_btn_row.addStretch()
+        cond_inner.addLayout(cond_btn_row)
+
+        fgl.addWidget(self._cond_container)
+        self._cond_container.setVisible(False)   # shown only when conditions exist
         left_lay.addWidget(filter_grp)
 
         # ── 3. Split Assignment ───────────────────────────────────────────────
@@ -1390,6 +1314,50 @@ class QuattrocentoTrainingDialog(QDialog):
         split_info.setStyleSheet(f"color:{_C['muted']};font-size:10px;")
         split_info.setWordWrap(True)
         split_lay.addWidget(split_info)
+
+        intra_row = QHBoxLayout()
+        intra_row.addWidget(QLabel("Intra-trial fallback:"))
+        self._intra_mode_combo = QComboBox()
+        self._intra_mode_combo.addItem("Auto (if split missing)", "auto")
+        self._intra_mode_combo.addItem("Force ON", "force_on")
+        self._intra_mode_combo.addItem("Force OFF", "force_off")
+        self._intra_mode_combo.setMaximumWidth(180)
+        self._intra_mode_combo.currentIndexChanged.connect(self._update_preview)
+        intra_row.addWidget(self._intra_mode_combo)
+
+        intra_row.addSpacing(8)
+        intra_row.addWidget(QLabel("Ratios (%):"))
+        self._split_train_pct = QDoubleSpinBox()
+        self._split_train_pct.setRange(0.0, 100.0)
+        self._split_train_pct.setValue(70.0)
+        self._split_train_pct.setDecimals(1)
+        self._split_train_pct.setSingleStep(1.0)
+        self._split_train_pct.setSuffix(" T")
+        self._split_train_pct.setMaximumWidth(74)
+        self._split_train_pct.valueChanged.connect(self._update_preview)
+        intra_row.addWidget(self._split_train_pct)
+
+        self._split_val_pct = QDoubleSpinBox()
+        self._split_val_pct.setRange(0.0, 100.0)
+        self._split_val_pct.setValue(15.0)
+        self._split_val_pct.setDecimals(1)
+        self._split_val_pct.setSingleStep(1.0)
+        self._split_val_pct.setSuffix(" V")
+        self._split_val_pct.setMaximumWidth(74)
+        self._split_val_pct.valueChanged.connect(self._update_preview)
+        intra_row.addWidget(self._split_val_pct)
+
+        self._split_test_pct = QDoubleSpinBox()
+        self._split_test_pct.setRange(0.0, 100.0)
+        self._split_test_pct.setValue(15.0)
+        self._split_test_pct.setDecimals(1)
+        self._split_test_pct.setSingleStep(1.0)
+        self._split_test_pct.setSuffix(" Te")
+        self._split_test_pct.setMaximumWidth(74)
+        self._split_test_pct.valueChanged.connect(self._update_preview)
+        intra_row.addWidget(self._split_test_pct)
+        intra_row.addStretch()
+        split_lay.addLayout(intra_row)
 
         # Global quick buttons
         gb2 = QHBoxLayout()
@@ -1579,7 +1547,22 @@ class QuattrocentoTrainingDialog(QDialog):
         right_widget = QWidget()
         right_lay = QVBoxLayout(right_widget)
         right_lay.setContentsMargins(0, 0, 0, 0)
-        root.addWidget(right_widget, stretch=1)
+        self._main_splitter.addWidget(right_widget)
+
+        top_right_row = QHBoxLayout()
+        top_right_row.addStretch()
+        self._toggle_settings_btn = QPushButton("Hide Settings")
+        self._toggle_settings_btn.setStyleSheet(_BTN_SECONDARY)
+        self._toggle_settings_btn.setFixedHeight(26)
+        self._toggle_settings_btn.setToolTip("Collapse/expand the left settings panel")
+        self._toggle_settings_btn.clicked.connect(self._toggle_settings_panel)
+        top_right_row.addWidget(self._toggle_settings_btn)
+        right_lay.addLayout(top_right_row)
+
+        self._left_restore_width = 520
+        self._main_splitter.setStretchFactor(0, 0)
+        self._main_splitter.setStretchFactor(1, 1)
+        self._main_splitter.setSizes([self._left_restore_width, 1000])
 
         self._results_tabs = QTabWidget()
         right_lay.addWidget(self._results_tabs)
@@ -1799,13 +1782,81 @@ class QuattrocentoTrainingDialog(QDialog):
                for item in self._subj_list.selectedItems()]
         return sel if sel else None
 
+    def _selected_conditions(self) -> Optional[List[str]]:
+        sel = [item.data(Qt.ItemDataRole.UserRole)
+               for item in self._cond_list.selectedItems()]
+        return sel if sel else None
+
     def _filtered_recs(self):
-        gestures = self._selected_gestures()
-        subjects = self._selected_subjects()
+        gestures   = self._selected_gestures()
+        subjects   = self._selected_subjects()
+        conditions = self._selected_conditions()
         recs = [r for r in self._primary_recs() if r.gesture in gestures]
-        if subjects:
-            recs = [r for r in recs if r.subject_id in subjects]
+        if subjects:   recs = [r for r in recs if r.subject_id in subjects]
+        if conditions: recs = [r for r in recs if r.condition in conditions]
         return recs
+
+    def _toggle_settings_panel(self):
+        sizes = self._main_splitter.sizes() if hasattr(self, "_main_splitter") else []
+        if len(sizes) < 2:
+            return
+        left_size = sizes[0]
+        total = max(sum(sizes), 1)
+        if left_size <= 24:
+            restore = max(360, int(getattr(self, "_left_restore_width", 520)))
+            self._main_splitter.setSizes([restore, max(300, total - restore)])
+            self._toggle_settings_btn.setText("Hide Settings")
+        else:
+            self._left_restore_width = left_size
+            self._main_splitter.setSizes([0, total])
+            self._toggle_settings_btn.setText("Show Settings")
+
+    def _effective_split(self, recs: list, roles: Dict[Tuple[str, str], str]):
+        train_recs = [r for r in recs if roles.get((r.subject_id, r.trial_label)) == "train"]
+        val_recs   = [r for r in recs if roles.get((r.subject_id, r.trial_label)) == "val"]
+        test_recs  = [r for r in recs if roles.get((r.subject_id, r.trial_label)) == "test"]
+
+        included = [r for r in recs
+                    if roles.get((r.subject_id, r.trial_label)) in {"train", "val", "test"}]
+        if not included:
+            return train_recs, val_recs, test_recs, False
+
+        mode = self._intra_mode_combo.currentData() if hasattr(self, "_intra_mode_combo") else "auto"
+        if mode == "force_off":
+            return train_recs, val_recs, test_recs, False
+        if mode == "force_on":
+            return included, included, included, True
+
+        subj_trials: Dict[str, set] = {}
+        for r in included:
+            subj_trials.setdefault(r.subject_id, set()).add(r.trial_label)
+        low_trial_subjects = bool(subj_trials) and all(len(trials) <= 2 for trials in subj_trials.values())
+        missing_split = not train_recs or not val_recs or not test_recs
+        use_intra_split = low_trial_subjects and missing_split
+        if use_intra_split:
+            return included, included, included, True
+        return train_recs, val_recs, test_recs, False
+
+    def _get_intra_split_ratios(self) -> Tuple[float, float, float]:
+        train = float(getattr(self, "_split_train_pct", None).value()) if hasattr(self, "_split_train_pct") else 70.0
+        val = float(getattr(self, "_split_val_pct", None).value()) if hasattr(self, "_split_val_pct") else 15.0
+        test = float(getattr(self, "_split_test_pct", None).value()) if hasattr(self, "_split_test_pct") else 15.0
+        total = train + val + test
+        if total <= 0:
+            return _DEFAULT_INTRA_SPLIT_RATIOS
+        return train / total, val / total, test / total
+
+    @staticmethod
+    def _count_split_windows(total_windows: int, split_role: str,
+                             ratios: Tuple[float, float, float]) -> int:
+        tr_end, va_end = _split_bounds(total_windows, ratios)
+        if split_role == "train":
+            return tr_end
+        if split_role == "val":
+            return max(0, va_end - tr_end)
+        if split_role == "test":
+            return max(0, total_windows - va_end)
+        return 0
 
     # ─── slots ────────────────────────────────────────────────────────────────
 
@@ -1813,7 +1864,10 @@ class QuattrocentoTrainingDialog(QDialog):
     def _on_config_changed(self):
         if self._loader is not None:
             self._loader = None
-            self._gest_list.clear(); self._subj_list.clear()
+            self._gest_list.clear()
+            self._subj_list.clear()
+            self._cond_list.clear()
+            self._cond_container.setVisible(False)
             self._train_btn.setEnabled(False); self._lc_btn.setEnabled(False)
             if self._root_edit.text():
                 self._scan_info.setText("⚠ Config changed — click 'Scan Directory' to reload.")
@@ -1832,120 +1886,102 @@ class QuattrocentoTrainingDialog(QDialog):
 
     @Slot()
     def _on_scan(self):
-        if self._scan_worker and self._scan_worker.isRunning():
-            return
-
+        from playagain_pipeline.gui.widgets.quattrocento_loader import QuattrocentoSubjectLoader
+        from playagain_pipeline.gui.widgets.busy_overlay import run_blocking
         root = Path(self._root_edit.text())
-        if not root.exists():
-            self._scan_info.setText(f"Scan error: folder does not exist: {root}")
-            return
-
         window_ms, nc_target = self._primary_config()
-        side = self._side_combo.currentText().strip().lower()
-
+        side = self._side_combo.currentText() if hasattr(self, "_side_combo") else "left"
         self._scan_btn.setEnabled(False)
-        self._browse_btn.setEnabled(False)
-        self._side_combo.setEnabled(False)
-        self._ws_spin.setEnabled(False)
-        self._nc_spin.setEnabled(False)
-        self._scan_progress.setValue(0)
-        self._scan_progress.setVisible(True)
-        self._scan_info.setText("Scanning metadata (participant/gesture/trial)…")
+        self._scan_info.setText("Scanning…")
 
-        self._scan_worker = _ScanWorker(root=root, side=side, window_ms=window_ms, nc_target=nc_target)
-        self._scan_worker.progress.connect(self._on_scan_progress)
-        self._scan_worker.scan_finished.connect(self._on_scan_finished)
-        self._scan_worker.error.connect(self._on_scan_error)
-        self._scan_worker.cancelled.connect(self._on_scan_cancelled)
-        self._scan_worker.start()
+        def _do_scan():
+            loader = QuattrocentoSubjectLoader(root, side=side, window_ms=window_ms)
+            all_recs = loader.scan(verbose=False)
+            return loader, all_recs
 
-    @Slot(int, str)
-    def _on_scan_progress(self, value: int, message: str):
-        self._scan_progress.setValue(max(0, min(100, int(value))))
-        self._scan_info.setText(f"Scanning metadata… {value}%\n{message}")
+        def _scan_done(result):
+            loader, all_recs = result
+            self._scan_btn.setEnabled(True)
+            self._finish_scan(loader, all_recs, nc_target, window_ms)
 
-    @Slot(object)
-    def _on_scan_finished(self, payload: dict):
-        self._loader = payload["loader"]
-        primary = payload["primary"]
-        skipped = int(payload["skipped"])
-        side = str(payload["side"])
-        window_ms = int(payload["window_ms"])
+        def _scan_error(tb):
+            self._scan_btn.setEnabled(True)
+            self._scan_info.setText(f"Scan error — see log")
+            self._log(f"Scan error:\n{tb}")
 
-        gestures = sorted({r.gesture for r in primary},
-                          key=lambda g: (_DEFAULT_LABEL_ORDER.index(g)
-                                          if g in _DEFAULT_LABEL_ORDER else 999))
-        self._gest_list.clear()
-        for g in gestures:
-            n = sum(1 for r in primary if r.gesture == g)
-            item = QListWidgetItem(f"{g}  ({n} files)")
-            item.setData(Qt.ItemDataRole.UserRole, g)
-            self._gest_list.addItem(item)
-        self._gest_list.selectAll()
+        run_blocking(self, _do_scan, _scan_done, _scan_error, label="Scanning directory…")
 
-        subjects = sorted({r.subject_id for r in primary})
-        self._subj_list.clear()
-        for s in subjects:
-            item = QListWidgetItem(s)
-            item.setData(Qt.ItemDataRole.UserRole, s)
-            self._subj_list.addItem(item)
-        self._subj_list.selectAll()
+    def _finish_scan(self, loader, all_recs, nc_target, window_ms):
+        try:
+            primary = [r for r in all_recs if r.n_channels == nc_target] if nc_target > 0 else all_recs
+            skipped = len(all_recs) - len(primary)
+            self._loader = loader
 
-        subj_trials: Dict[str, List[str]] = {}
-        for r in primary:
-            subj_trials.setdefault(r.subject_id, [])
-            if r.trial_label not in subj_trials[r.subject_id]:
-                subj_trials[r.subject_id].append(r.trial_label)
-        self._split_cards.load(subj_trials)
+            gestures = sorted({r.gesture for r in primary},
+                              key=lambda g: (_DEFAULT_LABEL_ORDER.index(g)
+                                              if g in _DEFAULT_LABEL_ORDER else 999))
+            self._gest_list.clear()
+            for g in gestures:
+                recs_g = [r for r in primary if r.gesture == g]
+                n = len(recs_g)
+                total_reps = sum(r.n_repetitions for r in recs_g)
+                has_trig = sum(1 for r in recs_g if r.has_trigger)
+                trig_str = f"trig={has_trig}/{n}" if has_trig > 0 else f"rms only"
+                item = QListWidgetItem(f"{g}  ({n} files, ~{total_reps} reps, {trig_str})")
+                item.setData(Qt.ItemDataRole.UserRole, g)
+                self._gest_list.addItem(item)
+            self._gest_list.selectAll()
 
-        trial_labels = sorted({r.trial_label for r in primary})
-        n_ch_found = sorted({r.n_channels for r in primary})
-        info = (f"Found {len(primary)} CSV files  ({window_ms} ms windows)\n"
-                f"Channels: {n_ch_found} | side={side}\n"
-                f"Subjects: {', '.join(subjects)}\n"
-                f"Trial labels: {', '.join(trial_labels)}\n"
-                "Scan mode: metadata-only (fast)")
-        if skipped:
-            info += f"\n(skipped {skipped} files with different config)"
-        self._scan_info.setText(info)
-        self._scan_progress.setValue(100)
-        self._train_btn.setEnabled(True)
-        self._lc_btn.setEnabled(False)
-        self._update_preview()
-        self._log(f"Scan complete: {len(primary)} files, {len(gestures)} gestures, labels: {trial_labels}")
-        self._finalize_scan_worker()
+            subjects = sorted({r.subject_id for r in primary})
+            self._subj_list.clear()
+            for s in subjects:
+                item = QListWidgetItem(s)
+                item.setData(Qt.ItemDataRole.UserRole, s)
+                self._subj_list.addItem(item)
+            self._subj_list.selectAll()
 
-    @Slot(str)
-    def _on_scan_error(self, error_text: str):
-        self._scan_info.setText(f"Scan error: {error_text}")
-        self._log(f"Scan error: {error_text}")
-        self._finalize_scan_worker()
+            # Condition filter (only shown when the new folder layout is used)
+            conditions = sorted({r.condition for r in primary if r.condition})
+            self._cond_list.clear()
+            for cond in conditions:
+                n_cond = sum(1 for r in primary if r.condition == cond)
+                item = QListWidgetItem(f"{cond}  ({n_cond} files)")
+                item.setData(Qt.ItemDataRole.UserRole, cond)
+                self._cond_list.addItem(item)
+            self._cond_list.selectAll()
+            self._cond_container.setVisible(bool(conditions))
 
-    @Slot()
-    def _on_scan_cancelled(self):
-        self._scan_info.setText("Scan cancelled")
-        self._log("Scan cancelled")
-        self._finalize_scan_worker()
+            subj_trials: Dict[str, List[str]] = {}
+            for r in primary:
+                subj_trials.setdefault(r.subject_id, [])
+                if r.trial_label not in subj_trials[r.subject_id]:
+                    subj_trials[r.subject_id].append(r.trial_label)
+            self._split_cards.load(subj_trials)
 
-    def _finalize_scan_worker(self):
-        if self._scan_worker:
-            try:
-                self._scan_worker.progress.disconnect(self._on_scan_progress)
-                self._scan_worker.scan_finished.disconnect(self._on_scan_finished)
-                self._scan_worker.error.disconnect(self._on_scan_error)
-                self._scan_worker.cancelled.disconnect(self._on_scan_cancelled)
-            except Exception:
-                pass
-            if self._scan_worker.isRunning():
-                self._scan_worker.requestInterruption()
-                self._scan_worker.wait(1500)
-            self._scan_worker = None
+            trial_labels = sorted({r.trial_label for r in primary})
+            n_ch_found = sorted({r.n_channels for r in primary})
+            n_trigger = sum(1 for r in primary if r.has_trigger)
+            total_reps_all = sum(r.n_repetitions for r in primary)
+            seg_method = "trigger" if n_trigger > len(primary) * 0.5 else "RMS (no trigger)"
+            side = getattr(self._side_combo, 'currentText', lambda: 'left')()
 
-        self._scan_btn.setEnabled(True)
-        self._browse_btn.setEnabled(True)
-        self._side_combo.setEnabled(True)
-        self._ws_spin.setEnabled(True)
-        self._nc_spin.setEnabled(True)
+            info = (f"Found {len(primary)} CSV files  ({window_ms} ms windows)\n"
+                    f"Channels: {n_ch_found}  |  Side: {side}\n"
+                    f"Subjects: {', '.join(subjects)}\n"
+                    f"Trial labels: {', '.join(trial_labels)}\n"
+                    f"Repetitions: ~{total_reps_all} total  |  Seg: {seg_method}\n"
+                    f"Trigger files: {n_trigger}/{len(primary)}")
+            if skipped:
+                info += f"\n(skipped {skipped} files with different channel config)"
+            self._scan_info.setText(info)
+            self._train_btn.setEnabled(True)
+            self._lc_btn.setEnabled(False)
+            self._update_preview()
+            self._log(f"Scan complete: {len(primary)} files, {len(gestures)} gestures, "
+                      f"~{total_reps_all} reps, trigger={n_trigger}/{len(primary)}")
+        except Exception as e:
+            self._scan_info.setText(f"Finish-scan error: {e}")
+            self._log(f"Finish-scan error: {e}")
 
     def _update_preview(self):
         if self._loader is None:
@@ -1955,22 +1991,17 @@ class QuattrocentoTrainingDialog(QDialog):
             self._preview_lbl.setText("No data matched current filters.")
             return
 
-        if all(int(getattr(r, "n_windows", 0)) == 0 for r in recs):
-            gestures = self._selected_gestures()
-            self._preview_lbl.setText(
-                f"Train/Val/Test window counts are computed during loading.\n"
-                f"Current selection: {len(recs):,} files, {len(gestures)} classes, "
-                f"{len({r.subject_id for r in recs})} subjects"
-            )
-            return
-
         roles = self._split_cards.get_roles()
-        train_wins = sum(r.n_windows for r in recs
-                         if roles.get((r.subject_id, r.trial_label)) == "train")
-        val_wins   = sum(r.n_windows for r in recs
-                         if roles.get((r.subject_id, r.trial_label)) == "val")
-        test_wins  = sum(r.n_windows for r in recs
-                         if roles.get((r.subject_id, r.trial_label)) == "test")
+        train_recs, val_recs, test_recs, use_intra_split = self._effective_split(recs, roles)
+        ratios = self._get_intra_split_ratios()
+        if use_intra_split:
+            train_wins = sum(self._count_split_windows(r.n_windows, "train", ratios) for r in train_recs)
+            val_wins   = sum(self._count_split_windows(r.n_windows, "val", ratios)   for r in val_recs)
+            test_wins  = sum(self._count_split_windows(r.n_windows, "test", ratios)  for r in test_recs)
+        else:
+            train_wins = sum(r.n_windows for r in train_recs)
+            val_wins   = sum(r.n_windows for r in val_recs)
+            test_wins  = sum(r.n_windows for r in test_recs)
         total = train_wins + val_wins + test_wins
 
         gestures = self._selected_gestures()
@@ -1979,9 +2010,10 @@ class QuattrocentoTrainingDialog(QDialog):
         imbalance_txt = ""
         if train_wins > 0:
             counts_per_class = {}
-            for r in recs:
-                if roles.get((r.subject_id, r.trial_label)) == "train":
-                    counts_per_class[r.gesture] = counts_per_class.get(r.gesture, 0) + r.n_windows
+            for r in train_recs:
+                n_train = (self._count_split_windows(r.n_windows, "train", ratios)
+                           if use_intra_split else r.n_windows)
+                counts_per_class[r.gesture] = counts_per_class.get(r.gesture, 0) + n_train
             if counts_per_class:
                 max_c = max(counts_per_class.values())
                 min_c = min(counts_per_class.values())
@@ -1995,9 +2027,15 @@ class QuattrocentoTrainingDialog(QDialog):
         self._imbalance_warn.setVisible(bool(imbalance_txt))
         self._imbalance_warn.setText(imbalance_txt)
 
+        if use_intra_split:
+            p_train, p_val, p_test = [100.0 * r for r in ratios]
+            split_note = f"\nIntra-trial split active: {p_train:.1f}% / {p_val:.1f}% / {p_test:.1f}%."
+        else:
+            split_note = ""
         txt = (f"Train: {train_wins:,}  |  Val: {val_wins:,}  |  Test: {test_wins:,}  "
                f"(total {total:,})\n{len(gestures)} classes, "
-               f"{len({r.subject_id for r in recs})} subjects")
+               f"{len({r.subject_id for r in recs})} subjects"
+               f"{split_note}")
         self._preview_lbl.setText(txt)
 
     @Slot()
@@ -2015,9 +2053,8 @@ class QuattrocentoTrainingDialog(QDialog):
             return
 
         roles = self._split_cards.get_roles()
-        train_recs = [r for r in recs if roles.get((r.subject_id, r.trial_label)) == "train"]
-        val_recs   = [r for r in recs if roles.get((r.subject_id, r.trial_label)) == "val"]
-        test_recs  = [r for r in recs if roles.get((r.subject_id, r.trial_label)) == "test"]
+        train_recs, val_recs, test_recs, use_intra_split = self._effective_split(recs, roles)
+        split_ratios = self._get_intra_split_ratios()
 
         if not train_recs:
             QMessageBox.warning(self, "No training data",
@@ -2057,11 +2094,12 @@ class QuattrocentoTrainingDialog(QDialog):
         self._log(f"SR: {sr:.0f} Hz  |  Window: {ws} smp ({window_ms} ms)  |  Channels: {nc}")
         self._log(f"Train files: {len(train_recs)}  |  Val: {len(val_recs)}  |  Test: {len(test_recs)}")
         self._log(f"Norm: {norm_mode}  |  Augment: {augment}  |  CV: {cv_mode}  |  CW: {class_weight}")
-        self._log(
-            f"Trigger mode: {self._use_trigger_cb.isChecked()}  |  "
-            f"RMS-pick: {self._use_rms_cb.isChecked()}  |  "
-            f"min-gap: {self._trigger_gap_spin.value()} ms"
-        )
+        if use_intra_split:
+            self._log(
+                "Using intra-trial split: "
+                f"{split_ratios[0]*100:.1f}% train / {split_ratios[1]*100:.1f}% val / "
+                f"{split_ratios[2]*100:.1f}% test per recording."
+            )
 
         self._train_btn.setEnabled(False)
         self._stop_btn.setEnabled(True)
@@ -2072,6 +2110,8 @@ class QuattrocentoTrainingDialog(QDialog):
         self._live_canvas.reset()
         self._cv_table.setRowCount(0)
 
+        use_trigger = self._use_trigger_cb.isChecked() if hasattr(self, '_use_trigger_cb') else False
+        onset_delay = float(self._onset_delay_spin.value()) if hasattr(self, '_onset_delay_spin') else 150.0
         self._worker = _TrainWorker(
             loader=self._loader,
             train_recs=train_recs, test_recs=test_recs, val_recs=val_recs,
@@ -2085,9 +2125,10 @@ class QuattrocentoTrainingDialog(QDialog):
             channel_reduce_n=self._ch_n_spin.value(),
             class_weight=class_weight,
             early_stopping_patience=self._es_patience_spin.value(),
-            use_trigger_segmentation=self._use_trigger_cb.isChecked(),
-            use_rms_selection=self._use_rms_cb.isChecked(),
-            trigger_min_gap_ms=self._trigger_gap_spin.value(),
+            use_trigger_segments=use_trigger,
+            onset_delay_ms=onset_delay,
+            intra_trial_split=use_intra_split,
+            split_ratios=split_ratios,
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.epoch_update.connect(self._on_epoch_update)
@@ -2341,8 +2382,7 @@ class QuattrocentoTrainingDialog(QDialog):
 
         recs = self._filtered_recs()
         roles = self._split_cards.get_roles()
-        train_recs = [r for r in recs if roles.get((r.subject_id, r.trial_label)) == "train"]
-        test_recs  = [r for r in recs if roles.get((r.subject_id, r.trial_label)) == "test"]
+        train_recs, _, test_recs, _ = self._effective_split(recs, roles)
         if not train_recs or not test_recs:
             QMessageBox.warning(self, "No data", "Need both TRAIN and TEST trials assigned.")
             return
@@ -2366,9 +2406,6 @@ class QuattrocentoTrainingDialog(QDialog):
             model_manager=self._model_manager, model_type=model_type,
             ws=ws, nc=nc, sr=sr, norm_mode=self._norm_combo.currentData(),
             feat_cfg=feat_cfg, label_order=_DEFAULT_LABEL_ORDER,
-            use_trigger_segmentation=self._use_trigger_cb.isChecked(),
-            use_rms_selection=self._use_rms_cb.isChecked(),
-            trigger_min_gap_ms=self._trigger_gap_spin.value(),
         )
         self._lc_worker.progress.connect(
             lambda p, m: (self._lc_progress.setValue(p), self._status_lbl.setText(m)))
@@ -2461,7 +2498,7 @@ class QuattrocentoTrainingDialog(QDialog):
             self._log_text.verticalScrollBar().maximum())
 
     def closeEvent(self, event):
-        for w in (self._worker, self._lc_worker, self._scan_worker):
+        for w in (self._worker, self._lc_worker):
             if w and w.isRunning():
                 w.terminate()
                 w.wait(3000)

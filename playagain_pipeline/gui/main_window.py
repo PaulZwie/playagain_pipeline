@@ -48,8 +48,8 @@ from playagain_pipeline.protocols.protocol import (
     create_fist_protocol,
 )
 from playagain_pipeline.prediction_server import PredictionServer, PredictionSmoother
+from playagain_pipeline.gui.widgets.busy_overlay import run_blocking
 from playagain_pipeline.game_recorder import GameRecorder
-from playagain_pipeline.gui.gui_style import apply_app_style
 
 
 class PredictionWorker(QThread):
@@ -185,9 +185,6 @@ class MainWindow(QMainWindow):
         self.data_dir = self._pipeline_dir / "data"
         self.data_dir.mkdir(exist_ok=True)
 
-        # Runtime config (bright theme default unless overridden by file).
-        self.config = get_default_config()
-
         # Initialize managers
         self.data_manager = DataManager(self.data_dir)
         self.device_manager = DeviceManager()
@@ -234,7 +231,6 @@ class MainWindow(QMainWindow):
 
         # Setup UI
         self._setup_ui()
-        self._apply_app_theme()
         self._setup_connections()
 
         # Connect thread-safe server prediction signal to UI update
@@ -246,13 +242,13 @@ class MainWindow(QMainWindow):
         self._status_timer.start(1000)
 
         # Load configuration
+        self.config = get_default_config()
         # Try to load from file if exists
         config_path = self._pipeline_dir / "config.json"
         if config_path.exists():
             try:
                 self.config = PipelineConfig.load(config_path)
                 self._log("Loaded configuration from file")
-                self._apply_app_theme()
             except Exception as e:
                 self._log(f"Failed to load config, using defaults: {e}")
 
@@ -414,8 +410,7 @@ class MainWindow(QMainWindow):
         device_layout = QFormLayout(device_group)
 
         self.device_combo = QComboBox()
-        self.device_combo.addItems(["Synthetic", "Quattrocento Replay", "Muovi", "Muovi Plus"])
-        self.device_combo.currentTextChanged.connect(self._on_device_selection_changed)
+        self.device_combo.addItems(["Synthetic", "Muovi", "Muovi Plus", "Quattrocento"])
         device_layout.addRow("Device:", self.device_combo)
 
         self.channels_spin = QSpinBox()
@@ -453,22 +448,6 @@ class MainWindow(QMainWindow):
         self.session_id_combo = QComboBox()
         self.session_id_combo.setEnabled(False)
         device_layout.addRow("Session:", self.session_id_combo)
-
-        # Quattrocento replay options
-        self.quattro_root_edit = QLineEdit(str(self.data_dir / "quattrocento"))
-        self.quattro_root_edit.setEnabled(False)
-        self.quattro_root_btn = QPushButton("Browse…")
-        self.quattro_root_btn.setEnabled(False)
-        self.quattro_root_btn.clicked.connect(self._pick_quattrocento_root)
-        q_root_row = QHBoxLayout()
-        q_root_row.addWidget(self.quattro_root_edit)
-        q_root_row.addWidget(self.quattro_root_btn)
-        device_layout.addRow("Q4 root:", q_root_row)
-
-        self.quattro_side_combo = QComboBox()
-        self.quattro_side_combo.addItems(["left", "right", "both"])
-        self.quattro_side_combo.setEnabled(False)
-        device_layout.addRow("Q4 side:", self.quattro_side_combo)
 
         # Note: channel enable/disable is done via the checkboxes in the EMG plot
         channel_note = QLabel("Channel Status: Use checkboxes in EMG plot to enable/disable channels")
@@ -624,7 +603,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(scroll)
 
         self._on_recording_mode_changed()
-        self._on_device_selection_changed(self.device_combo.currentText())
 
         return tab
 
@@ -1590,8 +1568,7 @@ class MainWindow(QMainWindow):
             "device": {
                 "num_channels": self.channels_spin.value(),
                 "sampling_rate": self.sampling_rate_spin.value()
-            },
-            "ui_theme": getattr(self.config, "ui_theme", "bright"),
+            }
         }
 
         dialog = ConfigurationDialog(current_config, self)
@@ -1612,13 +1589,10 @@ class MainWindow(QMainWindow):
                 idx = self.device_combo.findText(dev["type"])
                 if idx >= 0:
                     self.device_combo.setCurrentIndex(idx)
-                self.config.device.device_type = str(dev["type"]).lower().replace(" ", "_")
             if "num_channels" in dev:
                 self.channels_spin.setValue(dev["num_channels"])
-                self.config.device.num_channels = int(dev["num_channels"])
             if "sampling_rate" in dev:
                 self.sampling_rate_spin.setValue(dev["sampling_rate"])
-                self.config.device.sampling_rate = int(dev["sampling_rate"])
 
         # Apply recording settings
         if "recording" in config:
@@ -1631,15 +1605,6 @@ class MainWindow(QMainWindow):
             cal = config["calibration"]
             if self.calibrator and self.calibrator.current_calibration:
                 self.calibrator.current_calibration.rotation_offset = cal.get("rotation_offset", 0)
-
-        if "ui_theme" in config:
-            self.config.ui_theme = str(config["ui_theme"])
-            self._apply_app_theme()
-
-        try:
-            self.config.save(self._pipeline_dir / "config.json")
-        except Exception as e:
-            self._log(f"Could not save config: {e}")
 
     @Slot()
     def _on_advanced_training(self):
@@ -1749,8 +1714,17 @@ class MainWindow(QMainWindow):
             device_type = DeviceType.MUOVI
         elif device_text == "Muovi Plus":
             device_type = DeviceType.MUOVI_PLUS
-        elif device_text == "Quattrocento Replay":
-            device_type = DeviceType.QUATTROCENTO
+        elif device_text == "Quattrocento":
+            # Quattrocento streaming: pick a data directory first
+            from PySide6.QtWidgets import QFileDialog
+            q4_root = QFileDialog.getExistingDirectory(
+                self, "Select Quattrocento recordings folder",
+                str(self.data_dir),
+            )
+            if not q4_root:
+                return
+            self._start_quattrocento_stream(q4_root)
+            return
         else:
             device_type = DeviceType.SYNTHETIC
 
@@ -1767,12 +1741,6 @@ class MainWindow(QMainWindow):
             if device_type == DeviceType.SYNTHETIC and self.use_session_data_cb.isChecked():
                 kwargs.update({"use_session_data": True, "session_subject_id": self.session_subject_combo.currentText(),
                                "session_id": self.session_id_combo.currentText(), "data_dir": str(self.data_dir)})
-            elif device_type == DeviceType.QUATTROCENTO:
-                kwargs.update({
-                    "quattrocento_root": self.quattro_root_edit.text().strip(),
-                    "quattrocento_side": self.quattro_side_combo.currentText().strip().lower(),
-                    "data_dir": str(self.data_dir),
-                })
 
             device = self.device_manager.create_device(device_type, **kwargs)
 
@@ -1866,7 +1834,13 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_disconnect_device(self):
-        """Disconnect from device."""
+        """Disconnect from device (Muovi/Synthetic or Quattrocento stream)."""
+        # Stop Quattrocento stream if active
+        if hasattr(self, '_q4_worker') and self._q4_worker is not None:
+            self._q4_worker.stop()
+            self._q4_worker.wait(2000)
+            self._q4_worker = None
+            self._log("Quattrocento stream stopped")
         self.device_manager.stop_and_disconnect()
         self.connect_btn.setEnabled(True)
         self.disconnect_btn.setEnabled(False)
@@ -2105,9 +2079,13 @@ class MainWindow(QMainWindow):
             except Exception as e:
                 self._log(f"Rotation detection failed: {e}")
 
-            # Save session (now includes rotation metadata)
-            path = self.data_manager.save_session(self._current_session)
-            self._log(f"Saved session to {path}")
+            # Save session (now includes rotation metadata) — do it on main thread
+            # (saving is usually fast for recording sizes, but show feedback)
+            try:
+                path = self.data_manager.save_session(self._current_session)
+                self._log(f"Saved session to {path}")
+            except Exception as save_err:
+                self._log(f"Error saving session: {save_err}")
 
             self._current_session = None
 
@@ -2209,72 +2187,72 @@ class MainWindow(QMainWindow):
                                 "Record a session first if none are available.")
             return
 
-        try:
-            self._log(f"Loading session {subject}/{session_id} for calibration...")
+        self.calibrate_from_session_btn.setEnabled(False)
+        self._log(f"Loading session {subject}/{session_id} for calibration...")
+
+        def _do_cal():
             session = self.data_manager.load_session(subject, session_id)
-
             if not session.trials:
-                QMessageBox.warning(self, "Warning",
-                                    "Selected session has no recorded trials.\n"
-                                    "Please select a session with gesture recordings.")
-                return
-
-            # Update calibrator to use the session's actual channel count (adaptive)
-            # This ensures it works correctly even when bad channels were removed
+                raise ValueError("Selected session has no recorded trials.")
             self.calibrator.processor.num_channels = session.metadata.num_channels
-
-            # Show which gestures were found
-            gesture_names = set(t.gesture_name for t in session.get_valid_trials())
-            self._log(f"Found gestures: {', '.join(sorted(gesture_names))}")
-            self._log(f"Total valid trials: {len(session.get_valid_trials())}")
-
-            # Run calibration from the session data
             result = self.calibrator.calibrate_from_session(session)
+            return session, result
 
-            self._update_calibration_display()
-            self._log(f"Calibration completed from session '{session_id}'")
-            self._log(f"  Rotation offset: {result.rotation_offset} channels")
-            self._log(f"  Confidence: {result.confidence:.2%}")
+        def _cal_done(payload):
+            self.calibrate_from_session_btn.setEnabled(True)
+            session, result = payload
+            try:
 
-            # Show per-gesture confidence if available
-            per_gesture = result.metadata.get("per_gesture_confidence", {})
-            if per_gesture:
-                for gesture, conf in sorted(per_gesture.items()):
-                    self._log(f"  {gesture}: {conf:.2%}")
+                gesture_names = set(t.gesture_name for t in session.get_valid_trials())
+                self._log(f"Found gestures: {', '.join(sorted(gesture_names))}")
+                self._log(f"Total valid trials: {len(session.get_valid_trials())}")
+                self._update_calibration_display()
+                self._log(f"Calibration completed from session '{session_id}'")
+                self._log(f"  Rotation offset: {result.rotation_offset} channels")
+                self._log(f"  Confidence: {result.confidence:.2%}")
 
-            # Check if reference was incompatible
-            incompat = result.metadata.get("reference_incompatible")
-            if incompat:
-                self._log(f"  Warning - Reference was incompatible: {incompat}")
-                self._log(f"  Saving this session as the new reference.")
-                # Auto-save as new reference since the old one is useless
-                self.calibrator.save_as_reference(result)
-                QMessageBox.information(self, "New Reference Saved",
-                                        f"Calibration from session '{session_id}' complete!\n\n"
-                                        f"The previous reference calibration was incompatible:\n"
-                                        f"{incompat}\n\n"
-                                        f"This session has been saved as the new reference.\n"
-                                        f"Future sessions with the same gestures will detect\n"
-                                        f"bracelet rotation relative to this recording.")
-            elif not self.calibrator.has_reference:
-                self._log(f"  No reference found. Saving as reference.")
-                self.calibrator.save_as_reference(result)
-                QMessageBox.information(self, "Reference Saved",
-                                        f"Calibration from session '{session_id}' complete!\n\n"
-                                        f"No existing reference was found, so this session has\n"
-                                        f"been saved as the new reference calibration.\n\n"
-                                        f"Future sessions will detect bracelet rotation\n"
-                                        f"relative to this recording.")
-            else:
-                QMessageBox.information(self, "Calibration Complete",
-                                        f"Calibration from session '{session_id}' complete!\n\n"
-                                        f"Rotation offset: {result.rotation_offset} channels\n"
-                                        f"Confidence: {result.confidence:.2%}\n\n"
-                                        f"Save as reference to use for future sessions.")
+                per_gesture = result.metadata.get("per_gesture_confidence", {})
+                if per_gesture:
+                    for gesture, conf in sorted(per_gesture.items()):
+                        self._log(f"  {gesture}: {conf:.2%}")
 
-        except Exception as e:
-            self._log(f"Calibration error: {e}")
-            QMessageBox.critical(self, "Error", f"Calibration failed: {e}")
+                incompat = result.metadata.get("reference_incompatible")
+                if incompat:
+                    self._log(f"  Warning - Reference was incompatible: {incompat}")
+                    self._log(f"  Saving this session as the new reference.")
+                    self.calibrator.save_as_reference(result)
+                    QMessageBox.information(self, "New Reference Saved",
+                                            f"Calibration from session '{session_id}' complete!\n\n"
+                                            f"The previous reference calibration was incompatible:\n"
+                                            f"{incompat}\n\n"
+                                            f"This session has been saved as the new reference.\n"
+                                            f"Future sessions with the same gestures will detect\n"
+                                            f"bracelet rotation relative to this recording.")
+                elif not self.calibrator.has_reference:
+                    self._log(f"  No reference found. Saving as reference.")
+                    self.calibrator.save_as_reference(result)
+                    QMessageBox.information(self, "Reference Saved",
+                                            f"Calibration from session '{session_id}' complete!\n\n"
+                                            f"No existing reference was found, so this session has\n"
+                                            f"been saved as the new reference calibration.\n\n"
+                                            f"Future sessions will detect bracelet rotation\n"
+                                            f"relative to this recording.")
+                else:
+                    QMessageBox.information(self, "Calibration Complete",
+                                            f"Calibration from session '{session_id}' complete!\n\n"
+                                            f"Rotation offset: {result.rotation_offset} channels\n"
+                                            f"Confidence: {result.confidence:.2%}\n\n"
+                                            f"Save as reference to use for future sessions.")
+            except Exception as e:
+                self._log(f"Calibration display error: {e}")
+
+        def _cal_err(tb):
+            self.calibrate_from_session_btn.setEnabled(True)
+            self._log(f"Calibration error:\n{tb}")
+            QMessageBox.critical(self, "Error", f"Calibration failed.\nSee log for details.")
+
+        run_blocking(self, _do_cal, _cal_done, _cal_err,
+                     label="Calibrating from session…")
 
     @Slot()
     def _on_save_reference(self):
@@ -2286,22 +2264,29 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_save_reference_and_recompute(self):
         """Save current calibration as reference and recompute all session rotations."""
-        if self.calibrator.current_calibration:
-            self._log("Setting new reference and recomputing all session rotations...")
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            try:
-                from playagain_pipeline.calibration.calibrator import backfill_session_rotations
-                self.calibrator.save_as_reference(
-                    self.calibrator.current_calibration,
-                    recompute_all=True,
-                    data_dir=self.data_dir,
-                )
-                self._log("All session rotations recomputed relative to new reference")
-                self._update_calibration_display()
-            except Exception as e:
-                self._log(f"Error recomputing rotations: {e}")
-            finally:
-                QApplication.restoreOverrideCursor()
+        if not self.calibrator.current_calibration:
+            return
+        cal_snapshot = self.calibrator.current_calibration
+        data_dir_snap = self.data_dir
+        self._log("Setting new reference and recomputing all session rotations...")
+
+        def _do_recompute():
+            self.calibrator.save_as_reference(
+                cal_snapshot,
+                recompute_all=True,
+                data_dir=data_dir_snap,
+            )
+            return True
+
+        def _done(_):
+            self._log("All session rotations recomputed relative to new reference")
+            self._update_calibration_display()
+
+        def _err(tb):
+            self._log(f"Error recomputing rotations:\n{tb}")
+
+        run_blocking(self, _do_recompute, _done, _err,
+                     label="Recomputing all session rotations…")
 
     @Slot()
     def _on_load_calibration(self):
@@ -3003,100 +2988,89 @@ class MainWindow(QMainWindow):
                         ds_feature_config = {"mode": "default", "features": []}
                     self._log(f"Pre-extracting features (mode: {ds_feature_config['mode']})")
 
-                dataset = self.data_manager.create_dataset(
-                    name=name_edit.text(),
-                    sessions=sessions_to_use,
-                    window_size_ms=window_size_spin.value(),
-                    window_stride_ms=stride_spin.value(),
-                    include_invalid=include_invalid_cb.isChecked(),
-                    calibration=cal_to_apply,
-                    use_per_session_rotation=use_per_session,
-                    feature_config=ds_feature_config,
-                    bad_channel_mode=bad_channel_mode_combo.currentData(),
-                )
+                ds_name      = name_edit.text()
+                ds_sessions  = sessions_to_use
+                ds_ws        = window_size_spin.value()
+                ds_stride    = stride_spin.value()
+                ds_invalid   = include_invalid_cb.isChecked()
+                ds_cal       = cal_to_apply
+                ds_per_sess  = use_per_session
+                ds_feat_cfg  = ds_feature_config
+                ds_bad_mode  = bad_channel_mode_combo.currentData()
 
-                self.data_manager.save_dataset(dataset)
-                self._log(f"Created dataset '{name_edit.text()}' with {dataset['metadata']['num_samples']} samples")
-                self._refresh_datasets()
+                def _create():
+                    ds = self.data_manager.create_dataset(
+                        name=ds_name, sessions=ds_sessions,
+                        window_size_ms=ds_ws, window_stride_ms=ds_stride,
+                        include_invalid=ds_invalid, calibration=ds_cal,
+                        use_per_session_rotation=ds_per_sess,
+                        feature_config=ds_feat_cfg, bad_channel_mode=ds_bad_mode,
+                    )
+                    self.data_manager.save_dataset(ds)
+                    return ds
+
+                def _ds_done(ds):
+                    self._log(f"Created dataset '{ds_name}' with {ds['metadata']['num_samples']} samples")
+                    self._refresh_datasets()
+
+                def _ds_err(tb):
+                    self._log(f"Error creating dataset:\n{tb}")
+                    from PySide6.QtWidgets import QMessageBox
+                    QMessageBox.critical(self, "Error", f"Failed to create dataset.\nSee log for details.")
+
+                run_blocking(self, _create, _ds_done, _ds_err,
+                             label=f"Creating dataset '{ds_name}'…")
 
             except Exception as e:
-                self._log(f"Error creating dataset: {e}")
+                self._log(f"Error preparing dataset creation: {e}")
                 QMessageBox.critical(self, "Error", f"Failed to create dataset: {e}")
 
     @Slot()
     def _on_train_model(self):
-        """Train a model on selected dataset."""
+        """Train a model on selected dataset (non-blocking)."""
         selected = self.dataset_list.currentItem()
         if not selected:
             QMessageBox.warning(self, "Warning", "Please select a dataset")
             return
 
-        try:
-            dataset_name = selected.text()
+        dataset_name = selected.text()
+        model_type_text = self.model_type_combo.currentText()
+        if model_type_text == "AttentionNet":
+            model_type = "attention_net"
+        elif model_type_text == "MSTNet":
+            model_type = "mstnet"
+        else:
+            model_type = model_type_text.lower().replace(" ", "_")
 
-            # Log dataset loading
-            self._log(f"Loading dataset '{dataset_name}'...")
+        safe_dataset_name = dataset_name.replace(":", "-").replace(" ", "_").replace("/", "_")
+        timestamp = datetime.now().strftime("%H%M%S")
+        model_name = f"{model_type}_{safe_dataset_name}_{timestamp}"
+
+        self._log(f"Loading dataset '{dataset_name}' and starting training ({model_type})...")
+        self.train_btn.setEnabled(False)
+
+        def _do_train():
             dataset = self.data_manager.load_dataset(dataset_name)
-
-            num_samples = dataset['metadata']['num_samples']
-            num_classes = dataset['metadata']['num_classes']
-            num_channels = dataset['metadata']['num_channels']
-            window_samples = dataset['metadata']['window_samples']
-
-            self._log(f"Dataset loaded: {num_samples} samples, {num_classes} classes, "
-                      f"{num_channels} channels, {window_samples} samples/window")
-
-            # Create model
-            model_type_text = self.model_type_combo.currentText()
-            # Convert UI display names to internal model type names
-            if model_type_text == "AttentionNet":
-                model_type = "attention_net"
-            elif model_type_text == "MSTNet":
-                model_type = "mstnet"
-            else:
-                model_type = model_type_text.lower().replace(" ", "_")
-            self._log(f"Creating {model_type} model...")
-
-            # Build model name: type_datasetname_timestamp
-            safe_dataset_name = dataset_name.replace(":", "-").replace(" ", "_")
-            safe_dataset_name = safe_dataset_name.replace("/", "_").replace("\\\\", "_")
-            timestamp = datetime.now().strftime("%H%M%S")
-            model_name = f"{model_type}_{safe_dataset_name}_{timestamp}"
-
             model = self.model_manager.create_model(model_type, name=model_name)
-            self._log(f"Model created: {model.name}")
-
-            # Data splitting information
-            from sklearn.model_selection import train_test_split
-            X = dataset["X"]
-            y = dataset["y"]
-            X_train, X_val, y_train, y_val = train_test_split(
-                X, y, test_size=0.2, stratify=y, random_state=42
-            )
-
-            self._log(f"Splitting data: Train={len(X_train)} samples, "
-                      f"Validation={len(X_val)} samples")
-
-            # Train
-            self._log(f"Starting training ({model_type})...")
             results = self.model_manager.train_model(model, dataset)
+            return model, results
 
-            # Log detailed results
-            self._log(f"Training complete!")
-            self._log(f"  Training accuracy: {results['training_accuracy']:.2%}")
-            self._log(f"  Validation accuracy: {results['validation_accuracy']:.2%}")
-
+        def _train_done(payload):
+            self.train_btn.setEnabled(True)
+            model, results = payload
+            self._log(f"Training complete!  acc={results.get('training_accuracy', 0):.2%}  "
+                      f"val={results.get('validation_accuracy', 0):.2%}")
             if 'training_time' in results:
                 self._log(f"  Training time: {results['training_time']:.2f}s")
-
-            if 'feature_count' in results:
-                self._log(f"  Features extracted: {results['feature_count']}")
-
             self._refresh_models()
-            self._log(f"Model saved successfully")
+            self._log(f"Model saved: {model_name}")
 
-        except Exception as e:
-            self._log(f"Error training model: {e}")
+        def _train_err(tb):
+            self.train_btn.setEnabled(True)
+            self._log(f"Training error:\n{tb}")
+
+        run_blocking(self, _do_train, _train_done, _train_err,
+                     label=f"Training {model_type}…")
 
     # Prediction handlers
     @Slot()
@@ -3558,27 +3532,6 @@ class MainWindow(QMainWindow):
             # Load available sessions for the selected subject
             self._load_available_sessions()
 
-    @Slot(str)
-    def _on_device_selection_changed(self, device_text: str):
-        """Toggle replay controls based on selected device."""
-        is_synth = device_text == "Synthetic"
-        is_q4 = device_text == "Quattrocento Replay"
-
-        self.use_session_data_cb.setEnabled(is_synth)
-        if not is_synth:
-            self.use_session_data_cb.setChecked(False)
-
-        self.quattro_root_edit.setEnabled(is_q4)
-        self.quattro_root_btn.setEnabled(is_q4)
-        self.quattro_side_combo.setEnabled(is_q4)
-
-    @Slot()
-    def _pick_quattrocento_root(self):
-        start_dir = self.quattro_root_edit.text().strip() or str(self.data_dir)
-        chosen = QFileDialog.getExistingDirectory(self, "Select Quattrocento root", start_dir)
-        if chosen:
-            self.quattro_root_edit.setText(chosen)
-
     def _load_available_sessions(self):
         """Load available session IDs for the selected subject."""
         subject = self.session_subject_combo.currentText()
@@ -3597,8 +3550,204 @@ class MainWindow(QMainWindow):
             self.session_id_combo.setCurrentText(sessions[-1])
 
     def _apply_app_theme(self):
-        """Apply the shared dark theme consistently across tabs and dialogs."""
-        apply_app_style(self, getattr(self.config, "ui_theme", "bright"))
+        """Apply a consistent, modern dark-adaptive theme to the whole app."""
+        self.setStyleSheet("""
+            QMainWindow, QDialog {
+                background: #1e1e2e;
+                color: #e2e8f0;
+            }
+            QTabWidget::pane {
+                border: 1px solid #3f3f5c;
+                border-radius: 6px;
+                background: #2a2a3e;
+            }
+            QTabBar::tab {
+                background: #1e1e2e;
+                color: #94a3b8;
+                padding: 6px 14px;
+                border: 1px solid #3f3f5c;
+                border-bottom: none;
+                border-top-left-radius: 5px;
+                border-top-right-radius: 5px;
+                margin-right: 2px;
+                font-size: 11px;
+            }
+            QTabBar::tab:selected {
+                background: #2a2a3e;
+                color: #06b6d4;
+                border-bottom: 2px solid #06b6d4;
+            }
+            QGroupBox {
+                background: #2a2a3e;
+                border: 1px solid #3f3f5c;
+                border-radius: 7px;
+                font-weight: 600;
+                color: #e2e8f0;
+                padding-top: 14px;
+                margin-top: 5px;
+            }
+            QGroupBox::title {
+                subcontrol-origin: margin;
+                left: 10px;
+                padding: 0 5px;
+                color: #06b6d4;
+                font-size: 11px;
+            }
+            QPushButton {
+                background: #313145;
+                color: #e2e8f0;
+                border: 1px solid #3f3f5c;
+                border-radius: 5px;
+                padding: 5px 12px;
+                font-size: 12px;
+            }
+            QPushButton:hover { border-color: #06b6d4; color: #06b6d4; }
+            QPushButton:pressed { background: #3f3f5c; }
+            QPushButton:disabled { color: #4b5563; border-color: #2d2d40; }
+            QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox, QTextEdit {
+                background: #1e1e2e;
+                color: #e2e8f0;
+                border: 1px solid #3f3f5c;
+                border-radius: 4px;
+                padding: 3px 6px;
+                selection-background-color: #7c3aed;
+            }
+            QComboBox:focus, QLineEdit:focus,
+            QSpinBox:focus, QDoubleSpinBox:focus {
+                border-color: #7c3aed;
+            }
+            QComboBox::drop-down { border: none; }
+            QListWidget, QTableWidget {
+                background: #1e1e2e;
+                color: #e2e8f0;
+                border: 1px solid #3f3f5c;
+                border-radius: 5px;
+                alternate-background-color: #252538;
+                selection-background-color: #7c3aed;
+            }
+            QProgressBar {
+                background: #1e1e2e;
+                border: 1px solid #3f3f5c;
+                border-radius: 4px;
+                height: 12px;
+                text-align: center;
+                font-size: 10px;
+                color: #e2e8f0;
+            }
+            QProgressBar::chunk {
+                background: qlineargradient(x1:0,y1:0,x2:1,y2:0,
+                    stop:0 #7c3aed, stop:1 #06b6d4);
+                border-radius: 3px;
+            }
+            QCheckBox, QRadioButton { color: #e2e8f0; spacing: 6px; }
+            QCheckBox::indicator, QRadioButton::indicator {
+                border: 1px solid #3f3f5c;
+                background: #1e1e2e;
+                border-radius: 3px;
+                width: 13px; height: 13px;
+            }
+            QCheckBox::indicator:checked, QRadioButton::indicator:checked {
+                background: #7c3aed; border-color: #7c3aed;
+            }
+            QLabel { color: #e2e8f0; }
+            QHeaderView::section {
+                background: #2a2a3e; color: #94a3b8;
+                border: none; padding: 4px 8px; font-size: 10px;
+            }
+            QStatusBar { background: #13131f; color: #94a3b8; font-size: 11px; }
+            QMenuBar { background: #13131f; color: #e2e8f0; }
+            QMenuBar::item:selected { background: #2a2a3e; }
+            QMenu { background: #2a2a3e; border: 1px solid #3f3f5c; color: #e2e8f0; }
+            QMenu::item:selected { background: #7c3aed; }
+            QScrollBar:vertical {
+                background: #1e1e2e; width: 8px; margin: 0;
+            }
+            QScrollBar::handle:vertical {
+                background: #3f3f5c; border-radius: 4px; min-height: 20px;
+            }
+            QSplitter::handle { background: #3f3f5c; }
+        """)
+
+
+    # ── Quattrocento streaming ────────────────────────────────────────────────
+
+    def _start_quattrocento_stream(self, root_dir: str) -> None:
+        """Start streaming Quattrocento CSV data into the pipeline."""
+        from PySide6.QtCore import QThread, Signal as QSignal
+        import numpy as np
+
+        class _Q4Worker(QThread):
+            chunk_ready = QSignal(object, str)  # (ndarray, gesture_name)
+            finished_all = QSignal()
+            error = QSignal(str)
+
+            def __init__(self, root, side, chunk_ms, parent=None):
+                super().__init__(parent)
+                self._root = root
+                self._side = side
+                self._chunk_ms = chunk_ms
+                self._stop = False
+
+            def stop(self):
+                self._stop = True
+
+            def run(self):
+                try:
+                    from playagain_pipeline.gui.widgets.quattrocento_loader import (
+                        QuattrocentoStreamAdapter,
+                    )
+                    adapter = QuattrocentoStreamAdapter(
+                        self._root, side=self._side,
+                        chunk_ms=self._chunk_ms,
+                        use_trigger_segments=True,
+                        onset_delay_ms=150.0,
+                    )
+                    adapter.scan()
+                    for chunk, gesture, is_new in adapter.stream():
+                        if self._stop:
+                            break
+                        self.chunk_ready.emit(chunk, gesture)
+                        self.msleep(int(self._chunk_ms))
+                    self.finished_all.emit()
+                except Exception as e:
+                    self.error.emit(str(e))
+
+        if hasattr(self, "_q4_worker") and self._q4_worker is not None:
+            self._q4_worker.stop()
+            self._q4_worker.wait(2000)
+
+        side = "left"
+        chunk_ms = 20.0
+        num_ch = self.channels_spin.value()
+
+        self._q4_worker = _Q4Worker(root_dir, side, chunk_ms, parent=self)
+        self._q4_worker.chunk_ready.connect(self._on_q4_chunk)
+        self._q4_worker.finished_all.connect(self._on_q4_finished)
+        self._q4_worker.error.connect(lambda e: self._log(f"Quattrocento stream error: {e}"))
+        self._q4_worker.start()
+
+        self.connect_btn.setEnabled(False)
+        self.disconnect_btn.setEnabled(True)
+        self._log(f"Quattrocento streaming started from: {root_dir}  (side={side})")
+
+    @Slot(object, str)
+    def _on_q4_chunk(self, chunk, gesture: str) -> None:
+        """Handle a streaming chunk from Quattrocento adapter."""
+        import numpy as np
+        if not isinstance(chunk, np.ndarray) or chunk.size == 0:
+            return
+        if chunk.ndim == 1:
+            chunk = chunk.reshape(-1, 1)
+        # Update ground truth label display
+        self._on_ground_truth_changed(gesture)
+        # Feed into standard data path
+        self._on_data_received(chunk)
+
+    @Slot()
+    def _on_q4_finished(self) -> None:
+        self._log("Quattrocento: all files streamed.")
+        self.connect_btn.setEnabled(True)
+        self.disconnect_btn.setEnabled(False)
 
 
 def main():
