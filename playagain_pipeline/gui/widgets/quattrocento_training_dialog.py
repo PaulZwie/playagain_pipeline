@@ -71,64 +71,115 @@ _DEFAULT_LABEL_ORDER = [
 
 # ─── colour palette ───────────────────────────────────────────────────────────
 
-_C = {
-    "bg":      "#1e1e2e",
-    "panel":   "#2a2a3e",
-    "card":    "#313145",
-    "accent":  "#7c3aed",
-    "accent2": "#06b6d4",
-    "success": "#22c55e",
-    "warning": "#f59e0b",
-    "danger":  "#ef4444",
-    "text":    "#e2e8f0",
-    "muted":   "#94a3b8",
-    "border":  "#3f3f5c",
-    "train":   "#22c55e",
-    "val":     "#f59e0b",
-    "test":    "#ef4444",
-    "excl":    "#6b7280",
+_PALETTES = {
+    "bright": {
+        "bg": "#f6f8fc",
+        "panel": "#ffffff",
+        "card": "#eef2ff",
+        "accent": "#6d28d9",
+        "accent_hover": "#5b21b6",
+        "accent2": "#0284c7",
+        "success": "#16a34a",
+        "warning": "#d97706",
+        "danger": "#dc2626",
+        "text": "#111827",
+        "muted": "#4b5563",
+        "border": "#c7d2fe",
+        "disabled_bg": "#e5e7eb",
+        "disabled_text": "#9ca3af",
+        "canvas_bg": "#f8fafc",
+        "train": "#16a34a",
+        "val": "#d97706",
+        "test": "#dc2626",
+        "excl": "#6b7280",
+        "card_train_bg": "#ecfdf3",
+        "card_val_bg": "#fff7ed",
+        "card_test_bg": "#fef2f2",
+    },
+    "dark": {
+        "bg": "#1e1e2e",
+        "panel": "#2a2a3e",
+        "card": "#313145",
+        "accent": "#7c3aed",
+        "accent_hover": "#6d28d9",
+        "accent2": "#06b6d4",
+        "success": "#22c55e",
+        "warning": "#f59e0b",
+        "danger": "#ef4444",
+        "text": "#e2e8f0",
+        "muted": "#94a3b8",
+        "border": "#3f3f5c",
+        "disabled_bg": "#3f3f5c",
+        "disabled_text": "#6b7280",
+        "canvas_bg": "#1a1a2e",
+        "train": "#22c55e",
+        "val": "#f59e0b",
+        "test": "#ef4444",
+        "excl": "#6b7280",
+        "card_train_bg": "#1a3a2a",
+        "card_val_bg": "#3a2a10",
+        "card_test_bg": "#3a1a1a",
+    },
 }
 
-_PANEL_STYLE = f"""
-    QGroupBox {{
-        background: {_C['panel']};
-        border: 1px solid {_C['border']};
-        border-radius: 8px;
-        font-weight: 600;
-        color: {_C['text']};
-        padding-top: 16px;
-        margin-top: 6px;
-    }}
-    QGroupBox::title {{
-        subcontrol-origin: margin;
-        left: 10px;
-        padding: 0 6px;
-        color: {_C['accent2']};
-    }}
-"""
-_BTN_PRIMARY = f"""
-    QPushButton {{
-        background: {_C['accent']};
-        color: white;
-        border: none;
-        border-radius: 6px;
-        padding: 6px 18px;
-        font-weight: 700;
-        font-size: 13px;
-    }}
-    QPushButton:hover {{ background: #6d28d9; }}
-    QPushButton:disabled {{ background: #3f3f5c; color: #6b7280; }}
-"""
-_BTN_SECONDARY = f"""
-    QPushButton {{
-        background: {_C['panel']};
-        color: {_C['text']};
-        border: 1px solid {_C['border']};
-        border-radius: 6px;
-        padding: 5px 14px;
-    }}
-    QPushButton:hover {{ border-color: {_C['accent2']}; color: {_C['accent2']}; }}
-"""
+_C: Dict[str, str] = {}
+_PANEL_STYLE = ""
+_BTN_PRIMARY = ""
+_BTN_SECONDARY = ""
+
+
+def _apply_theme(theme: str) -> str:
+    """Populate module-level styles from selected theme and return resolved key."""
+    global _C, _PANEL_STYLE, _BTN_PRIMARY, _BTN_SECONDARY
+    resolved = (theme or "bright").lower()
+    if resolved not in _PALETTES:
+        resolved = "bright"
+
+    _C = dict(_PALETTES[resolved])
+    _PANEL_STYLE = f"""
+        QGroupBox {{
+            background: {_C['panel']};
+            border: 1px solid {_C['border']};
+            border-radius: 8px;
+            font-weight: 600;
+            color: {_C['text']};
+            padding-top: 16px;
+            margin-top: 6px;
+        }}
+        QGroupBox::title {{
+            subcontrol-origin: margin;
+            left: 10px;
+            padding: 0 6px;
+            color: {_C['accent2']};
+        }}
+    """
+    _BTN_PRIMARY = f"""
+        QPushButton {{
+            background: {_C['accent']};
+            color: white;
+            border: none;
+            border-radius: 6px;
+            padding: 6px 18px;
+            font-weight: 700;
+            font-size: 13px;
+        }}
+        QPushButton:hover {{ background: {_C['accent_hover']}; }}
+        QPushButton:disabled {{ background: {_C['disabled_bg']}; color: {_C['disabled_text']}; }}
+    """
+    _BTN_SECONDARY = f"""
+        QPushButton {{
+            background: {_C['panel']};
+            color: {_C['text']};
+            border: 1px solid {_C['border']};
+            border-radius: 6px;
+            padding: 5px 14px;
+        }}
+        QPushButton:hover {{ border-color: {_C['accent2']}; color: {_C['accent2']}; }}
+    """
+    return resolved
+
+
+_apply_theme("dark")
 
 
 # ─── data helpers ─────────────────────────────────────────────────────────────
@@ -749,34 +800,34 @@ class _LearningCurveWorker(QThread):
 
 class _ConfusionMatrixCanvas(FigureCanvasQTAgg):
     def __init__(self, parent=None):
-        self._fig = Figure(facecolor="#1a1a2e")
+        self._fig = Figure(facecolor=_C["canvas_bg"])
         super().__init__(self._fig)
         self.setParent(parent)
         self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
 
     def plot(self, conf_mat: np.ndarray, class_names: List[str], title: str = ""):
         self._fig.clear()
-        ax = self._fig.add_subplot(111, facecolor="#1a1a2e")
+        ax = self._fig.add_subplot(111, facecolor=_C["canvas_bg"])
         row_sums = conf_mat.sum(1, keepdims=True).clip(min=1)
         cm_pct   = conf_mat / row_sums * 100
         im = ax.imshow(cm_pct, cmap="Blues", vmin=0, vmax=100, aspect="auto")
         cbar = self._fig.colorbar(im, ax=ax, fraction=0.04, pad=0.02)
-        cbar.set_label("%", color="#e2e8f0", fontsize=8)
-        cbar.ax.yaxis.set_tick_params(color="#e2e8f0", labelcolor="#e2e8f0")
+        cbar.set_label("%", color=_C["text"], fontsize=8)
+        cbar.ax.yaxis.set_tick_params(color=_C["text"], labelcolor=_C["text"])
         n = len(class_names)
         ax.set_xticks(range(n)); ax.set_yticks(range(n))
-        ax.set_xticklabels(class_names, rotation=40, ha="right", fontsize=max(5, 9 - n//4), color="#e2e8f0")
-        ax.set_yticklabels(class_names, fontsize=max(5, 9 - n//4), color="#e2e8f0")
-        ax.set_xlabel("Predicted", fontsize=9, color="#94a3b8")
-        ax.set_ylabel("True", fontsize=9, color="#94a3b8")
-        ax.set_title(title, fontsize=9, color="#e2e8f0", pad=8)
-        ax.tick_params(colors="#94a3b8")
+        ax.set_xticklabels(class_names, rotation=40, ha="right", fontsize=max(5, 9 - n//4), color=_C["text"])
+        ax.set_yticklabels(class_names, fontsize=max(5, 9 - n//4), color=_C["text"])
+        ax.set_xlabel("Predicted", fontsize=9, color=_C["muted"])
+        ax.set_ylabel("True", fontsize=9, color=_C["muted"])
+        ax.set_title(title, fontsize=9, color=_C["text"], pad=8)
+        ax.tick_params(colors=_C["muted"])
         for spine in ax.spines.values():
-            spine.set_edgecolor("#3f3f5c")
+            spine.set_edgecolor(_C["border"])
         thresh = 50
         for i in range(n):
             for j in range(n):
-                col = "white" if cm_pct[i, j] > thresh else "#94a3b8"
+                col = "white" if cm_pct[i, j] > thresh else _C["muted"]
                 ax.text(j, i, f"{cm_pct[i,j]:.0f}%\n({conf_mat[i,j]})",
                         ha="center", va="center",
                         fontsize=max(4, 7 - n//5), color=col)
@@ -786,32 +837,32 @@ class _ConfusionMatrixCanvas(FigureCanvasQTAgg):
 
 class _LearningCurveCanvas(FigureCanvasQTAgg):
     def __init__(self, parent=None):
-        self._fig = Figure(facecolor="#1a1a2e")
+        self._fig = Figure(facecolor=_C["canvas_bg"])
         super().__init__(self._fig)
         self.setParent(parent)
 
     def plot(self, sizes, train_accs, val_accs, title="Learning Curve"):
         self._fig.clear()
-        ax = self._fig.add_subplot(111, facecolor="#1a1a2e")
+        ax = self._fig.add_subplot(111, facecolor=_C["canvas_bg"])
         ax.plot(sizes, train_accs, "o-", color="#22c55e", lw=2, label="Train", ms=5)
         ax.plot(sizes, val_accs,   "s-", color="#f59e0b", lw=2, label="Test",  ms=5)
         ax.fill_between(sizes, train_accs, val_accs,
-                        alpha=0.08, color="#94a3b8")
-        ax.set_xlabel("Training windows", fontsize=9, color="#94a3b8")
-        ax.set_ylabel("Accuracy", fontsize=9, color="#94a3b8")
-        ax.set_title(title, fontsize=10, color="#e2e8f0")
+                        alpha=0.08, color=_C["muted"])
+        ax.set_xlabel("Training windows", fontsize=9, color=_C["muted"])
+        ax.set_ylabel("Accuracy", fontsize=9, color=_C["muted"])
+        ax.set_title(title, fontsize=10, color=_C["text"])
         ax.set_ylim(0, 1.05)
-        ax.tick_params(colors="#94a3b8")
-        ax.legend(framealpha=0.3, fontsize=8, labelcolor="#e2e8f0")
+        ax.tick_params(colors=_C["muted"])
+        ax.legend(framealpha=0.3, fontsize=8, labelcolor=_C["text"])
         for spine in ax.spines.values():
-            spine.set_edgecolor("#3f3f5c")
+            spine.set_edgecolor(_C["border"])
         self._fig.tight_layout(pad=1.2)
         self.draw()
 
 
 class _LiveCurveCanvas(FigureCanvasQTAgg):
     def __init__(self, parent=None):
-        self._fig = Figure(facecolor="#1a1a2e")
+        self._fig = Figure(facecolor=_C["canvas_bg"])
         super().__init__(self._fig)
         self.setParent(parent)
         self._epochs: List[int] = []
@@ -833,26 +884,26 @@ class _LiveCurveCanvas(FigureCanvasQTAgg):
 
     def _redraw(self):
         self._fig.clear()
-        ax1 = self._fig.add_subplot(121, facecolor="#1a1a2e")
+        ax1 = self._fig.add_subplot(121, facecolor=_C["canvas_bg"])
         ax1.plot(self._epochs, self._tl, color="#22c55e", lw=1.5, label="Train")
         ax1.plot(self._epochs, self._vl, color="#ef4444", lw=1.5, label="Val",
                  linestyle="--")
-        ax1.set_title("Loss", fontsize=9, color="#e2e8f0")
-        ax1.tick_params(colors="#94a3b8", labelsize=7)
-        ax1.legend(fontsize=7, framealpha=0.3, labelcolor="#e2e8f0")
+        ax1.set_title("Loss", fontsize=9, color=_C["text"])
+        ax1.tick_params(colors=_C["muted"], labelsize=7)
+        ax1.legend(fontsize=7, framealpha=0.3, labelcolor=_C["text"])
 
-        ax2 = self._fig.add_subplot(122, facecolor="#1a1a2e")
+        ax2 = self._fig.add_subplot(122, facecolor=_C["canvas_bg"])
         ax2.plot(self._epochs, self._ta, color="#22c55e", lw=1.5, label="Train")
         ax2.plot(self._epochs, self._va, color="#f59e0b", lw=1.5, label="Val",
                  linestyle="--")
-        ax2.set_title("Accuracy", fontsize=9, color="#e2e8f0")
+        ax2.set_title("Accuracy", fontsize=9, color=_C["text"])
         ax2.set_ylim(0, 1.05)
-        ax2.tick_params(colors="#94a3b8", labelsize=7)
-        ax2.legend(fontsize=7, framealpha=0.3, labelcolor="#e2e8f0")
+        ax2.tick_params(colors=_C["muted"], labelsize=7)
+        ax2.legend(fontsize=7, framealpha=0.3, labelcolor=_C["text"])
 
         for ax in (ax1, ax2):
             for sp in ax.spines.values():
-                sp.set_edgecolor("#3f3f5c")
+                sp.set_edgecolor(_C["border"])
         self._fig.tight_layout(pad=0.8)
         self.draw()
 
@@ -870,13 +921,6 @@ class _SplitCardWidget(QWidget):
     changed = Signal()
 
     _CYCLE = {"skip": "train", "train": "val", "val": "test", "test": "skip"}
-    _BADGE = {
-        "train": ("TRAIN", _C["train"]),
-        "val":   ("VAL",   _C["val"]),
-        "test":  ("TEST",  _C["test"]),
-        "skip":  ("—",     _C["excl"]),
-    }
-
     def __init__(self, parent=None):
         super().__init__(parent)
         self._assignments: Dict[Tuple[str, str], str] = {}  # (subject, trial) → role
@@ -1001,7 +1045,13 @@ class _SplitCardWidget(QWidget):
 
     def _make_card(self, subj: str, trial: str) -> QFrame:
         role = self._assignments.get((subj, trial), "skip")
-        badge_txt, badge_clr = self._BADGE.get(role, ("?", "#888"))
+        badge_map = {
+            "train": ("TRAIN", _C["train"]),
+            "val": ("VAL", _C["val"]),
+            "test": ("TEST", _C["test"]),
+            "skip": ("—", _C["excl"]),
+        }
+        badge_txt, badge_clr = badge_map.get(role, ("?", "#888"))
 
         card = QFrame()
         card.setFixedSize(68, 52)
@@ -1033,7 +1083,7 @@ class _SplitCardWidget(QWidget):
 
     @staticmethod
     def _apply_card_style(card: QFrame, role: str):
-        bg = {"train": "#1a3a2a", "val": "#3a2a10", "test": "#3a1a1a",
+        bg = {"train": _C["card_train_bg"], "val": _C["card_val_bg"], "test": _C["card_test_bg"],
               "skip": _C["panel"]}.get(role, _C["panel"])
         bc = {"train": _C["train"], "val": _C["val"], "test": _C["test"],
               "skip": _C["border"]}.get(role, _C["border"])
@@ -1089,7 +1139,7 @@ class QuattrocentoTrainingDialog(QDialog):
     • Cleaner, more logical left-panel layout.
     """
 
-    def __init__(self, model_manager, data_dir: Path, parent=None):
+    def __init__(self, model_manager, data_dir: Path, parent=None, theme: str = "bright"):
         super().__init__(parent)
         self._model_manager = model_manager
         self._data_dir      = Path(data_dir)
@@ -1099,11 +1149,12 @@ class QuattrocentoTrainingDialog(QDialog):
         self._trained_model = None
         self._results       = None
         self._all_runs: List[_ModelRun] = []
+        self._theme = _apply_theme(theme)
 
         self.setWindowTitle("Quattrocento Training & Evaluation")
         self.setMinimumSize(1280, 820)
         from playagain_pipeline.gui.gui_style import apply_app_style
-        apply_app_style(self, theme="dark")
+        apply_app_style(self, theme=self._theme)
         # Overlay a few extra rules that the training dialog needs on top of
         # the shared stylesheet (splitter handle, scrollbar, font-size tweak).
         self.setStyleSheet(self.styleSheet() + f"""
@@ -1882,7 +1933,10 @@ class QuattrocentoTrainingDialog(QDialog):
     def _set_root(self, path: Path):
         self._root_edit.setText(str(path))
         self._scan_btn.setEnabled(True)
-        self._scan_info.setText(f"Click 'Scan' to discover recordings in:\n{path}")
+        self._scan_info.setText(
+            f"Click 'Scan' to discover .npy recordings in:\n{path}\n"
+            "(Folder picker is expected here, so files appear greyed out.)"
+        )
 
     @Slot()
     def _on_scan(self):
@@ -1965,7 +2019,7 @@ class QuattrocentoTrainingDialog(QDialog):
             seg_method = "trigger" if n_trigger > len(primary) * 0.5 else "RMS (no trigger)"
             side = getattr(self._side_combo, 'currentText', lambda: 'left')()
 
-            info = (f"Found {len(primary)} CSV files  ({window_ms} ms windows)\n"
+            info = (f"Found {len(primary)} NPY files  ({window_ms} ms windows)\n"
                     f"Channels: {n_ch_found}  |  Side: {side}\n"
                     f"Subjects: {', '.join(subjects)}\n"
                     f"Trial labels: {', '.join(trial_labels)}\n"

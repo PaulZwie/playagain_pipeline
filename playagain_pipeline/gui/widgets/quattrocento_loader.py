@@ -1,10 +1,10 @@
 """
-Quattrocento HD-EMG data loader  (v4 – trigger-aware CSV input)
+Quattrocento HD-EMG data loader  (v4 – trigger-aware NPY input)
 
 Key improvements over v3
 ─────────────────────────
 • Trigger-based repetition extraction:
-    Each Quattrocento gesture file contains ~5 repetitions separated by rest.
+    Each Quattrocento gesture file contains repetitions separated by rest.
     The trigger column goes HIGH during each active rep.
     ``extract_trigger_segments()`` returns one TriggerSegment per repetition.
 
@@ -57,7 +57,7 @@ _DEFAULT_LABEL_ORDER = [
 ]
 
 _FILENAME_RE = re.compile(
-    r"^VHI_Recording_((?:\d+_\d+)|\d+)_(.+?)_(trial\S+|default|mvcpowergrasp\S*|fistmvc\S*|holdduration\S*)_(left|right)\.csv$",
+    r"^VHI_Recording_((?:\d+_\d+)|\d+)_(.+?)_(trial\S+|default|mvcpowergrasp\S*|fistmvc\S*|holdduration\S*)_(left|right)\.npy$",
     re.IGNORECASE,
 )
 
@@ -371,35 +371,40 @@ class QuattrocentoFileLoader:
         window_ms: int = DEFAULT_WINDOW_MS,
         overlap_pct: int = DEFAULT_OVERLAP_PCT,
     ) -> QuattrocentoRecording:
+        if path.suffix.lower() != ".npy":
+            raise ValueError(f"Only .npy files are supported: {path.name}")
+
         parsed = cls._parse_filename(path.name)
         if parsed is None:
-            raise ValueError(f"Filename does not match VHI CSV pattern: {path.name}")
+            raise ValueError(f"Filename does not match VHI NPY pattern: {path.name}")
         ts, gesture_raw, trial_label, side = parsed
 
-        header_tokens = cls._read_header_tokens(path)
-        first_row, header_rows = cls._read_header_row(path)
-        if len(first_row) < _METADATA_COLS + 1:
-            raise ValueError(f"CSV has only {len(first_row)} columns: {path.name}")
+        data = np.load(str(path), mmap_mode="r")
+        if data.ndim != 2:
+            raise ValueError(f"NPY must be 2D [samples, columns], got {data.shape}: {path.name}")
+        if data.shape[1] < (_METADATA_COLS + 1):
+            raise ValueError(f"NPY has too few columns ({data.shape[1]}): {path.name}")
 
-        trigger_col, ref_col, signal_start_col = cls._resolve_columns(header_tokens, len(first_row))
-
-        sr         = float(first_row[_COL_SAMPLE_RATE]) if first_row[_COL_SAMPLE_RATE] > 0 else 2048.0
-        n_channels = max(1, len(first_row) - signal_start_col)
-        n_samples  = cls._count_rows(path, header_rows=header_rows)
+        trigger_col, ref_col, signal_start_col = _COL_TRIGGER, _COL_REF_RMS, _METADATA_COLS
+        sr_col = np.asarray(data[:, _COL_SAMPLE_RATE], dtype=np.float32)
+        sr_valid = sr_col[np.isfinite(sr_col) & (sr_col > 0)]
+        sr = float(sr_valid[0]) if sr_valid.size else 2048.0
+        n_channels = max(1, int(data.shape[1] - signal_start_col))
+        n_samples = int(data.shape[0])
+        header_rows = 0
 
         ws     = max(1, int(round(sr * window_ms / 1000.0)))
         stride = max(1, int(round(ws * (1.0 - overlap_pct / 100.0))))
         n_wins = max(0, (n_samples - ws) // stride + 1)
         gesture = normalize_gesture_name(gesture_raw)
 
-        # Trigger detection is deferred to load time to keep scanning fast.
-        # We do a cheap check: sample just the first 20 rows of the trigger column.
+        # Trigger detection is deferred to full load; we only do a cheap sampled check.
         has_trigger = False
         n_reps = 0
         try:
-            has_trigger = cls._quick_has_trigger(path, int(header_rows), int(trigger_col), int(n_samples))
-            # n_reps is estimated from n_samples / typical rep length at this sr
-            # ~5 reps, each ~3 s rest+active, so estimate 5 reps as default
+            stride = max(1, n_samples // 200)
+            trig = np.asarray(data[::stride, trigger_col], dtype=np.float32)
+            has_trigger = bool(np.any(trig > 0.5) and np.any(trig <= 0.5))
             n_reps = 5  # will be refined when data is actually loaded
         except Exception:
             pass
@@ -418,11 +423,7 @@ class QuattrocentoFileLoader:
     @classmethod
     def _load_npy(cls, rec: "QuattrocentoRecording") -> np.ndarray:
         """
-        Load a pre-converted .npy file for *rec*.
-
-        The .npy file must live next to the original CSV with the same stem
-        (e.g. VHI_Recording_…_left.npy).  Run ``convert_csv_to_npy.py``
-        once on your data directory to create all cache files.
+        Load the .npy file for *rec*.
 
         Raises
         ------
@@ -433,11 +434,7 @@ class QuattrocentoFileLoader:
         npy_path = rec.path.with_suffix(".npy")
         if not npy_path.exists():
             raise FileNotFoundError(
-                f"Pre-converted .npy file not found:\n"
-                f"  {npy_path}\n\n"
-                f"Run the conversion script once on your data directory:\n"
-                f"  python convert_csv_to_npy.py \"{rec.path.parent.parent.parent}\"\n"
-                f"(point it at the root folder that contains your VP_XX subjects)"
+                f"Required .npy file not found:\n  {npy_path}"
             )
         return np.load(str(npy_path), mmap_mode="r")
 
@@ -618,7 +615,7 @@ class QuattrocentoStreamAdapter:
 # ---------------------------------------------------------------------------
 
 class QuattrocentoSubjectLoader:
-    """Scan and load Quattrocento CSV recordings from a directory tree."""
+    """Scan and load Quattrocento NPY recordings from a directory tree."""
 
     def __init__(
         self,
@@ -636,23 +633,23 @@ class QuattrocentoSubjectLoader:
 
     def scan(self, verbose: bool = True) -> List[QuattrocentoRecording]:
         """
-        Scan the root directory for Quattrocento CSV files.
+        Scan the root directory for Quattrocento NPY files.
 
         Supported layouts
         ─────────────────
         New (condition-aware):
-            <root>/VP_XX/healthy/VHI_Recording_*.csv
-            <root>/VP_XX/paralysed/VHI_Recording_*.csv
+            <root>/VP_XX/healthy/VHI_Recording_*.npy
+            <root>/VP_XX/paralysed/VHI_Recording_*.npy
 
         Legacy (flat):
-            <root>/VP_XX/recordings/VHI_Recording_*.csv
-            <root>/VP_XX/VHI_Recording_*.csv
-            <root>/VHI_Recording_*.csv
+            <root>/VP_XX/recordings/VHI_Recording_*.npy
+            <root>/VP_XX/VHI_Recording_*.npy
+            <root>/VHI_Recording_*.npy
         """
         self._recordings.clear()
         errors: List[str] = []
 
-        # Collect (csv_path, subject_id, condition) tuples
+        # Collect (npy_path, subject_id, condition) tuples
         candidates: List[Tuple[Path, str, str]] = []
 
         _CONDITION_DIRS = {"healthy", "paralysed", "paretic", "impaired"}
@@ -670,8 +667,8 @@ class QuattrocentoSubjectLoader:
                 cond = cond_dir.name.lower()
                 if cond in _CONDITION_DIRS:
                     found_condition_dirs = True
-                    for csv_path in sorted(cond_dir.glob("VHI_Recording_*.csv")):
-                        candidates.append((csv_path, subj_id, cond))
+                    for npy_path in sorted(cond_dir.glob("VHI_Recording_*.npy")):
+                        candidates.append((npy_path, subj_id, cond))
 
             if found_condition_dirs:
                 continue  # skip legacy layout for this subject
@@ -679,34 +676,34 @@ class QuattrocentoSubjectLoader:
             # Legacy layout: VP_XX/recordings/ or VP_XX/ directly
             rd = child / "recordings"
             search_dir = rd if rd.is_dir() else child
-            for csv_path in sorted(search_dir.glob("VHI_Recording_*.csv")):
-                candidates.append((csv_path, subj_id, ""))
+            for npy_path in sorted(search_dir.glob("VHI_Recording_*.npy")):
+                candidates.append((npy_path, subj_id, ""))
 
         # Fallback: CSVs directly in root
         if not candidates:
             if (self.root_dir / "recordings").is_dir():
-                for csv_path in sorted((self.root_dir / "recordings").glob("VHI_Recording_*.csv")):
-                    candidates.append((csv_path, self.root_dir.name, ""))
+                for npy_path in sorted((self.root_dir / "recordings").glob("VHI_Recording_*.npy")):
+                    candidates.append((npy_path, self.root_dir.name, ""))
             else:
-                for csv_path in sorted(self.root_dir.glob("VHI_Recording_*.csv")):
-                    candidates.append((csv_path, self.root_dir.name, ""))
+                for npy_path in sorted(self.root_dir.glob("VHI_Recording_*.npy")):
+                    candidates.append((npy_path, self.root_dir.name, ""))
 
-        for csv_path, sid, condition in candidates:
-            name_lower = csv_path.name.lower()
-            if self.side == "left"  and not name_lower.endswith("_left.csv"):
+        for npy_path, sid, condition in candidates:
+            name_lower = npy_path.name.lower()
+            if self.side == "left"  and not name_lower.endswith("_left.npy"):
                 continue
-            if self.side == "right" and not name_lower.endswith("_right.csv"):
+            if self.side == "right" and not name_lower.endswith("_right.npy"):
                 continue
             try:
                 rec = QuattrocentoFileLoader.load_recording(
-                    csv_path, sid,
+                    npy_path, sid,
                     window_ms=self.window_ms,
                     overlap_pct=self.overlap_pct,
                 )
                 rec.condition = condition
                 self._recordings.append(rec)
             except Exception as e:
-                errors.append(f"  {csv_path.name}: {e}")
+                errors.append(f"  {npy_path.name}: {e}")
 
         self._scanned = True
         if verbose:
@@ -716,7 +713,7 @@ class QuattrocentoSubjectLoader:
     def _print_summary(self, errors: List[str]) -> None:
         subjects = sorted({r.subject_id for r in self._recordings})
         print(f"\n{'─'*64}")
-        print(f"Quattrocento CSV scan: {self.root_dir}  (side={self.side!r})")
+        print(f"Quattrocento NPY scan: {self.root_dir}  (side={self.side!r})")
         print(f"  Total: {len(self._recordings)} files, {len(subjects)} subjects")
         for s in subjects:
             recs = [r for r in self._recordings if r.subject_id == s]
@@ -783,7 +780,7 @@ class QuattrocentoSubjectLoader:
         onset_delay_ms: float = 150.0,
         progress_callback=None,
     ) -> Dict[str, Any]:
-        """Build a pipeline-compatible dataset dict from CSV recordings."""
+        """Build a pipeline-compatible dataset dict from NPY recordings."""
         if not self._scanned:
             self.scan(verbose=False)
 
@@ -867,7 +864,7 @@ class QuattrocentoSubjectLoader:
         return {
             "X": X, "y": y, "trial_ids": np.array(trial_ids),
             "metadata": {
-                "name": name, "source": "quattrocento_csv",
+                "name": name, "source": "quattrocento_npy",
                 "created_at": datetime.now().isoformat(),
                 "num_samples": int(wp),
                 "num_classes": len(present_gestures),
@@ -920,6 +917,6 @@ def discover_quattrocento_root(data_dir: Path) -> Optional[Path]:
         if p.is_dir():
             return p
     for child in data_dir.iterdir():
-        if child.is_dir() and list(child.rglob("VHI_Recording_*_left.csv")):
+        if child.is_dir() and list(child.rglob("VHI_Recording_*_left.npy")):
             return child
     return None

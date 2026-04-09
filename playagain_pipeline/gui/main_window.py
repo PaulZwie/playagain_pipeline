@@ -219,6 +219,10 @@ class MainWindow(QMainWindow):
         # Ground truth label for session replay
         self._current_ground_truth_label: Optional[str] = None
 
+        # Quattrocento file-stream state (independent from DeviceManager device)
+        self._q4_stream_active = False
+        self._q4_stream_channels: Optional[int] = None
+
         # Live quick calibration state
         self._live_cal_active = False
         self._live_cal_gestures: list = []
@@ -1695,10 +1699,12 @@ class MainWindow(QMainWindow):
         from playagain_pipeline.gui.widgets.quattrocento_training_dialog import (
             QuattrocentoTrainingDialog,
         )
+        ui_theme = getattr(getattr(self, "config", None), "ui_theme", "bright")
         dialog = QuattrocentoTrainingDialog(
             model_manager=self.model_manager,
             data_dir=self.data_dir,
             parent=self,
+            theme=ui_theme,
         )
         dialog.exec()
         self._refresh_models()
@@ -1715,15 +1721,18 @@ class MainWindow(QMainWindow):
         elif device_text == "Muovi Plus":
             device_type = DeviceType.MUOVI_PLUS
         elif device_text == "Quattrocento":
-            # Quattrocento streaming: pick a data directory first
-            from PySide6.QtWidgets import QFileDialog
-            q4_root = QFileDialog.getExistingDirectory(
-                self, "Select Quattrocento recordings folder",
-                str(self.data_dir),
+            # Ensure no previous device stream is still running.
+            self.device_manager.stop_and_disconnect()
+            # Quattrocento streaming: pick one NPY recording file.
+            q4_file, _ = QFileDialog.getOpenFileName(
+                self,
+                "Select Quattrocento NPY recording",
+                str(self.data_dir / "quattrocento"),
+                "NumPy files (*.npy)",
             )
-            if not q4_root:
+            if not q4_file:
                 return
-            self._start_quattrocento_stream(q4_root)
+            self._start_quattrocento_stream(q4_file)
             return
         else:
             device_type = DeviceType.SYNTHETIC
@@ -1840,6 +1849,8 @@ class MainWindow(QMainWindow):
             self._q4_worker.stop()
             self._q4_worker.wait(2000)
             self._q4_worker = None
+            self._q4_stream_active = False
+            self._q4_stream_channels = None
             self._log("Quattrocento stream stopped")
         self.device_manager.stop_and_disconnect()
         self.connect_btn.setEnabled(True)
@@ -3095,7 +3106,10 @@ class MainWindow(QMainWindow):
             # datasets (it gets set to the feature dim instead of raw channels).
             # The buffer receives raw EMG data, so always use device channels.
             device = self.device_manager.device
-            num_ch = device.num_channels if device else self.channels_spin.value()
+            if self._q4_stream_active and self._q4_stream_channels is not None:
+                num_ch = int(self._q4_stream_channels)
+            else:
+                num_ch = device.num_channels if device else self.channels_spin.value()
             window_samples = int(self._prediction_window_ms * self._current_model.metadata.sampling_rate / 1000)
             self._prediction_buffer = np.zeros((window_samples, num_ch))
 
@@ -3117,7 +3131,8 @@ class MainWindow(QMainWindow):
             return
 
         device = self.device_manager.device
-        if not device or not device.is_streaming:
+        stream_ready = bool(device and device.is_streaming) or bool(self._q4_stream_active)
+        if not stream_ready:
             QMessageBox.warning(self, "Warning", "Please connect and start device")
             return
 
@@ -3242,7 +3257,8 @@ class MainWindow(QMainWindow):
 
         # Roll buffer and add new data
         n_samples = min(data.shape[0], len(self._prediction_buffer))
-        self._prediction_buffer = np.roll(self._prediction_buffer, -n_samples, axis=0)
+        # In-place shift avoids np.roll allocation each frame (reduces UI lag).
+        self._prediction_buffer[:-n_samples] = self._prediction_buffer[n_samples:]
         self._prediction_buffer[-n_samples:] = data[:n_samples]
 
         # Send updated buffer to worker thread
@@ -3671,19 +3687,18 @@ class MainWindow(QMainWindow):
 
     # ── Quattrocento streaming ────────────────────────────────────────────────
 
-    def _start_quattrocento_stream(self, root_dir: str) -> None:
-        """Start streaming Quattrocento CSV data into the pipeline."""
+    def _start_quattrocento_stream(self, source_path: str) -> None:
+        """Start streaming Quattrocento data from one NPY file (or folder fallback)."""
         from PySide6.QtCore import QThread, Signal as QSignal
-        import numpy as np
 
         class _Q4Worker(QThread):
             chunk_ready = QSignal(object, str)  # (ndarray, gesture_name)
             finished_all = QSignal()
             error = QSignal(str)
 
-            def __init__(self, root, side, chunk_ms, parent=None):
+            def __init__(self, source, side, chunk_ms, parent=None):
                 super().__init__(parent)
-                self._root = root
+                self._source = source
                 self._side = side
                 self._chunk_ms = chunk_ms
                 self._stop = False
@@ -3691,23 +3706,84 @@ class MainWindow(QMainWindow):
             def stop(self):
                 self._stop = True
 
+            @staticmethod
+            def _infer_subject(file_path: Path) -> str:
+                for part in file_path.parts:
+                    if part.upper().startswith("VP_"):
+                        return part
+                return "quattro_file"
+
+            def _stream_signal(self, signal, gesture: str, sampling_rate: float):
+                import numpy as np
+                chunk_smp = max(1, int(float(sampling_rate) * self._chunk_ms / 1000.0))
+                pos = 0
+                while pos < len(signal):
+                    if self._stop:
+                        return
+                    chunk = np.asarray(signal[pos:pos + chunk_smp], dtype=np.float32)
+                    if chunk.size > 0:
+                        self.chunk_ready.emit(chunk, gesture)
+                    pos += chunk_smp
+                    self.msleep(int(self._chunk_ms))
+
+            def _stream_single_file(self, file_path: Path):
+                from playagain_pipeline.gui.widgets.quattrocento_loader import (
+                    QuattrocentoFileLoader,
+                    TriggerSegment,
+                    detect_segments,
+                )
+
+                side = "right" if file_path.name.lower().endswith("_right.npy") else "left"
+                rec = QuattrocentoFileLoader.load_recording(
+                    file_path,
+                    subject_id=self._infer_subject(file_path),
+                )
+                if self._side in {"left", "right"} and side != self._side:
+                    raise ValueError(
+                        f"Selected file side '{side}' does not match requested side '{self._side}'."
+                    )
+
+                signal, trigger, ref_rms = QuattrocentoFileLoader.load_raw_data(rec)
+                segs, _ = detect_segments(
+                    signal,
+                    trigger,
+                    ref_rms,
+                    rec.sampling_rate,
+                    onset_delay_ms=150.0,
+                )
+                if not segs:
+                    segs = [TriggerSegment(0, 0, len(signal), len(signal), "full", signal)]
+
+                for seg in segs:
+                    if self._stop:
+                        break
+                    self._stream_signal(seg.signal, rec.gesture, rec.sampling_rate)
+
             def run(self):
                 try:
-                    from playagain_pipeline.gui.widgets.quattrocento_loader import (
-                        QuattrocentoStreamAdapter,
-                    )
-                    adapter = QuattrocentoStreamAdapter(
-                        self._root, side=self._side,
-                        chunk_ms=self._chunk_ms,
-                        use_trigger_segments=True,
-                        onset_delay_ms=150.0,
-                    )
-                    adapter.scan()
-                    for chunk, gesture, is_new in adapter.stream():
-                        if self._stop:
-                            break
-                        self.chunk_ready.emit(chunk, gesture)
-                        self.msleep(int(self._chunk_ms))
+                    source = Path(self._source).expanduser()
+                    if source.is_file():
+                        self._stream_single_file(source)
+                    elif source.is_dir():
+                        # Backward-compatible fallback for callers that pass a folder.
+                        from playagain_pipeline.gui.widgets.quattrocento_loader import (
+                            QuattrocentoStreamAdapter,
+                        )
+                        adapter = QuattrocentoStreamAdapter(
+                            source,
+                            side=self._side,
+                            chunk_ms=self._chunk_ms,
+                            use_trigger_segments=True,
+                            onset_delay_ms=150.0,
+                        )
+                        adapter.scan()
+                        for chunk, gesture, _ in adapter.stream():
+                            if self._stop:
+                                break
+                            self.chunk_ready.emit(chunk, gesture)
+                            self.msleep(int(self._chunk_ms))
+                    else:
+                        raise FileNotFoundError(f"Quattrocento source not found: {source}")
                     self.finished_all.emit()
                 except Exception as e:
                     self.error.emit(str(e))
@@ -3716,19 +3792,33 @@ class MainWindow(QMainWindow):
             self._q4_worker.stop()
             self._q4_worker.wait(2000)
 
-        side = "left"
+        src_name = Path(source_path).name.lower()
+        side = "right" if src_name.endswith("_right.npy") else "left"
         chunk_ms = 20.0
         num_ch = self.channels_spin.value()
 
-        self._q4_worker = _Q4Worker(root_dir, side, chunk_ms, parent=self)
+        self._q4_worker = _Q4Worker(source_path, side, chunk_ms, parent=self)
         self._q4_worker.chunk_ready.connect(self._on_q4_chunk)
         self._q4_worker.finished_all.connect(self._on_q4_finished)
         self._q4_worker.error.connect(lambda e: self._log(f"Quattrocento stream error: {e}"))
         self._q4_worker.start()
 
+        self._q4_stream_active = True
+        self._q4_stream_channels = None
+        try:
+            src = Path(source_path)
+            if src.is_file() and src.suffix.lower() == ".npy":
+                preview = np.load(str(src), mmap_mode="r")
+                if preview.ndim == 2:
+                    self._q4_stream_channels = int(max(1, preview.shape[1] - 4))
+                del preview
+        except Exception:
+            # Non-fatal: first chunk will still set channel count.
+            self._q4_stream_channels = None
+
         self.connect_btn.setEnabled(False)
         self.disconnect_btn.setEnabled(True)
-        self._log(f"Quattrocento streaming started from: {root_dir}  (side={side})")
+        self._log(f"Quattrocento streaming started from: {source_path}  (side={side})")
 
     @Slot(object, str)
     def _on_q4_chunk(self, chunk, gesture: str) -> None:
@@ -3738,14 +3828,24 @@ class MainWindow(QMainWindow):
             return
         if chunk.ndim == 1:
             chunk = chunk.reshape(-1, 1)
+        self._q4_stream_channels = int(chunk.shape[1])
+
+        # If model is already loaded, keep prediction buffer in sync with stream channels.
+        if self._current_model is not None and self._prediction_buffer is not None:
+            if self._prediction_buffer.shape[1] != chunk.shape[1]:
+                window_samples = self._prediction_buffer.shape[0]
+                self._prediction_buffer = np.zeros((window_samples, chunk.shape[1]), dtype=np.float32)
+
         # Update ground truth label display
-        self._on_ground_truth_changed(gesture)
+        if gesture != self._current_ground_truth_label:
+            self._on_ground_truth_changed(gesture)
         # Feed into standard data path
         self._on_data_received(chunk)
 
     @Slot()
     def _on_q4_finished(self) -> None:
         self._log("Quattrocento: all files streamed.")
+        self._q4_stream_active = False
         self.connect_btn.setEnabled(True)
         self.disconnect_btn.setEnabled(False)
 
