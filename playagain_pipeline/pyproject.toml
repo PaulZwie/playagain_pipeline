@@ -137,7 +137,6 @@ dependencies = [
     "pygments==2.19.1",
     "pyparsing==3.3.1",
     "pyqt6==6.7.1",
-    "pyqt5-qt5==5.15.16",
     "pyqt5-sip==12.17.0",
     "pyqt5-stubs==5.15.6.0",
     "pyqtgraph==0.13.7",
@@ -174,7 +173,6 @@ dependencies = [
     "tensorboard==2.19.0",
     "tensorboard-data-server==0.7.2",
     "tensorflow==2.19.0",
-    "tensorflow-io-gcs-filesystem==0.37.1",
     "termcolor==2.5.0",
     "terminado==0.18.1 ; sys_platform != 'win32'",
     "threadpoolctl==3.6.0",
@@ -198,9 +196,12 @@ dependencies = [
     "widgetsnbextension==4.0.13",
     "wrapt==1.17.2",
     "yarl==1.18.3",
-    "tkinter",
 ]
 
 [tool.uv.sources]
-device-interfaces = { path = "../../../PlayAgain-Game1/device-interfaces-main" }
-gui-custom-elements = { path = "../../../PlayAgain-Game1/gui-custom-elements-main" }
+device-interfaces = { path = "../../device-interfaces" }
+gui-custom-elements = { path = "../../gui-custom-elements" }
+
+[tool.uv]
+required-environments = ["sys_platform == 'win32' and platform_machine == 'AMD64'"]
+
