@@ -26,6 +26,7 @@ from __future__ import annotations
 import csv
 import threading
 import time
+from dataclasses import dataclass
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
@@ -1123,6 +1124,36 @@ class _ModelRun:
         self.timestamp  = timestamp
 
 
+@dataclass
+class _QueuedTrainConfig:
+    label: str
+    model_name: str
+    model_type: str
+    model_display: str
+    feat_cfg: Dict[str, Any]
+    cv_mode: str
+    cv_folds: int
+    norm_mode: str
+    ch_reduce: str
+    augment: bool
+    class_weight: str
+    noise_std: float
+    time_shift: int
+    ch_reduce_n: int
+    es_patience: int
+    use_trigger: bool
+    onset_delay: float
+    use_intra_split: bool
+    split_ratios: Tuple[float, float, float]
+    sampling_rate: float
+    window_ms: int
+    window_samples: int
+    num_channels: int
+    train_paths: List[str]
+    val_paths: List[str]
+    test_paths: List[str]
+
+
 # ─── main dialog ──────────────────────────────────────────────────────────────
 
 class QuattrocentoTrainingDialog(QDialog):
@@ -1149,6 +1180,9 @@ class QuattrocentoTrainingDialog(QDialog):
         self._trained_model = None
         self._results       = None
         self._all_runs: List[_ModelRun] = []
+        self._train_queue: List[_QueuedTrainConfig] = []
+        self._queue_running = False
+        self._active_train_cfg: Optional[_QueuedTrainConfig] = None
         self._theme = _apply_theme(theme)
 
         self.setWindowTitle("Quattrocento Training & Evaluation")
@@ -1243,7 +1277,7 @@ class QuattrocentoTrainingDialog(QDialog):
         side_lbl.setStyleSheet(f"color:{_C['muted']};font-size:10px;")
         scan_row.addWidget(side_lbl)
         self._side_combo = QComboBox()
-        self._side_combo.addItems(["left", "right", "both"])
+        self._side_combo.addItems(["both", "left", "right"])
         self._side_combo.setMaximumWidth(60)
         self._side_combo.setToolTip("Which electrode side to load")
         scan_row.addWidget(self._side_combo)
@@ -1584,6 +1618,34 @@ class QuattrocentoTrainingDialog(QDialog):
         btn_row.addWidget(close_btn)
         left_lay.addLayout(btn_row)
 
+        queue_row = QHBoxLayout()
+        self._queue_btn = QPushButton("＋ Queue Current")
+        self._queue_btn.setStyleSheet(_BTN_SECONDARY)
+        self._queue_btn.setFixedHeight(26)
+        self._queue_btn.setEnabled(False)
+        self._queue_btn.clicked.connect(self._on_queue_current)
+        queue_row.addWidget(self._queue_btn)
+
+        self._run_queue_btn = QPushButton("▶ Run Queue")
+        self._run_queue_btn.setStyleSheet(_BTN_SECONDARY)
+        self._run_queue_btn.setFixedHeight(26)
+        self._run_queue_btn.setEnabled(False)
+        self._run_queue_btn.clicked.connect(self._on_run_queue)
+        queue_row.addWidget(self._run_queue_btn)
+
+        self._clear_queue_btn = QPushButton("Clear Queue")
+        self._clear_queue_btn.setStyleSheet(_BTN_SECONDARY)
+        self._clear_queue_btn.setFixedHeight(26)
+        self._clear_queue_btn.setEnabled(False)
+        self._clear_queue_btn.clicked.connect(self._on_clear_queue)
+        queue_row.addWidget(self._clear_queue_btn)
+
+        self._queue_status_lbl = QLabel("Queue: 0")
+        self._queue_status_lbl.setStyleSheet(f"color:{_C['muted']};font-size:10px;")
+        queue_row.addWidget(self._queue_status_lbl)
+        queue_row.addStretch()
+        left_lay.addLayout(queue_row)
+
         self._progress = QProgressBar()
         self._progress.setRange(0, 100); self._progress.setValue(0)
         left_lay.addWidget(self._progress)
@@ -1920,6 +1982,9 @@ class QuattrocentoTrainingDialog(QDialog):
             self._cond_list.clear()
             self._cond_container.setVisible(False)
             self._train_btn.setEnabled(False); self._lc_btn.setEnabled(False)
+            self._clear_training_queue("Configuration changed — cleared queued runs.")
+            if hasattr(self, "_queue_btn"):
+                self._queue_btn.setEnabled(False)
             if self._root_edit.text():
                 self._scan_info.setText("⚠ Config changed — click 'Scan Directory' to reload.")
 
@@ -1967,6 +2032,7 @@ class QuattrocentoTrainingDialog(QDialog):
 
     def _finish_scan(self, loader, all_recs, nc_target, window_ms):
         try:
+            self._clear_training_queue("New scan loaded — cleared queued runs.")
             primary = [r for r in all_recs if r.n_channels == nc_target] if nc_target > 0 else all_recs
             skipped = len(all_recs) - len(primary)
             self._loader = loader
@@ -2029,6 +2095,8 @@ class QuattrocentoTrainingDialog(QDialog):
                 info += f"\n(skipped {skipped} files with different channel config)"
             self._scan_info.setText(info)
             self._train_btn.setEnabled(True)
+            if hasattr(self, "_queue_btn"):
+                self._queue_btn.setEnabled(True)
             self._lc_btn.setEnabled(False)
             self._update_preview()
             self._log(f"Scan complete: {len(primary)} files, {len(gestures)} gestures, "
@@ -2036,6 +2104,227 @@ class QuattrocentoTrainingDialog(QDialog):
         except Exception as e:
             self._scan_info.setText(f"Finish-scan error: {e}")
             self._log(f"Finish-scan error: {e}")
+
+    @staticmethod
+    def _rec_paths(recs: List[Any]) -> List[str]:
+        return [str(getattr(r, "path", "")) for r in recs if getattr(r, "path", None) is not None]
+
+    def _resolve_recs(self, paths: List[str]) -> List[Any]:
+        if self._loader is None:
+            return []
+        rec_map = {str(r.path): r for r in self._loader.recordings}
+        out = []
+        for p in paths:
+            rec = rec_map.get(str(p))
+            if rec is not None:
+                out.append(rec)
+        return out
+
+    def _clear_training_queue(self, log_msg: Optional[str] = None):
+        self._train_queue.clear()
+        self._queue_running = False
+        self._refresh_queue_ui()
+        if log_msg:
+            self._log(log_msg)
+
+    def _refresh_queue_ui(self):
+        queued = len(self._train_queue)
+        running_txt = " (running)" if self._queue_running else ""
+        next_txt = f"  Next: {self._train_queue[0].label}" if queued else ""
+        if hasattr(self, "_queue_status_lbl"):
+            self._queue_status_lbl.setText(f"Queue: {queued}{running_txt}{next_txt}")
+        if hasattr(self, "_run_queue_btn"):
+            self._run_queue_btn.setEnabled(queued > 0)
+        if hasattr(self, "_clear_queue_btn"):
+            self._clear_queue_btn.setEnabled(queued > 0)
+
+    def _build_train_config(self) -> Optional[_QueuedTrainConfig]:
+        if self._loader is None:
+            return None
+        gestures = self._selected_gestures()
+        if not gestures:
+            QMessageBox.warning(self, "No gestures", "Select at least one gesture.")
+            return None
+
+        recs = self._filtered_recs()
+        if not recs:
+            QMessageBox.warning(self, "No data", "No recordings matched current filters.")
+            return None
+
+        roles = self._split_cards.get_roles()
+        train_recs, val_recs, test_recs, use_intra_split = self._effective_split(recs, roles)
+        split_ratios = self._get_intra_split_ratios()
+
+        if not train_recs:
+            QMessageBox.warning(self, "No training data",
+                                "No trials are assigned to TRAIN.\n"
+                                "Click cards in the split panel to assign roles.")
+            return None
+
+        cv_map = {self._cv_none: "none", self._cv_kfold: "kfold", self._cv_loso: "loso"}
+        cv_mode = next(k for btn, k in cv_map.items() if btn.isChecked())
+        norm_mode = self._norm_combo.currentData()
+        ch_reduce = self._ch_reduce_combo.currentData()
+        augment = self._augment_cb.isChecked()
+        class_weight = self._class_weight_combo.currentData()
+        mi = self._model_combo.currentIndex()
+        model_type = _MODEL_TYPES[mi][1]
+        model_display = _MODEL_TYPES[mi][0]
+        ts_str = datetime.now().strftime("%H%M%S")
+        model_name = (self._model_name_edit.text().strip() or f"q4_{model_type}_{ts_str}")
+
+        feat_cfg = ({"mode": "raw", "features": []}
+                    if self._feat_combo.currentIndex() == 1
+                    else {"mode": "default", "features": []})
+
+        sr = float(np.median([r.sampling_rate for r in recs]))
+        window_ms, nc_target = self._primary_config()
+        ws = max(1, int(round(sr * window_ms / 1000.0)))
+        nc = nc_target if nc_target > 0 else recs[0].n_channels
+        use_trigger = self._use_trigger_cb.isChecked() if hasattr(self, '_use_trigger_cb') else False
+        onset_delay = float(self._onset_delay_spin.value()) if hasattr(self, '_onset_delay_spin') else 150.0
+
+        label = f"{model_name} [{model_display}]"
+        return _QueuedTrainConfig(
+            label=label,
+            model_name=model_name,
+            model_type=model_type,
+            model_display=model_display,
+            feat_cfg=dict(feat_cfg),
+            cv_mode=cv_mode,
+            cv_folds=self._cv_k_spin.value(),
+            norm_mode=norm_mode,
+            ch_reduce=ch_reduce,
+            augment=augment,
+            class_weight=class_weight,
+            noise_std=float(self._noise_spin.value()),
+            time_shift=int(self._shift_spin.value()),
+            ch_reduce_n=int(self._ch_n_spin.value()),
+            es_patience=int(self._es_patience_spin.value()),
+            use_trigger=use_trigger,
+            onset_delay=onset_delay,
+            use_intra_split=use_intra_split,
+            split_ratios=tuple(split_ratios),
+            sampling_rate=sr,
+            window_ms=int(window_ms),
+            window_samples=ws,
+            num_channels=int(nc),
+            train_paths=self._rec_paths(train_recs),
+            val_paths=self._rec_paths(val_recs),
+            test_paths=self._rec_paths(test_recs),
+        )
+
+    def _start_training_from_config(self, cfg: _QueuedTrainConfig) -> bool:
+        train_recs = self._resolve_recs(cfg.train_paths)
+        val_recs = self._resolve_recs(cfg.val_paths)
+        test_recs = self._resolve_recs(cfg.test_paths)
+        if not train_recs:
+            self._log(f"Queue item invalid (missing train recordings): {cfg.label}")
+            return False
+
+        try:
+            model = self._model_manager.create_model(cfg.model_type, name=cfg.model_name)
+        except Exception as e:
+            QMessageBox.critical(self, "Model creation failed", str(e))
+            return False
+
+        self._active_train_cfg = cfg
+        self._log("=" * 58)
+        self._log(f"Model: {cfg.model_name}  |  Type: {cfg.model_type}")
+        self._log(f"SR: {cfg.sampling_rate:.0f} Hz  |  Window: {cfg.window_samples} smp ({cfg.window_ms} ms)  |  Channels: {cfg.num_channels}")
+        self._log(f"Train files: {len(train_recs)}  |  Val: {len(val_recs)}  |  Test: {len(test_recs)}")
+        self._log(f"Norm: {cfg.norm_mode}  |  Augment: {cfg.augment}  |  CV: {cfg.cv_mode}  |  CW: {cfg.class_weight}")
+        if cfg.use_intra_split:
+            self._log(
+                "Using intra-trial split: "
+                f"{cfg.split_ratios[0]*100:.1f}% train / {cfg.split_ratios[1]*100:.1f}% val / "
+                f"{cfg.split_ratios[2]*100:.1f}% test per recording."
+            )
+
+        self._train_btn.setEnabled(False)
+        self._stop_btn.setEnabled(True)
+        self._save_btn.setEnabled(False)
+        self._export_btn.setEnabled(False)
+        self._lc_btn.setEnabled(False)
+        self._progress.setValue(0)
+        self._live_canvas.reset()
+        self._cv_table.setRowCount(0)
+
+        self._worker = _TrainWorker(
+            loader=self._loader,
+            train_recs=train_recs,
+            test_recs=test_recs,
+            val_recs=val_recs,
+            model=model,
+            feature_config=dict(cfg.feat_cfg),
+            sampling_rate=cfg.sampling_rate,
+            window_size=cfg.window_samples,
+            n_channels=cfg.num_channels,
+            cv_mode=cfg.cv_mode,
+            cv_folds=cfg.cv_folds,
+            norm_mode=cfg.norm_mode,
+            augment=cfg.augment,
+            noise_std=cfg.noise_std,
+            time_shift=cfg.time_shift,
+            channel_reduce=cfg.ch_reduce,
+            channel_reduce_n=cfg.ch_reduce_n,
+            class_weight=cfg.class_weight,
+            early_stopping_patience=cfg.es_patience,
+            use_trigger_segments=cfg.use_trigger,
+            onset_delay_ms=cfg.onset_delay,
+            intra_trial_split=cfg.use_intra_split,
+            split_ratios=cfg.split_ratios,
+        )
+        self._worker.progress.connect(self._on_progress)
+        self._worker.epoch_update.connect(self._on_epoch_update)
+        self._worker.fold_result.connect(self._on_fold_result)
+        self._worker.finished.connect(self._on_finished)
+        self._worker.error.connect(self._on_error)
+        self._worker.start()
+        return True
+
+    def _start_next_queued_training(self):
+        if not self._queue_running:
+            return
+        if self._worker is not None and self._worker.isRunning():
+            return
+        if not self._train_queue:
+            self._queue_running = False
+            self._refresh_queue_ui()
+            self._status_lbl.setText("Queue complete.")
+            self._log("Queue finished.")
+            return
+
+        cfg = self._train_queue.pop(0)
+        self._refresh_queue_ui()
+        self._status_lbl.setText(f"Running queued item: {cfg.label}")
+        self._log(f"Starting queued item: {cfg.label}")
+        started = self._start_training_from_config(cfg)
+        if not started:
+            QTimer.singleShot(0, self._start_next_queued_training)
+
+    @Slot()
+    def _on_queue_current(self):
+        cfg = self._build_train_config()
+        if cfg is None:
+            return
+        self._train_queue.append(cfg)
+        self._refresh_queue_ui()
+        self._log(f"Queued: {cfg.label}")
+
+    @Slot()
+    def _on_run_queue(self):
+        if not self._train_queue:
+            QMessageBox.information(self, "Queue empty", "No queued configs. Add one with 'Queue Current'.")
+            return
+        self._queue_running = True
+        self._refresh_queue_ui()
+        if self._worker is None or not self._worker.isRunning():
+            self._start_next_queued_training()
+
+    @Slot()
+    def _on_clear_queue(self):
+        self._clear_training_queue("Cleared queued runs.")
 
     def _update_preview(self):
         if self._loader is None:
@@ -2094,102 +2383,12 @@ class QuattrocentoTrainingDialog(QDialog):
 
     @Slot()
     def _on_train(self):
-        if self._loader is None:
+        cfg = self._build_train_config()
+        if cfg is None:
             return
-        gestures = self._selected_gestures()
-        if not gestures:
-            QMessageBox.warning(self, "No gestures", "Select at least one gesture.")
-            return
-
-        recs = self._filtered_recs()
-        if not recs:
-            QMessageBox.warning(self, "No data", "No recordings matched current filters.")
-            return
-
-        roles = self._split_cards.get_roles()
-        train_recs, val_recs, test_recs, use_intra_split = self._effective_split(recs, roles)
-        split_ratios = self._get_intra_split_ratios()
-
-        if not train_recs:
-            QMessageBox.warning(self, "No training data",
-                                "No trials are assigned to TRAIN.\n"
-                                "Click cards in the split panel to assign roles.")
-            return
-
-        cv_map = {self._cv_none: "none", self._cv_kfold: "kfold", self._cv_loso: "loso"}
-        cv_mode = next(k for btn, k in cv_map.items() if btn.isChecked())
-        norm_mode    = self._norm_combo.currentData()
-        ch_reduce    = self._ch_reduce_combo.currentData()
-        augment      = self._augment_cb.isChecked()
-        class_weight = self._class_weight_combo.currentData()
-        mi           = self._model_combo.currentIndex()
-        model_type   = _MODEL_TYPES[mi][1]
-        ts_str       = datetime.now().strftime("%H%M%S")
-        model_name   = (self._model_name_edit.text().strip() or
-                        f"q4_{model_type}_{ts_str}")
-
-        try:
-            model = self._model_manager.create_model(model_type, name=model_name)
-        except Exception as e:
-            QMessageBox.critical(self, "Model creation failed", str(e))
-            return
-
-        feat_cfg = ({"mode": "raw", "features": []}
-                    if self._feat_combo.currentIndex() == 1
-                    else {"mode": "default", "features": []})
-
-        sr         = float(np.median([r.sampling_rate for r in recs]))
-        window_ms, nc_target = self._primary_config()
-        ws         = max(1, int(round(sr * window_ms / 1000.0)))
-        nc         = nc_target if nc_target > 0 else recs[0].n_channels
-
-        self._log("=" * 58)
-        self._log(f"Model: {model_name}  |  Type: {model_type}")
-        self._log(f"SR: {sr:.0f} Hz  |  Window: {ws} smp ({window_ms} ms)  |  Channels: {nc}")
-        self._log(f"Train files: {len(train_recs)}  |  Val: {len(val_recs)}  |  Test: {len(test_recs)}")
-        self._log(f"Norm: {norm_mode}  |  Augment: {augment}  |  CV: {cv_mode}  |  CW: {class_weight}")
-        if use_intra_split:
-            self._log(
-                "Using intra-trial split: "
-                f"{split_ratios[0]*100:.1f}% train / {split_ratios[1]*100:.1f}% val / "
-                f"{split_ratios[2]*100:.1f}% test per recording."
-            )
-
-        self._train_btn.setEnabled(False)
-        self._stop_btn.setEnabled(True)
-        self._save_btn.setEnabled(False)
-        self._export_btn.setEnabled(False)
-        self._lc_btn.setEnabled(False)
-        self._progress.setValue(0)
-        self._live_canvas.reset()
-        self._cv_table.setRowCount(0)
-
-        use_trigger = self._use_trigger_cb.isChecked() if hasattr(self, '_use_trigger_cb') else False
-        onset_delay = float(self._onset_delay_spin.value()) if hasattr(self, '_onset_delay_spin') else 150.0
-        self._worker = _TrainWorker(
-            loader=self._loader,
-            train_recs=train_recs, test_recs=test_recs, val_recs=val_recs,
-            model=model, feature_config=feat_cfg,
-            sampling_rate=sr, window_size=ws, n_channels=nc,
-            cv_mode=cv_mode, cv_folds=self._cv_k_spin.value(),
-            norm_mode=norm_mode, augment=augment,
-            noise_std=self._noise_spin.value(),
-            time_shift=self._shift_spin.value(),
-            channel_reduce=ch_reduce,
-            channel_reduce_n=self._ch_n_spin.value(),
-            class_weight=class_weight,
-            early_stopping_patience=self._es_patience_spin.value(),
-            use_trigger_segments=use_trigger,
-            onset_delay_ms=onset_delay,
-            intra_trial_split=use_intra_split,
-            split_ratios=split_ratios,
-        )
-        self._worker.progress.connect(self._on_progress)
-        self._worker.epoch_update.connect(self._on_epoch_update)
-        self._worker.fold_result.connect(self._on_fold_result)
-        self._worker.finished.connect(self._on_finished)
-        self._worker.error.connect(self._on_error)
-        self._worker.start()
+        self._queue_running = False
+        self._refresh_queue_ui()
+        self._start_training_from_config(cfg)
 
     @Slot()
     def _on_stop_training(self):
@@ -2197,6 +2396,10 @@ class QuattrocentoTrainingDialog(QDialog):
             self._worker.terminate()
             self._worker.wait(3000)
             self._worker = None
+        if self._queue_running or self._train_queue:
+            self._clear_training_queue("Stopped training and cleared queued runs.")
+        self._queue_running = False
+        self._active_train_cfg = None
         self._status_lbl.setText("Training stopped.")
         self._train_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
@@ -2230,8 +2433,13 @@ class QuattrocentoTrainingDialog(QDialog):
 
     @Slot(object, object)
     def _on_finished(self, results: dict, model):
+        if self._worker and self._worker.isRunning():
+            self._worker.wait(5000)
+        self._worker = None
         self._results       = results
         self._trained_model = model
+        active_cfg = self._active_train_cfg
+        self._active_train_cfg = None
         self._train_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._save_btn.setEnabled(True)
@@ -2339,20 +2547,38 @@ class QuattrocentoTrainingDialog(QDialog):
         # Comparison table
         run = _ModelRun(
             name=model.name if model else "?",
-            model_type=_MODEL_TYPES[self._model_combo.currentIndex()][0],
+            model_type=(active_cfg.model_display if active_cfg is not None
+                        else _MODEL_TYPES[self._model_combo.currentIndex()][0]),
             results=results, model=model,
             timestamp=datetime.now().strftime("%H:%M:%S"))
         self._all_runs.append(run)
         self._refresh_comparison()
         self._results_tabs.setCurrentIndex(0)
+        self._refresh_queue_ui()
+        if self._queue_running and self._train_queue:
+            QTimer.singleShot(0, self._start_next_queued_training)
+        elif self._queue_running:
+            self._queue_running = False
+            self._refresh_queue_ui()
 
     @Slot(str)
     def _on_error(self, msg: str):
+        if self._worker and self._worker.isRunning():
+            self._worker.wait(5000)
+        self._worker = None
+        self._active_train_cfg = None
         self._train_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         self._lc_btn.setEnabled(self._trained_model is not None)
         self._log(f"ERROR: {msg}")
         QMessageBox.critical(self, "Training failed", msg[:800])
+        self._refresh_queue_ui()
+        if self._queue_running and self._train_queue:
+            self._log("Continuing with next queued run after failure.")
+            QTimer.singleShot(0, self._start_next_queued_training)
+        elif self._queue_running:
+            self._queue_running = False
+            self._refresh_queue_ui()
 
     @Slot()
     def _on_save_model(self):

@@ -1225,6 +1225,12 @@ class TrainingProgressDialog(QDialog):
         if self._worker:
             self._worker.stop()
             self._log("Stopping training...")
+            if self._worker.isRunning():
+                self._worker.wait(3000)
+            if self._worker.isRunning():
+                self._worker.terminate()
+                self._worker.wait(2000)
+            self._worker = None
 
     @Slot(int, str)
     def _on_progress(self, progress: int, message: str):
@@ -1322,6 +1328,10 @@ class TrainingProgressDialog(QDialog):
         except Exception as e:
             self._log(f"Warning: could not set model name automatically: {e}")
 
+        if self._worker and self._worker.isRunning():
+            self._worker.wait(5000)
+        self._worker = None
+
     @Slot(str)
     def _on_training_error(self, error: str):
         """Handle training error."""
@@ -1329,6 +1339,20 @@ class TrainingProgressDialog(QDialog):
         self.train_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
         self.status_label.setText(f"Error: {error}")
+        if self._worker and self._worker.isRunning():
+            self._worker.wait(3000)
+        self._worker = None
+
+    def closeEvent(self, event):
+        """Ensure worker thread is stopped before dialog destruction."""
+        if self._worker and self._worker.isRunning():
+            self._worker.stop()
+            self._worker.wait(3000)
+            if self._worker.isRunning():
+                self._worker.terminate()
+                self._worker.wait(2000)
+        self._worker = None
+        super().closeEvent(event)
 
     def get_trained_model(self):
         """Get the trained model."""

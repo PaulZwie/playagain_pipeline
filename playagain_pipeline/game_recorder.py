@@ -27,7 +27,7 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Optional, Dict, List, Any
+from typing import Optional, Dict, List, Any, Tuple
 
 import numpy as np
 
@@ -331,16 +331,13 @@ class GameRecorder:
 
         # Signal writer thread to stop and wait for it to drain
         if self._writer_thread is not None:
-            # Ensure sentinel insertion even if queue is full.
+            # Ensure sentinel insertion without dropping pending data.
             while True:
                 try:
                     self._write_queue.put_nowait(None)  # sentinel
                     break
                 except queue.Full:
-                    try:
-                        self._write_queue.get_nowait()
-                    except queue.Empty:
-                        break
+                    time.sleep(0.01)
             self._writer_thread.join(timeout=5.0)
             self._writer_thread = None
 
@@ -398,41 +395,35 @@ class GameRecorder:
         # Ground truth is derived only in on_game_state.
         # Keep on_emg_data a pure snapshot/write path for deterministic recording.
 
-        # Build all rows in bulk, then enqueue as a single batch
-        rows = []
+        # Build compact payload and let the writer thread construct CSV rows.
         sr = float(self._sampling_rate)
         timestamps = base_timestamp + (np.arange(n_samples, dtype=np.float64) / sr)
         gt_flag = 1 if gt_active else 0
         raw_gt_flag = 1 if raw_gt else 0
         cam_flag = 1 if cam_blocking else 0
         prob_values = [float(probabilities.get(name, 0.0)) for name in self._class_names]
-        emg_rows = data[:n_samples, :n_channels].tolist()
-        pad = [0.0] * (self._num_channels - n_channels)
+        emg_chunk = np.asarray(data[:n_samples, :n_channels], dtype=np.float32, order="C").copy()
+        pad_count = self._num_channels - n_channels
 
-        for i, ts in enumerate(timestamps):
-            row = [
-                float(ts),
-                prediction,
-                gesture_id,
-                confidence,
-            ]
-            row.extend(prob_values)
-            row.extend([
-                gt_flag,
-                raw_gt_flag,
-                req_gesture,
-                cam_flag,
-            ])
-            row.extend(emg_rows[i])
-            if pad:
-                row.extend(pad)
-            rows.append(row)
+        payload = (
+            timestamps,
+            prediction,
+            int(gesture_id),
+            confidence,
+            prob_values,
+            gt_flag,
+            raw_gt_flag,
+            req_gesture,
+            cam_flag,
+            emg_chunk,
+            pad_count,
+        )
 
         self._sample_count += n_samples
 
         # Enqueue batch for background writer (non-blocking)
         try:
-            self._write_queue.put_nowait(rows)
+            self._write_queue.put_nowait(payload)
         except queue.Full:
             # Under extreme load, drop oldest batch to protect GUI
             try:
@@ -440,7 +431,7 @@ class GameRecorder:
             except queue.Empty:
                 pass
             try:
-                self._write_queue.put_nowait(rows)
+                self._write_queue.put_nowait(payload)
             except queue.Full:
                 pass
 
@@ -533,7 +524,7 @@ class GameRecorder:
         Background thread: drains the write queue and flushes rows to CSV.
         Stops when it receives a None sentinel on the queue.
         """
-        pending_rows = []
+        pending_rows = 0
         last_flush = time.monotonic()
 
         while True:
@@ -552,13 +543,10 @@ class GameRecorder:
                         except queue.Empty:
                             break
                         if remaining is not None:
-                            pending_rows.extend(remaining)
-
-                    if pending_rows and self._writer:
-                        try:
-                            self._writer.writerows(pending_rows)
-                        except Exception as e:
-                            print(f"[GameRecorder] Write error: {e}")
+                            try:
+                                pending_rows += self._write_payload(remaining)
+                            except Exception as e:
+                                print(f"[GameRecorder] Write error: {e}")
 
                     if self._file:
                         try:
@@ -567,24 +555,58 @@ class GameRecorder:
                             pass
                     return
             else:
-                pending_rows.extend(item)
+                try:
+                    pending_rows += self._write_payload(item)
+                except Exception as e:
+                    print(f"[GameRecorder] Write error: {e}")
 
             now = time.monotonic()
             should_flush = (
                 pending_rows and (
-                    len(pending_rows) >= self._rows_per_flush
+                    pending_rows >= self._rows_per_flush
                     or (now - last_flush) >= self._flush_interval_s
                 )
             )
 
             if should_flush and self._writer:
                 try:
-                    self._writer.writerows(pending_rows)
                     self._file.flush()
-                    pending_rows.clear()
+                    pending_rows = 0
                     last_flush = now
                 except Exception as e:
                     print(f"[GameRecorder] Write error: {e}")
+
+    def _write_payload(self, payload: Tuple[Any, ...]) -> int:
+        """Write one queued payload to CSV and return number of rows written."""
+        if self._writer is None:
+            return 0
+
+        (
+            timestamps,
+            prediction,
+            gesture_id,
+            confidence,
+            prob_values,
+            gt_flag,
+            raw_gt_flag,
+            req_gesture,
+            cam_flag,
+            emg_chunk,
+            pad_count,
+        ) = payload
+
+        emg_rows = emg_chunk.tolist()
+        prefix = [prediction, gesture_id, confidence, *prob_values,
+                  gt_flag, raw_gt_flag, req_gesture, cam_flag]
+        pad = [0.0] * int(pad_count) if pad_count > 0 else None
+
+        for ts, emg_row in zip(timestamps, emg_rows):
+            row = [float(ts), *prefix, *emg_row]
+            if pad:
+                row.extend(pad)
+            self._writer.writerow(row)
+
+        return len(timestamps)
 
     def _save_config(self, subject_id: Optional[str] = None,
                      session_name: Optional[str] = None):

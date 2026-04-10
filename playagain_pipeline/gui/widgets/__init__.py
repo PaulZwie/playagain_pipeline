@@ -15,7 +15,7 @@ from playagain_pipeline.gui.widgets.training_dialog import (
     HyperparameterWidget
 )
 from playagain_pipeline.gui.widgets.feature_selection import FeatureSelectionDialog
-from playagain_pipeline.gui.widgets.calibration_dialog_old import CalibrationDialog
+from playagain_pipeline.gui.widgets.calibration_dialog import CalibrationDialog
 from playagain_pipeline.gui.widgets.emg_plot import VispyBiosignalPlot
 
 __all__ = [

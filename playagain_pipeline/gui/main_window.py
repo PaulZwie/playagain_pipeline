@@ -86,8 +86,9 @@ class PredictionWorker(QThread):
             if buffer is not None and self._model is not None:
                 try:
                     X = buffer[np.newaxis, :, :]
-                    pred = self._model.predict(X)[0]
+                    # Use one model pass to reduce per-frame CPU load.
                     proba = self._model.predict_proba(X)[0]
+                    pred = int(np.argmax(proba))
                     self.prediction_ready.emit(pred, proba)
                 except Exception as e:
                     # Log prediction errors (throttled to avoid spam)

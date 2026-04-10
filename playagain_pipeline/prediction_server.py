@@ -35,15 +35,12 @@ import socket
 import threading
 import time
 import argparse
-import sys
-import signal
 from pathlib import Path
-from typing import Optional, Dict, Any, List, Callable, Tuple
+from typing import Optional, Dict, List, Callable, Tuple
 
 import numpy as np
 
 from playagain_pipeline.config.config import get_default_config
-from playagain_pipeline.core.data_manager import DataManager
 from playagain_pipeline.devices.emg_device import DeviceManager, DeviceType, SyntheticEMGDevice
 from playagain_pipeline.models.classifier import ModelManager, BaseClassifier
 
@@ -504,8 +501,9 @@ class PredictionServer:
             # Run prediction
             try:
                 X = buffer_snapshot[np.newaxis, :, :]
-                pred = self._model.predict(X)[0]
+                # Hot path: infer both label and confidence from one probability pass.
                 proba = self._model.predict_proba(X)[0]
+                pred = int(np.argmax(proba))
 
                 self._process_prediction(pred, proba)
             except Exception as e:
@@ -610,8 +608,6 @@ class PredictionServer:
             with self._clients_lock:
                 for client in self._clients:
                     try:
-                        # Short timeout keeps sender responsive without affecting inference.
-                        client.settimeout(0.05)
                         client.sendall(payload)
                     except (OSError, BrokenPipeError, socket.timeout):
                         disconnected.append(client)
@@ -630,6 +626,8 @@ class PredictionServer:
             try:
                 client, addr = self._server_socket.accept()
                 client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+                # Configure once per client so sender loop stays lightweight.
+                client.settimeout(0.05)
                 
                 with self._clients_lock:
                     self._clients.append(client)
@@ -681,6 +679,7 @@ class PredictionServer:
             {"type": "game_state", "gesture_requested": "fist",
              "ground_truth": true, "camera_blocking": true, "timestamp": 123.456}
         """
+        reader = None
         try:
             # Create a file-like reader for line-delimited JSON
             reader = client.makefile("r", encoding="utf-8")
@@ -725,7 +724,8 @@ class PredictionServer:
         finally:
             # Clean up
             try:
-                reader.close()
+                if reader is not None:
+                    reader.close()
             except Exception:
                 pass
 

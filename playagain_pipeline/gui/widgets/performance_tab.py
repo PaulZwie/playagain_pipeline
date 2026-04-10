@@ -64,7 +64,7 @@ class ComparisonWorker(QThread):
     log_line   = Signal(str)
     epoch_data = Signal(str, int, float, float, float, float)
     # (model_name, epoch, train_loss, val_loss, train_acc, val_acc)
-    finished   = Signal(dict)
+    result_ready = Signal(dict)
     error      = Signal(str)
 
     def __init__(
@@ -239,7 +239,7 @@ class ComparisonWorker(QThread):
                         feature_configs=self._feature_configs,
                     )
 
-                self.finished.emit(res or {})
+                self.result_ready.emit(res or {})
             finally:
                 if comparison_module is not None and original_train_and_evaluate is not None:
                     comparison_module._train_and_evaluate_fold = original_train_and_evaluate
@@ -1690,7 +1690,7 @@ class PerformanceReviewTab(QWidget):
         )
         self._worker.log_line.connect(self._log)
         self._worker.epoch_data.connect(self._on_epoch_data)
-        self._worker.finished.connect(self._on_finished)
+        self._worker.result_ready.connect(self._on_finished)
         self._worker.error.connect(self._on_error)
         self._worker.start()
 
@@ -1750,8 +1750,13 @@ class PerformanceReviewTab(QWidget):
         self._run_btn.setEnabled(True)
         self._stop_btn.setEnabled(False)
         if self._worker:
+            if self._worker.isRunning():
+                self._worker.wait(5000)
+            if self._worker.isRunning():
+                self._worker.terminate()
+                self._worker.wait(3000)
             for sig in (self._worker.log_line, self._worker.epoch_data,
-                        self._worker.finished, self._worker.error):
+                        self._worker.result_ready, self._worker.error):
                 try:
                     sig.disconnect()
                 except RuntimeError:
