@@ -1,0 +1,79 @@
+# ──────────────────────────────────────────────────────────────────────
+# Example experiment: leave-one-subject-out baseline.
+#
+# This is a self-contained, reproducible description of one validation
+# run. Copy it, edit the sections you care about, and run:
+#
+#   python -m playagain_pipeline.validation run experiments/loso_baseline.yaml
+#
+# The runner will write a timestamped result directory under
+# data/validation_runs/ that contains:
+#
+#   experiment.json     ← this config, frozen
+#   environment.json    ← git SHA + python + package versions
+#   session_index.json  ← which sessions were used
+#   results.json        ← per-fold + aggregate metrics
+#   results.csv         ← flat per-fold table
+# ──────────────────────────────────────────────────────────────────────
+
+name: loso_baseline
+description: >
+  Leave-one-subject-out cross-validation across all pipeline-recorded
+  Muovi sessions, comparing three models on the standard MAV+RMS+WL+ZC
+  feature set. This is the default "honest single number" baseline.
+
+seed: 42
+
+# ── Which sessions to include ─────────────────────────────────────────
+data:
+  domains: [pipeline]            # pipeline | unity | both
+  min_channels: 32               # filter out any low-channel-count recordings
+  sampling_rate: 2000.0          # only the Muovi 2 kHz captures
+  # subjects: [VP_01, VP_04]     # optional explicit subject list
+  # explicit:                    # optional: explicit "subject/session_id"
+  #   - VP_01/2026-03-24_08-57-34_3rep
+
+# ── How the continuous EMG is sliced ──────────────────────────────────
+windowing:
+  window_ms: 200
+  stride_ms: 50
+  drop_rest: false
+
+# ── Feature pipeline ──────────────────────────────────────────────────
+features:
+  - name: mav
+  - name: rms
+  - name: wl
+  - name: zc
+    params: { threshold: 0.01 }
+
+# ── Models to evaluate ────────────────────────────────────────────────
+models:
+  - type: RandomForest
+    params: { n_estimators: 200, max_depth: 20 }
+  - type: CatBoost
+    params: { iterations: 300, depth: 6, verbose: 0 }
+  - type: LDA
+    params: {}
+
+# ── Cross-validation strategy ─────────────────────────────────────────
+cv:
+  strategy: loso_subject         # one of: within_session, loso_session,
+                                 # loso_subject, k_fold_subjects, cross_domain
+  kwargs: {}
+
+# ──────────────────────────────────────────────────────────────────────
+# A second example, kept here as a comment, that runs the cross-domain
+# experiment (Python pipeline → Unity, and back). Save it as its own
+# file when you want to use it.
+# ──────────────────────────────────────────────────────────────────────
+#
+# name: pipeline_to_unity_transfer
+# description: Train on pipeline data, test on Unity in-game recordings.
+# data:
+#   domains: [pipeline, unity]
+# cv:
+#   strategy: cross_domain
+#   kwargs:
+#     train_domain: pipeline
+#     test_domain:  unity

@@ -23,8 +23,8 @@ from PySide6.QtCore import Qt, Slot, QTimer, QThread, Signal, QMutex, QMutexLock
 from PySide6.QtGui import QFont, QAction
 from PySide6.QtWidgets import (QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QTabWidget, QPushButton, QComboBox,
                                QLineEdit, QLabel, QGroupBox, QFormLayout, QSpinBox, QDoubleSpinBox, QMessageBox,
-                               QFileDialog, QTextEdit, QFrame,
-                               QSplitter, QStatusBar, QListWidget, QScrollArea, QCheckBox, QSizePolicy,
+                               QFileDialog, QTextEdit,
+                               QSplitter, QStatusBar, QListWidget, QScrollArea, QCheckBox,
                                QApplication, QDialog)
 
 from playagain_pipeline.calibration.calibrator import AutoCalibrator
@@ -34,7 +34,7 @@ from playagain_pipeline.core.gesture import GestureSet, create_default_gesture_s
 from playagain_pipeline.core.session import RecordingSession
 from playagain_pipeline.devices.emg_device import (DeviceManager, DeviceType, SyntheticEMGDevice)
 from playagain_pipeline.gui.widgets.emg_plot import EMGPlotWidget
-from playagain_pipeline.gui.widgets.validation_tab import ValidationTab
+from playagain_pipeline.gui.widgets.performance_tab import PerformanceReviewTab
 from playagain_pipeline.gui.widgets.protocol_widget import ProtocolWidget
 from playagain_pipeline.models.classifier import ModelManager, BaseClassifier, apply_bad_channel_strategy
 from playagain_pipeline.protocols.protocol import (
@@ -49,59 +49,7 @@ from playagain_pipeline.protocols.protocol import (
 )
 from playagain_pipeline.prediction_server import PredictionServer, PredictionSmoother
 from playagain_pipeline.gui.widgets.busy_overlay import run_blocking
-from playagain_pipeline.gui.widgets.workflow_stepper import WorkflowStepper
 from playagain_pipeline.game_recorder import GameRecorder
-
-
-# ---------------------------------------------------------------------------
-# Tab index constants — single source of truth so the new ordering can be
-# changed in one place without breaking signal/slot lookups elsewhere.
-# ---------------------------------------------------------------------------
-TAB_RECORD       = 0
-TAB_TRAIN        = 1
-TAB_PREDICT      = 2
-TAB_CALIBRATION  = 3   # optional, moved out of the second slot on purpose
-TAB_VALIDATION   = 4
-
-# Workflow stepper indices (only the three primary stages get a step badge;
-# Calibration & Validation are side-tabs accessible from the bar).
-STEP_RECORD  = 0
-STEP_TRAIN   = 1
-STEP_PREDICT = 2
-
-
-def _make_step_header(title: str, subtitle: str, accent: str = "#0284c7") -> QWidget:
-    """
-    Build a small banner placed at the top of each tab so the user always
-    sees which step they are on and what to do next, without having to
-    read every group-box label.
-    """
-    wrap = QFrame()
-    wrap.setStyleSheet(
-        f"QFrame {{"
-        f"  background: #f1f5f9;"
-        f"  border-left: 4px solid {accent};"
-        f"  border-radius: 4px;"
-        f"}}"
-    )
-    lay = QVBoxLayout(wrap)
-    lay.setContentsMargins(10, 6, 10, 6)
-    lay.setSpacing(2)
-
-    title_lbl = QLabel(title)
-    tf = QFont()
-    tf.setBold(True)
-    tf.setPointSize(12)
-    title_lbl.setFont(tf)
-    title_lbl.setStyleSheet(f"color: {accent}; background: transparent; border: none;")
-    lay.addWidget(title_lbl)
-
-    sub_lbl = QLabel(subtitle)
-    sub_lbl.setWordWrap(True)
-    sub_lbl.setStyleSheet("color: #475569; font-size: 11px; background: transparent; border: none;")
-    lay.addWidget(sub_lbl)
-
-    return wrap
 
 
 class PredictionWorker(QThread):
@@ -325,28 +273,7 @@ class MainWindow(QMainWindow):
         # Central widget
         central = QWidget()
         self.setCentralWidget(central)
-        # Vertical wrapper so we can put the workflow stepper above the
-        # main horizontal splitter.
-        root_layout = QVBoxLayout(central)
-        root_layout.setContentsMargins(0, 0, 0, 0)
-        root_layout.setSpacing(0)
-
-        # ── Workflow stepper banner ───────────────────────────────────────
-        # Three primary stages — Calibration & Performance Review are
-        # side-tabs that don't get their own badge here.
-        self.workflow_stepper = WorkflowStepper([
-            ("Record",            "Connect device, capture gestures"),
-            ("Train & Evaluate",  "Build dataset, train & validate model"),
-            ("Predict",           "Run live inference / Unity server"),
-        ])
-        self.workflow_stepper.step_clicked.connect(self._on_workflow_step_clicked)
-        root_layout.addWidget(self.workflow_stepper)
-
-        # Main horizontal area below the stepper
-        main_area = QWidget()
-        main_layout = QHBoxLayout(main_area)
-        main_layout.setContentsMargins(6, 6, 6, 6)
-        root_layout.addWidget(main_area, 1)
+        main_layout = QHBoxLayout(central)
 
         # Main splitter
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -358,53 +285,26 @@ class MainWindow(QMainWindow):
 
         # Tab widget for different modes
         self.mode_tabs = QTabWidget()
-        self.mode_tabs.currentChanged.connect(self._on_mode_tab_changed)
 
-        # ── New tab order ────────────────────────────────────────────────
-        # 1. Record  →  2. Train & Evaluate  →  3. Predict
-        # Calibration is moved to position 4 (optional), and Performance
-        # Review stays at the end as the analysis tab.
-
+        # Recording tab
         recording_tab = self._create_recording_tab()
-        self.mode_tabs.addTab(recording_tab, "①  Record")
-        self.mode_tabs.setTabToolTip(
-            TAB_RECORD,
-            "Step 1 — Connect a device and record gesture sessions for one subject."
-        )
+        self.mode_tabs.addTab(recording_tab, "Recording")
 
-        training_tab = self._create_training_tab()
-        self.mode_tabs.addTab(training_tab, "②  Train && Evaluate")
-        self.mode_tabs.setTabToolTip(
-            TAB_TRAIN,
-            "Step 2 — Build datasets from recordings, train and validate models. "
-            "Includes Quattrocento offline training."
-        )
-
-        prediction_tab = self._create_prediction_tab()
-        self.mode_tabs.addTab(prediction_tab, "③  Predict")
-        self.mode_tabs.setTabToolTip(
-            TAB_PREDICT,
-            "Step 3 — Run a trained model live on the device or stream "
-            "predictions to Unity."
-        )
-
+        # Calibration tab
         calibration_tab = self._create_calibration_tab()
-        self.mode_tabs.addTab(calibration_tab, "Calibration  (optional)")
-        self.mode_tabs.setTabToolTip(
-            TAB_CALIBRATION,
-            "Optional — only needed when reusing a pretrained model with a "
-            "rotated bracelet, or to set a new reference orientation."
-        )
+        self.mode_tabs.addTab(calibration_tab, "Calibration")
 
-        self._validation_tab = ValidationTab(self.data_manager)
-        self.mode_tabs.addTab(self._validation_tab, "Validation")
-        self.mode_tabs.setTabToolTip(
-            TAB_VALIDATION,
-            "Reproducible cross-validation across feature sets, models, and CV "
-            "strategies. Replaces the old Performance Review tab — every run is "
-            "saved to data/validation_runs/ with full config and environment."
-        )
-        self.mode_tabs.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        # Training tab
+        training_tab = self._create_training_tab()
+        self.mode_tabs.addTab(training_tab, "Training")
+
+        # Prediction tab
+        prediction_tab = self._create_prediction_tab()
+        self.mode_tabs.addTab(prediction_tab, "Prediction")
+
+        # Performance Review tab
+        self._performance_tab = PerformanceReviewTab(self.data_manager)
+        self.mode_tabs.addTab(self._performance_tab, "Performance Review")
 
         left_layout.addWidget(self.mode_tabs)
 
@@ -436,8 +336,6 @@ class MainWindow(QMainWindow):
         )
         log_layout.addWidget(self.log_text)
         left_layout.addWidget(log_group)
-        left_layout.setStretch(0, 1)
-        left_layout.setStretch(1, 0)
 
         splitter.addWidget(left_panel)
 
@@ -478,11 +376,6 @@ class MainWindow(QMainWindow):
         """Create the recording configuration tab."""
         tab = QWidget()
         layout = QVBoxLayout(tab)
-
-        layout.addWidget(_make_step_header(
-            "Step 1 — Record",
-            "Set the subject ID, connect a device, choose a protocol, and capture gestures.",
-        ))
 
         # Create scroll area to prevent cramping on small screens
         scroll = QScrollArea()
@@ -841,13 +734,6 @@ class MainWindow(QMainWindow):
         tab = QWidget()
         layout = QVBoxLayout(tab)
 
-        layout.addWidget(_make_step_header(
-            "Optional — Calibration",
-            "Only needed when reusing a pretrained model with a rotated electrode bracelet, "
-            "or when establishing a new reference orientation. Skip this for first-time training.",
-            accent="#a78bfa",
-        ))
-
         # Create scroll area to prevent cramping on small screens
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1064,25 +950,8 @@ class MainWindow(QMainWindow):
         outer = QVBoxLayout(tab)
         outer.setContentsMargins(6, 6, 6, 6)
 
-        outer.addWidget(_make_step_header(
-            "Step 2 — Train && Evaluate",
-            "Build a dataset from your recordings, train a model, and (optionally) evaluate "
-            "Quattrocento offline data using the same harness.",
-        ))
-
-        # Keep this step usable on smaller windows while preserving splitter layout.
-        scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll_content = QWidget()
-        scroll_lay = QVBoxLayout(scroll_content)
-        scroll_lay.setContentsMargins(0, 0, 0, 0)
-        outer.addWidget(scroll)
-
         splitter = QSplitter(Qt.Orientation.Vertical)
-        splitter.setChildrenCollapsible(False)
-        splitter.setStretchFactor(0, 1)
-        splitter.setStretchFactor(1, 2)
-        scroll_lay.addWidget(splitter)
+        outer.addWidget(splitter)
 
         # ── Top half: Dataset management ──────────────────────────────────────
         top_widget = QWidget()
@@ -1128,8 +997,7 @@ class MainWindow(QMainWindow):
         self.dataset_list = QListWidget()
         self.dataset_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.dataset_list.setAlternatingRowColors(True)
-        self.dataset_list.setMinimumHeight(140)
-        self.dataset_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.dataset_list.setMinimumHeight(90)
         self.dataset_list.currentItemChanged.connect(self._on_dataset_selection_changed)
         ds_lay.addWidget(self.dataset_list)
 
@@ -1203,24 +1071,6 @@ class MainWindow(QMainWindow):
         adv_train_btn.clicked.connect(self._on_advanced_training)
         train_btn_row.addWidget(adv_train_btn)
 
-        # Quattrocento training is no longer hidden in the Tools menu —
-        # it lives here as a first-class evaluation entry point alongside
-        # the Muovi-based local training.
-        q4_train_btn = QPushButton("Quattrocento Training…")
-        q4_train_btn.setFixedHeight(36)
-        q4_train_btn.setToolTip(
-            "Open the Quattrocento offline training dialog: load .otb+/.csv\n"
-            "recordings, run k-fold or LOSO cross-validation, and compare\n"
-            "model architectures on the same evaluation harness as Muovi data."
-        )
-        q4_train_btn.setStyleSheet(
-            "QPushButton{background:#2a1a3a;color:#a78bfa;"
-            "border:1px solid #a78bfa;border-radius:6px;"
-            "font-weight:600;padding:4px 12px;}"
-            "QPushButton:hover{background:#a78bfa;color:#fff;}")
-        q4_train_btn.clicked.connect(self._on_quattrocento_training)
-        train_btn_row.addWidget(q4_train_btn)
-
         model_outer.addLayout(train_btn_row)
         bot_lay.addWidget(model_grp)
 
@@ -1247,16 +1097,12 @@ class MainWindow(QMainWindow):
         self.models_list = QListWidget()
         self.models_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.models_list.setAlternatingRowColors(True)
-        self.models_list.setMinimumHeight(140)
-        self.models_list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.models_list.setMinimumHeight(80)
         saved_lay.addWidget(self.models_list)
 
         bot_lay.addWidget(saved_grp)
         splitter.addWidget(bot_widget)
-        splitter.setSizes([280, 420])
-
-        scroll_content.setMinimumHeight(720)
-        scroll.setWidget(scroll_content)
+        splitter.setSizes([200, 320])
 
         return tab
 
@@ -1286,12 +1132,6 @@ class MainWindow(QMainWindow):
         """Create the real-time prediction tab."""
         tab = QWidget()
         layout = QVBoxLayout(tab)
-
-        layout.addWidget(_make_step_header(
-            "Step 3 — Predict",
-            "Load a trained model and run live inference. Optionally start the Unity TCP "
-            "server to stream predictions to a game.",
-        ))
 
         # Wrap everything in a scroll area so it fits
         scroll = QScrollArea()
@@ -1533,53 +1373,6 @@ class MainWindow(QMainWindow):
         self.protocol_widget.step_started.connect(self._on_step_started)
         self.protocol_widget.step_completed.connect(self._on_step_completed)
         self.protocol_widget.protocol_completed.connect(self._on_protocol_completed)
-
-        # Initialise the workflow stepper now that the tabs exist.
-        self.workflow_stepper.set_current(STEP_RECORD)
-        # If models / datasets already exist on disk, reflect that in the
-        # stepper at startup so returning users see their progress.
-        try:
-            if self.data_manager.list_datasets():
-                self.workflow_stepper.mark_done(STEP_RECORD)
-            if any(self.data_dir.glob("models/*/metadata.json")):
-                self.workflow_stepper.mark_done(STEP_TRAIN)
-        except Exception:
-            pass
-
-    # ------------------------------------------------------------------
-    # Workflow-stepper helpers
-    # ------------------------------------------------------------------
-
-    @Slot(int)
-    def _on_workflow_step_clicked(self, step_idx: int):
-        """Map a stepper click to the corresponding tab."""
-        mapping = {
-            STEP_RECORD:  TAB_RECORD,
-            STEP_TRAIN:   TAB_TRAIN,
-            STEP_PREDICT: TAB_PREDICT,
-        }
-        tab_idx = mapping.get(step_idx)
-        if tab_idx is not None:
-            self.mode_tabs.setCurrentIndex(tab_idx)
-
-    @Slot(int)
-    def _on_mode_tab_changed(self, tab_idx: int):
-        """Sync the stepper highlight to whichever main tab is active."""
-        reverse = {
-            TAB_RECORD:  STEP_RECORD,
-            TAB_TRAIN:   STEP_TRAIN,
-            TAB_PREDICT: STEP_PREDICT,
-        }
-        step = reverse.get(tab_idx)
-        if step is not None:
-            self.workflow_stepper.set_current(step)
-
-    def _stepper_mark(self, step_idx: int):
-        """Convenience wrapper used by recording/training/prediction handlers."""
-        try:
-            self.workflow_stepper.mark_done(step_idx)
-        except Exception:
-            pass
 
     def _update_participant_info_status(self, subject_id: Optional[str] = None):
         """Update the status label for the currently selected participant."""
@@ -2259,8 +2052,6 @@ class MainWindow(QMainWindow):
     def _on_stop_recording(self):
         """Stop the current recording."""
         if self._current_session:
-            # Recording finished → first workflow step is complete.
-            self._stepper_mark(STEP_RECORD)
             self._current_session.stop_recording()
             self.protocol_widget.stop()
             self._current_protocol = None
@@ -2989,38 +2780,22 @@ class MainWindow(QMainWindow):
                 if not selected_items:
                     new_name = "dataset_no_session"
                 elif len(selected_items) == 1:
-                    # Item text is "subject / session_id", data is (subject, session_id).
-                    # Always prefix the subject so the dataset (and the model derived
-                    # from it) is identifiable later without having to open metadata.
-                    subject, session_id = selected_items[0].data(Qt.ItemDataRole.UserRole)
-                    new_name = f"{subject}_{session_id}"
+                    # Item text is "subject / session_id", data is (subject, session_id)
+                    _, session_id = selected_items[0].data(Qt.ItemDataRole.UserRole)
+                    new_name = f"{session_id}"
                 else:
-                    # Multi-session selection: collect distinct subjects so the
-                    # generated name still tells the user *whose* data it is.
-                    subjects_in_sel = []
-                    seen = set()
-                    for item in selected_items:
-                        subj, _sid = item.data(Qt.ItemDataRole.UserRole)
-                        if subj not in seen:
-                            seen.add(subj)
-                            subjects_in_sel.append(subj)
-
-                    subject_prefix = (
-                        subjects_in_sel[0] if len(subjects_in_sel) == 1
-                        else f"{len(subjects_in_sel)}subjects"
-                    )
-
+                    # Try to create a meaningful name if few sessions
                     if len(selected_items) <= 3:
                         names = []
                         for item in selected_items:
                             _, session_id = item.data(Qt.ItemDataRole.UserRole)
                             names.append(session_id)
-                        new_name = f"{subject_prefix}_{'_'.join(names)}"
+                        new_name = f"{'_'.join(names)}"
                         # Truncate if too long
                         if len(new_name) > 80:
-                            new_name = f"{subject_prefix}_{len(selected_items)}_sessions"
+                            new_name = f"{len(selected_items)}_sessions"
                     else:
-                        new_name = f"{subject_prefix}_{len(selected_items)}_sessions"
+                        new_name = f"{len(selected_items)}_sessions"
 
             if name_edit.text() != new_name:
                 name_edit.setText(new_name)
@@ -3301,8 +3076,6 @@ class MainWindow(QMainWindow):
                 self._log(f"  Training time: {results['training_time']:.2f}s")
             self._refresh_models()
             self._log(f"Model saved: {model_name}")
-            # A trained model now exists → Train step is complete.
-            self._stepper_mark(STEP_TRAIN)
 
         def _train_err(tb):
             self.train_btn.setEnabled(True)
@@ -3322,8 +3095,6 @@ class MainWindow(QMainWindow):
         try:
             self._current_model = self.model_manager.load_model(model_name)
             self._log(f"Loaded model: {model_name}")
-            # A model is loaded → Predict step is ready / done.
-            self._stepper_mark(STEP_PREDICT)
 
             model_bad_mode = getattr(self._current_model.metadata, "bad_channel_mode", None)
             if model_bad_mode in {"interpolate", "zero"} and hasattr(self, "bad_ch_mode_combo"):

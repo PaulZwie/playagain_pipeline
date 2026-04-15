@@ -221,9 +221,15 @@ class DataManager:
                     try:
                         with open(metadata_path, 'r') as f:
                             data = json.load(f)
-                        created_at = datetime.fromisoformat(data["metadata"]["created_at"])
+                        # created_at lives at the top level of metadata.json,
+                        # not nested under a "metadata" key.
+                        raw_ts = (
+                            data.get("created_at")
+                            or data.get("metadata", {}).get("created_at")
+                        )
+                        created_at = datetime.fromisoformat(raw_ts) if raw_ts else datetime.min
                         sessions.append((d.name, created_at))
-                    except (KeyError, ValueError):
+                    except (KeyError, ValueError, TypeError):
                         # If can't parse, use directory name as fallback
                         sessions.append((d.name, datetime.min))
                 else:
