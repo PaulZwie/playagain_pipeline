@@ -209,6 +209,104 @@ def k_fold_subjects(
 
 
 # ---------------------------------------------------------------------------
+# Explicit train / val / test ratios
+# ---------------------------------------------------------------------------
+
+def holdout_split(
+    records: List[SessionRecord],
+    *,
+    val_ratio: float = 0.15,
+    test_ratio: float = 0.15,
+    seed: int = 42,
+    stratify_by: str = "subject",
+) -> Iterator[Fold]:
+    """
+    A single fold with explicit train / val / test ratios.
+
+    The split is performed at session granularity — entire sessions go
+    into one bucket each, never windows from the same session into two
+    different buckets. The order in which sessions are drawn is
+    deterministic given ``seed``.
+
+    Parameters
+    ----------
+    val_ratio : fraction of sessions used as the validation set.
+    test_ratio : fraction of sessions used as the test set.
+    seed : RNG seed for the deterministic shuffle.
+    stratify_by : ``"subject"`` (default) draws each subject's sessions
+        independently, so the val and test sets always contain *some*
+        sessions from every subject — the most useful default for small
+        cohorts. ``"none"`` shuffles all sessions globally and slices
+        them, which is appropriate when the experiment cares about
+        cross-subject generalisation.
+
+    Emits a single fold with three populated session lists. The
+    ``ValidationRunner`` knows how to consume the ``"val"`` slot and
+    pass it as ``X_val`` / ``y_val`` to the model's ``train()`` method
+    when the model supports it (MLP, CNN, AttentionNet, MSTNet).
+    """
+    if not 0.0 <= val_ratio < 1.0 or not 0.0 <= test_ratio < 1.0:
+        raise ValueError("val_ratio and test_ratio must be in [0, 1)")
+    if val_ratio + test_ratio >= 1.0:
+        raise ValueError(
+            f"val_ratio + test_ratio must be < 1.0 "
+            f"(got {val_ratio} + {test_ratio} = {val_ratio + test_ratio})"
+        )
+    if not records:
+        return
+
+    rng = random.Random(seed)
+
+    train: List[SessionRecord] = []
+    val:   List[SessionRecord] = []
+    test:  List[SessionRecord] = []
+
+    if stratify_by == "subject":
+        per_subject: dict = {}
+        for r in records:
+            per_subject.setdefault(r.subject_id, []).append(r)
+        for subj in sorted(per_subject):
+            recs = per_subject[subj][:]
+            rng.shuffle(recs)
+            n = len(recs)
+            n_test = max(1, int(round(n * test_ratio))) if test_ratio > 0 and n > 1 else 0
+            n_val  = max(1, int(round(n * val_ratio))) if val_ratio  > 0 and (n - n_test) > 1 else 0
+            # Edge case: very few sessions — favour train, then test, then val.
+            n_test = min(n_test, max(0, n - 1))
+            n_val  = min(n_val,  max(0, n - n_test - 1))
+            test.extend(recs[:n_test])
+            val.extend(recs[n_test:n_test + n_val])
+            train.extend(recs[n_test + n_val:])
+    else:
+        shuffled = records[:]
+        rng.shuffle(shuffled)
+        n = len(shuffled)
+        n_test = int(round(n * test_ratio))
+        n_val  = int(round(n * val_ratio))
+        test  = shuffled[:n_test]
+        val   = shuffled[n_test:n_test + n_val]
+        train = shuffled[n_test + n_val:]
+
+    if not train:
+        # Shouldn't happen with the validations above, but guard anyway.
+        return
+
+    yield {
+        "id": (f"holdout__val{int(val_ratio*100)}_test{int(test_ratio*100)}"
+               f"__seed{seed}__strat-{stratify_by}"),
+        "train": train,
+        "val":   val,
+        "test":  test if test else train[:0],
+        "split_kind": "holdout",
+        "ratios": {
+            "val": val_ratio, "test": test_ratio,
+            "train": 1.0 - val_ratio - test_ratio,
+        },
+        "stratify_by": stratify_by,
+    }
+
+
+# ---------------------------------------------------------------------------
 # Registry — used by the runner so YAML can name a strategy by string.
 # ---------------------------------------------------------------------------
 
@@ -218,6 +316,7 @@ STRATEGIES = {
     "loso_subject":           leave_one_subject_out,
     "cross_domain":           cross_domain,
     "k_fold_subjects":        k_fold_subjects,
+    "holdout_split":          holdout_split,
 }
 
 

@@ -50,6 +50,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem, QHeaderView, QSplitter,
     QScrollArea, QFileDialog, QMessageBox, QTabWidget, QFrame,
     QTextEdit, QProgressBar,
+    QTreeWidget, QTreeWidgetItem, QSlider,
 )
 
 from playagain_pipeline.gui.widgets.busy_overlay import run_blocking
@@ -112,6 +113,7 @@ _CV_DESCRIPTIONS = {
     "within_session":   "Within-Session  (temporal tail split — optimistic baseline)",
     "k_fold_subjects":  "k-Fold over subjects",
     "cross_domain":     "Cross-Domain  (pipeline ↔ unity)",
+    "holdout_split":    "Holdout  (Train / Val / Test ratios — for tuning)",
 }
 
 
@@ -305,19 +307,69 @@ class ValidationTab(QWidget):
         domain_row.addWidget(QLabel("Domains:"))
         self.cb_pipeline = QCheckBox("pipeline")
         self.cb_pipeline.setChecked(True)
-        self.cb_pipeline.toggled.connect(self._refresh_subject_list)
+        self.cb_pipeline.toggled.connect(self._refresh_pickers)
         domain_row.addWidget(self.cb_pipeline)
         self.cb_unity = QCheckBox("unity")
-        self.cb_unity.toggled.connect(self._refresh_subject_list)
+        self.cb_unity.toggled.connect(self._refresh_pickers)
         domain_row.addWidget(self.cb_unity)
         domain_row.addStretch()
         data_lay.addLayout(domain_row)
 
-        data_lay.addWidget(QLabel("Subjects (multi-select; empty = all):"))
+        # Two-tab picker: pick by subject (fast) or by individual session
+        # (precise). Whichever tab is active when the user hits Run is
+        # what populates DataSelection — Subject tab → DataSelection.subjects,
+        # Session tab → DataSelection.explicit (a list of "subject/session_id").
+        self._data_tabs = QTabWidget()
+
+        # Tab 1 — pick subjects
+        subj_tab = QWidget()
+        subj_lay = QVBoxLayout(subj_tab)
+        subj_lay.setContentsMargins(4, 4, 4, 4)
+        subj_lay.addWidget(QLabel(
+            "Multi-select subjects (empty = all matching the domain filter)."
+        ))
         self.subject_list = QListWidget()
         self.subject_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
-        self.subject_list.setMaximumHeight(110)
-        data_lay.addWidget(self.subject_list)
+        self.subject_list.setMinimumHeight(110)
+        subj_lay.addWidget(self.subject_list)
+        self._data_tabs.addTab(subj_tab, "By subject")
+
+        # Tab 2 — pick individual sessions
+        sess_tab = QWidget()
+        sess_lay = QVBoxLayout(sess_tab)
+        sess_lay.setContentsMargins(4, 4, 4, 4)
+        sess_help = QLabel(
+            "Tick the exact sessions to include. Tick a subject node "
+            "to toggle all of its sessions at once."
+        )
+        sess_help.setWordWrap(True)
+        sess_help.setStyleSheet("color: #64748b; font-size: 10px;")
+        sess_lay.addWidget(sess_help)
+
+        self.session_tree = QTreeWidget()
+        self.session_tree.setHeaderLabels(["Subject / Session", "Channels", "SR"])
+        self.session_tree.setMinimumHeight(160)
+        self.session_tree.itemChanged.connect(self._on_session_tree_changed)
+        sess_lay.addWidget(self.session_tree)
+
+        sess_btn_row = QHBoxLayout()
+        sess_all = QPushButton("Tick all")
+        sess_all.setFixedHeight(22)
+        sess_all.clicked.connect(lambda: self._set_all_session_ticks(True))
+        sess_btn_row.addWidget(sess_all)
+        sess_none = QPushButton("Untick all")
+        sess_none.setFixedHeight(22)
+        sess_none.clicked.connect(lambda: self._set_all_session_ticks(False))
+        sess_btn_row.addWidget(sess_none)
+        self.sess_count_lbl = QLabel("0 selected")
+        self.sess_count_lbl.setStyleSheet("color: #64748b; font-size: 10px;")
+        sess_btn_row.addStretch()
+        sess_btn_row.addWidget(self.sess_count_lbl)
+        sess_lay.addLayout(sess_btn_row)
+
+        self._data_tabs.addTab(sess_tab, "By session")
+
+        data_lay.addWidget(self._data_tabs)
 
         refresh_btn = QPushButton("↻ Re-scan corpus")
         refresh_btn.clicked.connect(self._refresh_corpus)
@@ -390,6 +442,10 @@ class ValidationTab(QWidget):
         self.xd_test_combo.addItems(["unity", "pipeline"])
         xd_row.addRow("Test on (cross-domain):", self.xd_test_combo)
         cv_lay.addWidget(self._xd_container)
+
+        # holdout train/val/test ratios (only relevant for holdout_split)
+        self._holdout_container = self._build_holdout_controls()
+        cv_lay.addWidget(self._holdout_container)
 
         # Initialise visibility
         self._on_cv_changed()
@@ -515,21 +571,103 @@ class ValidationTab(QWidget):
         self._corpus = SessionCorpus(self.data_dir)
         self._corpus.discover()
         self.corpus_summary_lbl.setText(self._corpus.summary().replace("\n", "  ·  "))
-        self._refresh_subject_list()
+        self._refresh_pickers()
 
-    def _refresh_subject_list(self):
+    def _refresh_pickers(self):
+        """Re-populate both the subject list and the session tree from the
+        current domain filter."""
         domains = self._selected_domains()
         # When no domain is checked, show all subjects rather than nothing —
-        # an empty domain selection is more likely "don't filter" than "hide all".
+        # an empty domain selection is more likely "don't filter" than
+        # "hide all".
         recs = self._corpus.filter(domains=domains) if domains else self._corpus.all()
-        subjects = sorted({r.subject_id for r in recs})
 
+        # ── Subject list ────────────────────────────────────────────────
+        previously_selected = set(self._selected_subjects() or [])
         self.subject_list.clear()
-        for s in subjects:
+        for s in sorted({r.subject_id for r in recs}):
             n = sum(1 for r in recs if r.subject_id == s)
             item = QListWidgetItem(f"{s}  ({n} sessions)")
             item.setData(Qt.ItemDataRole.UserRole, s)
             self.subject_list.addItem(item)
+            if s in previously_selected:
+                item.setSelected(True)
+
+        # ── Session tree ────────────────────────────────────────────────
+        previously_ticked = set(self._selected_sessions() or [])
+        self.session_tree.blockSignals(True)
+        try:
+            self.session_tree.clear()
+            recs_by_subject: Dict[str, list] = {}
+            for r in recs:
+                recs_by_subject.setdefault(r.subject_id, []).append(r)
+
+            for subj in sorted(recs_by_subject):
+                subj_recs = sorted(recs_by_subject[subj],
+                                   key=lambda r: r.session_id)
+                subj_item = QTreeWidgetItem([subj, "", ""])
+                subj_item.setFlags(
+                    subj_item.flags()
+                    | Qt.ItemFlag.ItemIsUserCheckable
+                    | Qt.ItemFlag.ItemIsAutoTristate
+                )
+                subj_item.setCheckState(0, Qt.CheckState.Unchecked)
+                f = subj_item.font(0); f.setBold(True); subj_item.setFont(0, f)
+                subj_item.setData(0, Qt.ItemDataRole.UserRole, ("subject", subj))
+                self.session_tree.addTopLevelItem(subj_item)
+
+                for rec in subj_recs:
+                    sess_item = QTreeWidgetItem([
+                        rec.session_id,
+                        str(rec.num_channels) if rec.num_channels else "?",
+                        f"{int(rec.sampling_rate)} Hz" if rec.sampling_rate else "?",
+                    ])
+                    sess_item.setFlags(
+                        sess_item.flags() | Qt.ItemFlag.ItemIsUserCheckable
+                    )
+                    key = f"{rec.subject_id}/{rec.session_id}"
+                    sess_item.setData(0, Qt.ItemDataRole.UserRole,
+                                      ("session", key))
+                    sess_item.setCheckState(
+                        0,
+                        Qt.CheckState.Checked
+                        if key in previously_ticked
+                        else Qt.CheckState.Unchecked,
+                    )
+                    subj_item.addChild(sess_item)
+
+                subj_item.setExpanded(True)
+            self.session_tree.resizeColumnToContents(0)
+        finally:
+            self.session_tree.blockSignals(False)
+        self._update_session_count()
+
+    @Slot()
+    def _on_session_tree_changed(self, *_):
+        self._update_session_count()
+
+    def _update_session_count(self):
+        n = len(self._selected_sessions() or [])
+        total = sum(
+            self.session_tree.topLevelItem(i).childCount()
+            for i in range(self.session_tree.topLevelItemCount())
+        )
+        self.sess_count_lbl.setText(f"{n} of {total} selected")
+
+    def _set_all_session_ticks(self, on: bool):
+        state = Qt.CheckState.Checked if on else Qt.CheckState.Unchecked
+        self.session_tree.blockSignals(True)
+        try:
+            for i in range(self.session_tree.topLevelItemCount()):
+                top = self.session_tree.topLevelItem(i)
+                top.setCheckState(0, state)
+                # Children inherit from parent due to ItemIsAutoTristate,
+                # but be explicit so the visual update is immediate.
+                for j in range(top.childCount()):
+                    top.child(j).setCheckState(0, state)
+        finally:
+            self.session_tree.blockSignals(False)
+        self._update_session_count()
 
     def _selected_domains(self) -> List[str]:
         out = []
@@ -545,11 +683,109 @@ class ValidationTab(QWidget):
             return None  # → "all"
         return [it.data(Qt.ItemDataRole.UserRole) for it in items]
 
+    def _selected_sessions(self) -> Optional[List[str]]:
+        """Return ticked sessions in the tree as ``["subject/session_id", ...]``."""
+        keys: List[str] = []
+        for i in range(self.session_tree.topLevelItemCount()):
+            top = self.session_tree.topLevelItem(i)
+            for j in range(top.childCount()):
+                child = top.child(j)
+                if child.checkState(0) == Qt.CheckState.Checked:
+                    kind, key = child.data(0, Qt.ItemDataRole.UserRole)
+                    if kind == "session":
+                        keys.append(key)
+        return keys or None
+
+    def _data_picker_mode(self) -> str:
+        """Which data sub-tab is active: 'subjects' or 'sessions'."""
+        return "sessions" if self._data_tabs.currentIndex() == 1 else "subjects"
+
+    # ------------------------------------------------------------------
+    # Holdout-ratio controls (Train / Val / Test)
+    # ------------------------------------------------------------------
+
+    def _build_holdout_controls(self) -> QWidget:
+        """Two sliders + live "train / val / test = X / Y / Z %" readout."""
+        wrap = QWidget()
+        lay = QVBoxLayout(wrap)
+        lay.setContentsMargins(0, 4, 0, 0)
+        lay.setSpacing(2)
+
+        info = QLabel(
+            "A single fold with explicit train / val / test ratios. "
+            "Sessions are split — never windows from the same session."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #64748b; font-size: 10px;")
+        lay.addWidget(info)
+
+        # Val ratio slider
+        val_row = QHBoxLayout()
+        val_row.addWidget(QLabel("Val %:"))
+        self.holdout_val_slider = QSlider(Qt.Orientation.Horizontal)
+        self.holdout_val_slider.setRange(0, 50)   # percent
+        self.holdout_val_slider.setValue(15)
+        self.holdout_val_slider.valueChanged.connect(self._update_holdout_readout)
+        val_row.addWidget(self.holdout_val_slider, 1)
+        self.holdout_val_lbl = QLabel("15%")
+        self.holdout_val_lbl.setMinimumWidth(34)
+        val_row.addWidget(self.holdout_val_lbl)
+        lay.addLayout(val_row)
+
+        # Test ratio slider
+        test_row = QHBoxLayout()
+        test_row.addWidget(QLabel("Test %:"))
+        self.holdout_test_slider = QSlider(Qt.Orientation.Horizontal)
+        self.holdout_test_slider.setRange(5, 50)
+        self.holdout_test_slider.setValue(15)
+        self.holdout_test_slider.valueChanged.connect(self._update_holdout_readout)
+        test_row.addWidget(self.holdout_test_slider, 1)
+        self.holdout_test_lbl = QLabel("15%")
+        self.holdout_test_lbl.setMinimumWidth(34)
+        test_row.addWidget(self.holdout_test_lbl)
+        lay.addLayout(test_row)
+
+        # Stratification choice
+        strat_row = QHBoxLayout()
+        strat_row.addWidget(QLabel("Stratify by:"))
+        self.holdout_strat_combo = QComboBox()
+        self.holdout_strat_combo.addItem("subject (recommended)", userData="subject")
+        self.holdout_strat_combo.addItem("none (global shuffle)", userData="none")
+        strat_row.addWidget(self.holdout_strat_combo, 1)
+        lay.addLayout(strat_row)
+
+        # Live readout
+        self.holdout_summary_lbl = QLabel("")
+        self.holdout_summary_lbl.setStyleSheet(
+            "color: #06b6d4; font-weight: 600; font-size: 11px;"
+        )
+        lay.addWidget(self.holdout_summary_lbl)
+
+        self._update_holdout_readout()
+        return wrap
+
+    def _update_holdout_readout(self, *_):
+        v = self.holdout_val_slider.value()
+        t = self.holdout_test_slider.value()
+        # Cap test if val + test would exceed 95% so train always has data.
+        if v + t > 95:
+            t = 95 - v
+            self.holdout_test_slider.blockSignals(True)
+            self.holdout_test_slider.setValue(t)
+            self.holdout_test_slider.blockSignals(False)
+        train = 100 - v - t
+        self.holdout_val_lbl.setText(f"{v}%")
+        self.holdout_test_lbl.setText(f"{t}%")
+        self.holdout_summary_lbl.setText(
+            f"Train / Val / Test  =  {train}% / {v}% / {t}%"
+        )
+
     @Slot()
     def _on_cv_changed(self):
         key = self.cv_combo.currentData()
         self._kfold_container.setVisible(key == "k_fold_subjects")
         self._xd_container.setVisible(key == "cross_domain")
+        self._holdout_container.setVisible(key == "holdout_split")
 
     # ------------------------------------------------------------------
     # Build an ExperimentConfig from the live UI state
@@ -570,15 +806,34 @@ class ValidationTab(QWidget):
         elif cv_key == "cross_domain":
             kwargs = {"train_domain": self.xd_train_combo.currentText(),
                       "test_domain":  self.xd_test_combo.currentText()}
+        elif cv_key == "holdout_split":
+            kwargs = {
+                "val_ratio":   self.holdout_val_slider.value() / 100.0,
+                "test_ratio":  self.holdout_test_slider.value() / 100.0,
+                "seed":        int(self.seed_spin.value()),
+                "stratify_by": self.holdout_strat_combo.currentData(),
+            }
+
+        # Two ways the user can narrow the data:
+        #   * "By subject" tab → DataSelection.subjects (predicate filter)
+        #   * "By session" tab → DataSelection.explicit (allow-list, takes
+        #     precedence over the subject filter inside SessionCorpus.select).
+        if self._data_picker_mode() == "sessions":
+            data_sel = DataSelection(
+                domains=self._selected_domains() or None,
+                explicit=self._selected_sessions(),
+            )
+        else:
+            data_sel = DataSelection(
+                subjects=self._selected_subjects(),
+                domains=self._selected_domains() or None,
+            )
 
         return ExperimentConfig(
             name=self.name_edit.text().strip() or "unnamed",
             description="Built from the GUI Validation tab.",
             seed=int(self.seed_spin.value()),
-            data=DataSelection(
-                subjects=self._selected_subjects(),
-                domains=self._selected_domains() or None,
-            ),
+            data=data_sel,
             windowing=WindowingConfig(
                 window_ms=int(self.window_ms.value()),
                 stride_ms=int(self.stride_ms.value()),
@@ -630,8 +885,15 @@ class ValidationTab(QWidget):
         _log(f"Strategy : {cv_label}")
         _log(f"Features : {', '.join(f.name for f in cfg.features)}")
         _log(f"Models   : {', '.join(m.type for m in cfg.models)}")
-        subjects = cfg.data.subjects or ["all"]
-        _log(f"Subjects : {', '.join(subjects)}")
+        if cfg.data.explicit:
+            _log(f"Sessions : {len(cfg.data.explicit)} explicit session(s)")
+        else:
+            subjects = cfg.data.subjects or ["all"]
+            _log(f"Subjects : {', '.join(subjects)}")
+        if cfg.cv.strategy == "holdout_split":
+            v = float(cfg.cv.kwargs.get("val_ratio", 0.0)) * 100
+            t = float(cfg.cv.kwargs.get("test_ratio", 0.0)) * 100
+            _log(f"Ratios   : train {100 - v - t:.0f}% / val {v:.0f}% / test {t:.0f}%")
         _log("─" * 42)
 
         # Animate step label while running
@@ -699,8 +961,28 @@ class ValidationTab(QWidget):
     # ------------------------------------------------------------------
 
     def _populate_results(self, result: RunResult):
+        # Decide whether any fold actually has a val score — if so, show
+        # the val columns; if not, hide them to keep the tables compact.
+        any_val = any(fr.val_accuracy is not None for fr in result.folds)
+
         # Aggregate table
+        agg_headers = ["Model", "Folds", "Accuracy", "Macro-F1"]
+        if any_val:
+            agg_headers += ["Val Accuracy", "Val Macro-F1"]
+        self.agg_table.setColumnCount(len(agg_headers))
+        self.agg_table.setHorizontalHeaderLabels(agg_headers)
+
         agg = result.aggregate()
+        # Pre-compute val means per model from the per-fold list because
+        # the aggregate dict doesn't carry val numbers (we keep the
+        # public RunResult.aggregate() API stable).
+        val_by_model: Dict[str, list] = {}
+        for fr in result.folds:
+            if fr.val_accuracy is not None:
+                val_by_model.setdefault(fr.model_type, []).append(
+                    (fr.val_accuracy, fr.val_macro_f1 or 0.0)
+                )
+
         self.agg_table.setRowCount(len(agg))
         for row, (model, m) in enumerate(sorted(agg.items())):
             self.agg_table.setItem(row, 0, QTableWidgetItem(model))
@@ -713,16 +995,56 @@ class ValidationTab(QWidget):
                 row, 3,
                 QTableWidgetItem(f"{m['macro_f1_mean']:.3f} ± {m['macro_f1_std']:.3f}")
             )
+            if any_val:
+                vals = val_by_model.get(model, [])
+                if vals:
+                    import numpy as _np
+                    accs = _np.array([v[0] for v in vals], dtype=float)
+                    f1s  = _np.array([v[1] for v in vals], dtype=float)
+                    self.agg_table.setItem(
+                        row, 4,
+                        QTableWidgetItem(f"{accs.mean():.3f} ± {accs.std():.3f}")
+                    )
+                    self.agg_table.setItem(
+                        row, 5,
+                        QTableWidgetItem(f"{f1s.mean():.3f} ± {f1s.std():.3f}")
+                    )
+                else:
+                    self.agg_table.setItem(row, 4, QTableWidgetItem("—"))
+                    self.agg_table.setItem(row, 5, QTableWidgetItem("—"))
 
         # Per-fold table
+        fold_headers = ["Fold", "Model", "n_train", "n_test",
+                        "Accuracy", "Macro-F1"]
+        if any_val:
+            fold_headers = ["Fold", "Model", "n_train", "n_val", "n_test",
+                            "Accuracy", "Val Accuracy", "Macro-F1"]
+        self.fold_table.setColumnCount(len(fold_headers))
+        self.fold_table.setHorizontalHeaderLabels(fold_headers)
+
         self.fold_table.setRowCount(len(result.folds))
         for row, fr in enumerate(result.folds):
-            self.fold_table.setItem(row, 0, QTableWidgetItem(fr.fold_id))
-            self.fold_table.setItem(row, 1, QTableWidgetItem(fr.model_type))
-            self.fold_table.setItem(row, 2, QTableWidgetItem(str(fr.n_train_windows)))
-            self.fold_table.setItem(row, 3, QTableWidgetItem(str(fr.n_test_windows)))
-            self.fold_table.setItem(row, 4, QTableWidgetItem(f"{fr.accuracy:.3f}"))
-            self.fold_table.setItem(row, 5, QTableWidgetItem(f"{fr.macro_f1:.3f}"))
+            if any_val:
+                self.fold_table.setItem(row, 0, QTableWidgetItem(fr.fold_id))
+                self.fold_table.setItem(row, 1, QTableWidgetItem(fr.model_type))
+                self.fold_table.setItem(row, 2, QTableWidgetItem(str(fr.n_train_windows)))
+                self.fold_table.setItem(row, 3, QTableWidgetItem(str(fr.n_val_windows)))
+                self.fold_table.setItem(row, 4, QTableWidgetItem(str(fr.n_test_windows)))
+                self.fold_table.setItem(row, 5, QTableWidgetItem(f"{fr.accuracy:.3f}"))
+                self.fold_table.setItem(
+                    row, 6,
+                    QTableWidgetItem(
+                        f"{fr.val_accuracy:.3f}" if fr.val_accuracy is not None else "—"
+                    ),
+                )
+                self.fold_table.setItem(row, 7, QTableWidgetItem(f"{fr.macro_f1:.3f}"))
+            else:
+                self.fold_table.setItem(row, 0, QTableWidgetItem(fr.fold_id))
+                self.fold_table.setItem(row, 1, QTableWidgetItem(fr.model_type))
+                self.fold_table.setItem(row, 2, QTableWidgetItem(str(fr.n_train_windows)))
+                self.fold_table.setItem(row, 3, QTableWidgetItem(str(fr.n_test_windows)))
+                self.fold_table.setItem(row, 4, QTableWidgetItem(f"{fr.accuracy:.3f}"))
+                self.fold_table.setItem(row, 5, QTableWidgetItem(f"{fr.macro_f1:.3f}"))
 
         if result.output_dir is not None:
             self.output_path_lbl.setText(f"Wrote: {result.output_dir}")
@@ -786,9 +1108,32 @@ class ValidationTab(QWidget):
         domains = set(cfg.data.domains or [])
         self.cb_pipeline.setChecked("pipeline" in domains or not domains)
         self.cb_unity.setChecked("unity" in domains)
-        self._refresh_subject_list()
+        self._refresh_pickers()
 
-        if cfg.data.subjects:
+        # Subjects vs explicit sessions — switch to whichever tab the
+        # config actually populated, so the user sees a faithful
+        # reproduction of what the run will use.
+        if cfg.data.explicit:
+            self._data_tabs.setCurrentIndex(1)   # By session
+            wanted = set(cfg.data.explicit)
+            self.session_tree.blockSignals(True)
+            try:
+                for i in range(self.session_tree.topLevelItemCount()):
+                    top = self.session_tree.topLevelItem(i)
+                    for j in range(top.childCount()):
+                        child = top.child(j)
+                        kind, key = child.data(0, Qt.ItemDataRole.UserRole)
+                        if kind == "session":
+                            child.setCheckState(
+                                0,
+                                Qt.CheckState.Checked if key in wanted
+                                else Qt.CheckState.Unchecked,
+                            )
+            finally:
+                self.session_tree.blockSignals(False)
+            self._update_session_count()
+        elif cfg.data.subjects:
+            self._data_tabs.setCurrentIndex(0)   # By subject
             wanted = set(cfg.data.subjects)
             for i in range(self.subject_list.count()):
                 it = self.subject_list.item(i)
@@ -810,6 +1155,18 @@ class ValidationTab(QWidget):
             ed = cfg.cv.kwargs.get("test_domain", "unity")
             self.xd_train_combo.setCurrentText(td)
             self.xd_test_combo.setCurrentText(ed)
+        elif cfg.cv.strategy == "holdout_split":
+            self.holdout_val_slider.setValue(
+                int(round(float(cfg.cv.kwargs.get("val_ratio", 0.15)) * 100))
+            )
+            self.holdout_test_slider.setValue(
+                int(round(float(cfg.cv.kwargs.get("test_ratio", 0.15)) * 100))
+            )
+            strat = cfg.cv.kwargs.get("stratify_by", "subject")
+            for i in range(self.holdout_strat_combo.count()):
+                if self.holdout_strat_combo.itemData(i) == strat:
+                    self.holdout_strat_combo.setCurrentIndex(i)
+                    break
 
     # ------------------------------------------------------------------
     # Open output folder in the OS file manager

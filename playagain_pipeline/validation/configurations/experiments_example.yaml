@@ -77,3 +77,30 @@ cv:
 #   kwargs:
 #     train_domain: pipeline
 #     test_domain:  unity
+
+# ──────────────────────────────────────────────────────────────────────
+# A third example: classic Train/Val/Test holdout with 70/15/15 ratios.
+# Useful when tuning a deep model (the val split is fed straight into
+# model.train() so MLP/CNN/AttentionNet can use it for early stopping).
+# ──────────────────────────────────────────────────────────────────────
+#
+# name: tune_attentionnet_holdout
+# data:
+#   subjects: [VP_01]
+#   explicit:
+#     - VP_01/2026-03-24_08-57-34_3rep
+#     - VP_01/2026-03-25_13-36-55_3rep
+#     - VP_01/2026-03-26_12-38-48_3rep
+# windowing: { window_ms: 200, stride_ms: 50 }
+# features:
+#   - { name: mav }
+#   - { name: rms }
+# models:
+#   - { type: attention_net, params: { epochs: 50 } }
+# cv:
+#   strategy: holdout_split
+#   kwargs:
+#     val_ratio:   0.15
+#     test_ratio:  0.15
+#     stratify_by: subject     # or "none"
+#     seed:        42

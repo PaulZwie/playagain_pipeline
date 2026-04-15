@@ -92,10 +92,18 @@ will get bit-identical numbers.
 | `loso_subject`     | all sessions of one subj  | The honest single number. Default headline metric for a paper.              |
 | `k_fold_subjects`  | k subject groups          | Use when LOSO is too expensive (>20 subjects).                              |
 | `cross_domain`     | by `source_domain`        | "Does a model trained on pipeline data still work in the Unity game?"       |
+| `holdout_split`    | configurable ratios       | Train / Val / Test holdout (deep-model tuning, early stopping). Stratified by subject by default. |
 
 The Unity ↔ pipeline cross-domain experiment is the one the C# recorder
 was built for. It directly answers whether the GUI training results
 transfer to the real in-game stream.
+
+`holdout_split` is the only strategy that produces a separate
+**validation set**. When present, the runner passes it to the model's
+`train()` method as `X_val` / `y_val`, so deep-learning models
+(`mlp`, `cnn`, `attention_net`, `mstnet`) can use it for early stopping
+and live training curves. Classical models ignore it gracefully and
+report the test-set numbers only.
 
 ## How an experiment is glued to the existing pipeline
 

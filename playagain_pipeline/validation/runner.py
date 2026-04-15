@@ -70,6 +70,11 @@ class FoldResult:
     per_class_f1:   Dict[str, float] = field(default_factory=dict)
     train_seconds:  float = 0.0
     inference_ms:   float = 0.0
+    # Validation-set metrics — populated only when the CV strategy
+    # provides an explicit val split (currently: holdout_split).
+    n_val_windows:  int = 0
+    val_accuracy:   Optional[float] = None
+    val_macro_f1:   Optional[float] = None
     extra:          Dict[str, Any] = field(default_factory=dict)
 
 
@@ -201,7 +206,10 @@ class ValidationRunner:
         fold: Dict[str, Any],
     ) -> Optional[FoldResult]:
         try:
-            X_train, y_train, X_test, y_test, label_names = self._materialise_fold(cfg, fold)
+            (X_train, y_train,
+             X_val,   y_val,
+             X_test,  y_test,
+             label_names) = self._materialise_fold(cfg, fold)
         except Exception as e:  # noqa: BLE001
             log.exception("Failed to materialise fold %s: %s", fold.get("id"), e)
             return None
@@ -212,7 +220,12 @@ class ValidationRunner:
 
         t0 = time.time()
         try:
-            model, train_meta = self._fit_model(model_cfg, X_train, y_train)
+            model, train_meta = self._fit_model(
+                cfg, model_cfg,
+                X_train, y_train,
+                X_val if len(X_val) > 0 else None,
+                y_val if len(X_val) > 0 else None,
+            )
         except Exception as e:  # noqa: BLE001
             log.exception("Model fit failed for fold %s: %s", fold.get("id"), e)
             return None
@@ -224,14 +237,27 @@ class ValidationRunner:
             log.exception("Evaluation failed for fold %s: %s", fold.get("id"), e)
             return None
 
+        # Optional val metrics
+        val_acc = val_f1 = None
+        if len(X_val) > 0:
+            try:
+                val_metrics = self._evaluate(model, X_val, y_val, label_names)
+                val_acc = val_metrics["accuracy"]
+                val_f1  = val_metrics["macro_f1"]
+            except Exception as e:  # noqa: BLE001
+                log.warning("Val evaluation failed for fold %s: %s", fold.get("id"), e)
+
         return FoldResult(
             fold_id=str(fold["id"]),
             model_type=model_cfg.type,
             n_train_windows=int(len(X_train)),
             n_test_windows=int(len(X_test)),
+            n_val_windows=int(len(X_val)),
             accuracy=metrics["accuracy"],
             macro_f1=metrics["macro_f1"],
             per_class_f1=metrics.get("per_class_f1", {}),
+            val_accuracy=val_acc,
+            val_macro_f1=val_f1,
             train_seconds=train_secs,
             inference_ms=metrics.get("inference_ms", 0.0),
             extra={"train_meta": train_meta},
@@ -247,27 +273,31 @@ class ValidationRunner:
         self,
         cfg: ExperimentConfig,
         fold: Dict[str, Any],
-    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, Dict[int, str]]:
+    ) -> Tuple[np.ndarray, np.ndarray,
+               np.ndarray, np.ndarray,
+               np.ndarray, np.ndarray,
+               Dict[int, str]]:
         """
-        Turn a fold of SessionRecords into ``(X_train, y_train, X_test,
-        y_test, label_names)``.
+        Turn a fold of SessionRecords into
 
-        Strategy: load the underlying ``RecordingSession`` objects via
-        ``DataManager.load_session`` and feed them straight into
-        ``DataManager.create_dataset``. That reuses the *exact* same
-        windowing / preprocessing / per-session-rotation code path the
-        GUI Train tab uses, which is what we want — the validation
-        results then describe the production pipeline byte-for-byte,
-        not a parallel implementation.
+            (X_train, y_train, X_val, y_val, X_test, y_test, label_names)
 
-        For ``within_session`` folds (``split_kind == "temporal_tail"``)
-        the train and test record lists point at the same recording, so
-        we extract windows once and split them temporally afterwards.
+        For folds that don't define a separate validation set
+        (everything except ``holdout_split``) the val arrays are
+        returned empty (shape ``(0,)``) — the caller checks ``len()``
+        before passing them to the model.
+
+        Reuses ``DataManager.create_dataset`` so the windowing /
+        per-session-rotation / bad-channel / feature-extraction code
+        path is identical to the one the GUI Train tab uses.
         """
         from playagain_pipeline.core.data_manager import DataManager  # lazy
         dm = DataManager(self.data_dir)
 
         feature_config = self._build_feature_config(cfg)
+
+        def _empty():
+            return np.empty((0,)), np.empty((0,), dtype=int), {}
 
         def _load_sessions(records):
             sess = []
@@ -282,52 +312,42 @@ class ValidationRunner:
         def _make_xy(records, name_suffix: str):
             sessions = _load_sessions(records)
             if not sessions:
-                return np.empty((0,)), np.empty((0,), dtype=int), {}
-            
-            from collections import defaultdict
-            sessions_by_ch = defaultdict(list)
-            for s in sessions:
-                sessions_by_ch[int(s.metadata.num_channels)].append(s)
-            
-            X_list, y_list = [], []
-            label_names = {}
-            for ch_count, ch_sessions in sessions_by_ch.items():
-                ds = dm.create_dataset(
-                    name=f"_validation_tmp_{name_suffix}_{ch_count}ch",
-                    sessions=ch_sessions,
-                    window_size_ms=cfg.windowing.window_ms,
-                    window_stride_ms=cfg.windowing.stride_ms,
-                    feature_config=feature_config,
-                    use_per_session_rotation=False,
-                )
-                X_list.append(ds["X"])
-                y_list.append(ds["y"])
-                label_names.update(ds["metadata"].get("label_names", {}))
-                
-            if not X_list:
-                return np.empty((0,)), np.empty((0,), dtype=int), {}
-                
-            X_all = np.concatenate(X_list, axis=0)
-            y_all = np.concatenate(y_list, axis=0)
-            return X_all, y_all, label_names
+                return _empty()
+            ds = dm.create_dataset(
+                name=f"_validation_tmp_{name_suffix}",
+                sessions=sessions,
+                window_size_ms=cfg.windowing.window_ms,
+                window_stride_ms=cfg.windowing.stride_ms,
+                feature_config=feature_config,
+                use_per_session_rotation=False,
+            )
+            return ds["X"], ds["y"], ds["metadata"].get("label_names", {})
 
         is_within = fold.get("split_kind") == "temporal_tail"
         if is_within:
-            # Train and test records point at the same session(s); extract
-            # everything once, then split temporally so the *last*
-            # ``test_fraction`` of each session lands in the test set.
             X_all, y_all, label_names = _make_xy(fold["train"], "within")
             if len(X_all) == 0:
-                return X_all, y_all, X_all, y_all, label_names
+                return X_all, y_all, *_empty()[:2], X_all, y_all, label_names
             test_frac = float(fold.get("test_fraction", 0.2))
             cut = int(len(X_all) * (1.0 - test_frac))
-            return X_all[:cut], y_all[:cut], X_all[cut:], y_all[cut:], label_names
+            return (X_all[:cut], y_all[:cut],
+                    *_empty()[:2],
+                    X_all[cut:], y_all[cut:],
+                    label_names)
 
         X_tr, y_tr, names_tr = _make_xy(fold["train"], "train")
         X_te, y_te, names_te = _make_xy(fold["test"],  "test")
-        # Merge label-name dicts (both should agree on shared labels).
-        label_names = {**names_tr, **names_te}
-        return X_tr, y_tr, X_te, y_te, label_names
+
+        # holdout_split (and any future strategy) may attach a separate
+        # val record list. If absent, return empty val arrays.
+        val_records = fold.get("val") or []
+        if val_records:
+            X_va, y_va, names_va = _make_xy(val_records, "val")
+        else:
+            X_va, y_va, names_va = _empty()
+
+        label_names = {**names_tr, **names_va, **names_te}
+        return X_tr, y_tr, X_va, y_va, X_te, y_te, label_names
 
     @staticmethod
     def _build_feature_config(cfg: ExperimentConfig) -> Optional[Dict[str, Any]]:
@@ -344,23 +364,55 @@ class ValidationRunner:
         }
 
 
-    def _fit_model(self, model_cfg, X_train, y_train):
+    def _fit_model(self, cfg: ExperimentConfig, model_cfg,
+                   X_train, y_train, X_val=None, y_val=None):
+        """
+        Fit a model. If a held-out val set is provided, pass it
+        directly to the model's ``train()`` method so deep-learning
+        models can use it for early stopping / learning-rate scheduling
+        / live curves. When no val set is provided we fall back to
+        ``ModelManager.train_model`` which performs its own internal
+        80/20 split — keeping behaviour identical to the GUI Train tab.
+        """
         from playagain_pipeline.models.classifier import ModelManager  # lazy
+
         mm = ModelManager(self.data_dir / "models")
         model = mm.create_model(
             model_cfg.type,
             name=f"_validation_{model_cfg.type}",
             **(model_cfg.params or {}),
         )
-        # ModelManager.train_model expects a dataset dict in the same
-        # shape DataManager.create_dataset produces.
+
+        if X_val is not None and len(X_val) > 0:
+            # Use the supplied val split — gives the model a real
+            # held-out evaluation set rather than an internal re-split
+            # of the training data.
+            train_meta = model.train(
+                X_train, y_train,
+                X_val, y_val,
+                window_size_ms=cfg.windowing.window_ms,
+                sampling_rate=getattr(cfg.windowing, "sampling_rate", 2000),
+                num_channels=int(X_train.shape[-1]) if X_train.ndim >= 2 else 0,
+            )
+            # Don't persist these throwaway models to disk — the
+            # validation run produces its own results dir.
+            return model, train_meta
+
+        # No val supplied → reuse ModelManager.train_model so the
+        # behaviour is byte-identical to the Train tab.
         train_meta = mm.train_model(
             model,
             {
                 "X": X_train,
                 "y": y_train,
-                "metadata": {"name": f"_validation_{model_cfg.type}"},
+                "metadata": {
+                    "name": f"_validation_{model_cfg.type}",
+                    "window_size_ms": cfg.windowing.window_ms,
+                    "sampling_rate": 2000,
+                    "num_channels": int(X_train.shape[-1]) if X_train.ndim >= 2 else 0,
+                },
             },
+            save=False,
         )
         return model, train_meta
 
@@ -463,8 +515,10 @@ def _write_csv(path: Path, folds: List[FoldResult]) -> None:
     import csv
     fieldnames = [
         "fold_id", "model_type",
-        "n_train_windows", "n_test_windows",
-        "accuracy", "macro_f1", "train_seconds", "inference_ms",
+        "n_train_windows", "n_val_windows", "n_test_windows",
+        "accuracy", "macro_f1",
+        "val_accuracy", "val_macro_f1",
+        "train_seconds", "inference_ms",
     ]
     with path.open("w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)

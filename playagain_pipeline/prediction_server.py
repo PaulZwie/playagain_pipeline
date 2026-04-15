@@ -609,7 +609,11 @@ class PredictionServer:
                 for client in self._clients:
                     try:
                         client.sendall(payload)
-                    except (OSError, BrokenPipeError, socket.timeout):
+                    except socket.timeout:
+                        # Transient socket backpressure; keep client connected and
+                        # retry on next payload rather than forcing a disconnect.
+                        continue
+                    except (OSError, BrokenPipeError):
                         disconnected.append(client)
 
                 for client in disconnected:
@@ -626,8 +630,11 @@ class PredictionServer:
             try:
                 client, addr = self._server_socket.accept()
                 client.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
-                # Configure once per client so sender loop stays lightweight.
-                client.settimeout(0.05)
+                client.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+                # Keep client socket in blocking mode.
+                # A very short timeout here can trigger false disconnects when
+                # no Unity->Python traffic is sent for brief periods.
+                client.settimeout(None)
                 
                 with self._clients_lock:
                     self._clients.append(client)
@@ -714,6 +721,9 @@ class PredictionServer:
                             except Exception as e:
                                 print(f"[PredictionServer] Game state callback error: {e}")
 
+                except socket.timeout:
+                    # Non-fatal: keep waiting for game-state messages.
+                    continue
                 except (OSError, IOError):
                     if self._running:
                         break
