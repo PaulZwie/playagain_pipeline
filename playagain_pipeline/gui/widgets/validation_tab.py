@@ -1,35 +1,42 @@
 """
-validation_tab.py
+validation_tab.py  (v2)
+────────────────────────
+GUI front-end for the playagain_pipeline.validation package — reworked
+for clarity, live progress, and comparison across runs.
+
+What's new vs v1
 ─────────────────
-GUI front-end for the playagain_pipeline.validation package.
+1. **Live fold-by-fold progress.** A QThread-based worker drives the
+   runner with a ProgressReporter hook. Users see the current fold
+   index, model, train time, per-fold accuracy, and an ETA computed
+   from the running mean fold time — instead of a featureless spinner.
 
-Replaces the legacy PerformanceReviewTab. The legacy tab grew over time
-into an ad-hoc validation harness (`SessionPickerWidget` +
-`ComparisonWorker` + a feature picker). This widget delivers the same
-goal — comparing models / features across recording sessions — but
-through the new, reproducible, config-driven harness.
+2. **Cancellation.** A Cancel button sets a flag the runner checks
+   between folds. A cancelled run still keeps the folds it has done
+   so the user can inspect partial results.
 
-Design goals
-────────────
-1. **Modular.** Every "knob" is a checkbox or a dropdown — the user
-   picks which features, which models, which CV strategy, and which
-   subjects in a few clicks.
-2. **Reproducible.** Every run is just a temporary
-   :class:`ExperimentConfig` that gets serialised to disk alongside its
-   results. There is a "Save as YAML" button so an exploratory GUI run
-   can be re-run from the CLI later, byte-for-byte.
-3. **Honest.** All splitters operate at session granularity — no
-   window leakage. The default is leave-one-subject-out, which is the
-   single number most appropriate for a paper or thesis.
-4. **Non-blocking.** Heavy work runs through the existing
-   :func:`run_blocking` helper so the GUI stays responsive and the
-   user gets a busy overlay.
+3. **Pre-flight preview.** Before running, a small panel shows
+   "N folds × M models = T evaluations · ~E subjects selected" so
+   mistakes are caught before a 20-minute run.
 
-The widget purposely depends only on the public API of the validation
-package (corpus, config, runner, cv_strategies) and on the existing
-busy-overlay helper. It makes no assumptions about which features /
-models the project happens to ship today — it queries the live
-registries on construction and renders whatever is there.
+4. **Per-class F1 table.** The runner now exposes per-class F1 and a
+   confusion matrix per fold. A dedicated tab on the right aggregates
+   them into a class × model table so you can see which gestures each
+   model struggles with.
+
+5. **Previous runs browser.** A tab lists every run in
+   `data/validation_runs/` with strategy, best model, best accuracy,
+   and an "Open folder" shortcut. Makes it easy to compare today's
+   run with yesterday's without remembering timestamps.
+
+6. **Holdout UI reachable again.** v1 had the full holdout-ratio
+   controls wired up but never added "holdout_split" to the strategy
+   combo. Fixed.
+
+7. **Guardrail warnings** before running:
+   - no sessions matched
+   - only one subject with LOSO (degenerate fold)
+   - very short recordings given the window size
 """
 
 from __future__ import annotations
@@ -38,28 +45,34 @@ import json
 import logging
 import subprocess
 import sys
+import time
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional
 
-from PySide6.QtCore import Qt, Signal, Slot, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtCore import (
+    Qt, Signal, Slot, QTimer, QThread, QObject,
+)
+from PySide6.QtGui import QFont, QColor, QBrush
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QFormLayout,
     QLabel, QGroupBox, QPushButton, QListWidget, QListWidgetItem,
-    QCheckBox, QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit,
+    QCheckBox, QComboBox, QSpinBox, QLineEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QSplitter,
     QScrollArea, QFileDialog, QMessageBox, QTabWidget, QFrame,
     QTextEdit, QProgressBar,
-    QTreeWidget, QTreeWidgetItem, QSlider,
+    QTreeWidget, QTreeWidgetItem, QSlider, QSizePolicy,
 )
 
-from playagain_pipeline.gui.widgets.busy_overlay import run_blocking
 from playagain_pipeline.validation import (
     SessionCorpus,
     ExperimentConfig,
     ValidationRunner,
     RunResult,
-    cv_strategies,
+)
+from playagain_pipeline.validation.runner import (
+    FoldResult,
+    NoopProgress,
 )
 from playagain_pipeline.validation.config import (
     DataSelection, WindowingConfig, FeatureConfig, ModelConfig, CVConfig,
@@ -70,7 +83,7 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# Default knobs — sensible offerings if the live registry queries fail.
+# Defaults
 # ---------------------------------------------------------------------------
 
 _DEFAULT_FEATURES = [
@@ -92,8 +105,6 @@ _DEFAULT_MODELS = [
     ("attention_net", "Transformer attention — strongest temporal model."),
 ]
 
-# Normalise any PascalCase / legacy spelling a saved YAML might contain
-# to the snake_case key the model registry expects.
 _MODEL_KEY_NORMALISE: dict = {
     "lda": "lda", "LDA": "lda",
     "randomforest": "random_forest", "RandomForest": "random_forest",
@@ -110,10 +121,40 @@ _MODEL_KEY_NORMALISE: dict = {
 _CV_DESCRIPTIONS = {
     "loso_subject":     "Leave-One-Subject-Out  (the honest single number)",
     "loso_session":     "Leave-One-Session-Out  (per-session generalisation)",
-    "within_session":   "Within-Session  (temporal tail split — optimistic baseline)",
+    "within_session":   "Within-Session  (temporal tail — optimistic baseline)",
     "k_fold_subjects":  "k-Fold over subjects",
     "cross_domain":     "Cross-Domain  (pipeline ↔ unity)",
-    "holdout_split":    "Holdout  (Train / Val / Test ratios — for tuning)",
+    "holdout_split":    "Holdout  (explicit Train / Val / Test — for tuning)",
+}
+
+# Short help string surfaced in the hover tooltip for each CV strategy.
+# More guidance than the combo label, less than the README.
+_CV_TOOLTIPS = {
+    "loso_subject":
+        "Train on every subject but one, test on the held-out subject. "
+        "Repeat for every subject. Reports how well the pipeline "
+        "generalises to an unseen person — the most honest single "
+        "number for a paper.",
+    "loso_session":
+        "Like LOSO but at session granularity. Good when you have many "
+        "sessions per subject and want to see session-to-session "
+        "drift within the same person.",
+    "within_session":
+        "Train on the first 80% of each session's windows, test on the "
+        "last 20%. Optimistic — windows from the same session share "
+        "hardware placement and user state — but useful as a ceiling.",
+    "k_fold_subjects":
+        "Shuffle subjects, split into k roughly-equal groups, train on "
+        "k-1 and test on the remaining one. Useful when LOSO has too "
+        "many subjects to run quickly.",
+    "cross_domain":
+        "Train only on one domain (pipeline or unity) and test on the "
+        "other. Measures transfer from one recorder to the other.",
+    "holdout_split":
+        "One fold with explicit Train / Val / Test ratios. Best for "
+        "tuning a single model with early stopping — deep models use "
+        "the val split for schedulers; the test split is untouched "
+        "until the final number.",
 }
 
 
@@ -147,7 +188,6 @@ class _CheckboxGroup(QGroupBox):
         for key, description in items:
             cb = QCheckBox(f"{key}")
             cb.setToolTip(description)
-            # QCheckBox.toggled emits a bool; adapt to this group's no-arg signal.
             cb.toggled.connect(lambda _checked: self.selection_changed.emit())
             outer.addWidget(cb)
             self._checkboxes[key] = cb
@@ -175,7 +215,229 @@ class _CheckboxGroup(QGroupBox):
 
 
 # ---------------------------------------------------------------------------
-# The main widget
+# Qt-signal bridge to the runner's ProgressReporter
+# ---------------------------------------------------------------------------
+
+class _ProgressBridge(QObject):
+    """
+    Emits Qt signals from a runner ProgressReporter. The signals are
+    connected via Qt.QueuedConnection so the worker thread can call
+    ProgressReporter methods and the GUI updates land on the UI thread.
+    """
+
+    run_started   = Signal(int, int)            # n_folds, n_models
+    fold_started  = Signal(int, int, str, str)  # idx, total, fold_id, model
+    fold_finished = Signal(int, int, object)    # idx, total, FoldResult
+    run_finished  = Signal(object)              # RunResult
+    log_line      = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cancel = False
+
+    def request_cancel(self) -> None:
+        self._cancel = True
+
+    # ProgressReporter API (called from worker thread) ────────────────
+
+    def on_run_start(self, total_folds, total_models, _records):
+        self.run_started.emit(total_folds, total_models)
+
+    def on_fold_start(self, idx, total, fold_id, model_type):
+        self.fold_started.emit(idx, total, fold_id, model_type)
+
+    def on_fold_done(self, idx, total, fold_result):
+        self.fold_finished.emit(idx, total, fold_result)
+
+    def on_run_done(self, result):
+        self.run_finished.emit(result)
+
+    def log(self, message: str):
+        self.log_line.emit(message)
+
+    def should_cancel(self) -> bool:
+        return self._cancel
+
+
+class _ValidationWorker(QThread):
+    """Runs ValidationRunner.run(cfg, progress) on a worker thread."""
+
+    failed = Signal(str)
+    # run_finished fires on success via the progress bridge; failed()
+    # fires separately if an exception bubbles up.
+
+    def __init__(
+        self,
+        data_dir: Path,
+        cfg: ExperimentConfig,
+        bridge: _ProgressBridge,
+        parent=None,
+    ):
+        super().__init__(parent)
+        self._data_dir = data_dir
+        self._cfg = cfg
+        self._bridge = bridge
+
+    def run(self) -> None:
+        try:
+            runner = ValidationRunner(self._data_dir)
+            runner.run(self._cfg, progress=self._bridge)
+        except Exception:  # noqa: BLE001
+            import traceback
+            self.failed.emit(traceback.format_exc())
+
+
+# ---------------------------------------------------------------------------
+# Previous-runs browser
+# ---------------------------------------------------------------------------
+
+@dataclass
+class _PastRunSummary:
+    path:       Path
+    name:       str
+    timestamp:  str
+    strategy:   str
+    n_folds:    int
+    best_model: str
+    best_acc:   float
+    cancelled:  bool
+
+
+class _RunsBrowser(QWidget):
+    """Lists every run under validation_runs/ with quick 'open' / 'reload'."""
+
+    reload_requested = Signal(object)  # ExperimentConfig
+
+    def __init__(self, runs_root: Path, parent=None):
+        super().__init__(parent)
+        self._runs_root = runs_root
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(6, 6, 6, 6)
+
+        hdr = QHBoxLayout()
+        hdr.addWidget(QLabel("Previous runs"))
+        hdr.addStretch()
+        refresh = QPushButton("↻ Refresh")
+        refresh.setFixedHeight(24)
+        refresh.clicked.connect(self.refresh)
+        hdr.addWidget(refresh)
+        lay.addLayout(hdr)
+
+        self.table = QTableWidget(0, 6)
+        self.table.setHorizontalHeaderLabels(
+            ["When", "Name", "Strategy", "Folds", "Best model", "Best acc"]
+        )
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.table.setSelectionMode(QTableWidget.SelectionMode.SingleSelection)
+        self.table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        lay.addWidget(self.table, 1)
+
+        row = QHBoxLayout()
+        open_btn = QPushButton("Open folder")
+        open_btn.clicked.connect(self._on_open_selected)
+        row.addWidget(open_btn)
+        reload_btn = QPushButton("Reload config ↺")
+        reload_btn.setToolTip("Copy this run's experiment config into the "
+                              "left panel so you can re-run / tweak it.")
+        reload_btn.clicked.connect(self._on_reload_selected)
+        row.addWidget(reload_btn)
+        row.addStretch()
+        lay.addLayout(row)
+
+        self._rows: List[_PastRunSummary] = []
+        self.refresh()
+
+    def refresh(self) -> None:
+        self._rows = self._scan()
+        self.table.setRowCount(len(self._rows))
+        for i, s in enumerate(self._rows):
+            self.table.setItem(i, 0, QTableWidgetItem(s.timestamp))
+            self.table.setItem(i, 1, QTableWidgetItem(s.name))
+            self.table.setItem(i, 2, QTableWidgetItem(s.strategy))
+            self.table.setItem(i, 3, QTableWidgetItem(str(s.n_folds)))
+            self.table.setItem(i, 4, QTableWidgetItem(s.best_model))
+            acc_item = QTableWidgetItem(f"{s.best_acc:.3f}"
+                                        if s.best_acc > 0 else "—")
+            if s.cancelled:
+                for col in range(6):
+                    itm = self.table.item(i, col)
+                    if itm:
+                        itm.setForeground(QBrush(QColor("#9ca3af")))
+            self.table.setItem(i, 5, acc_item)
+
+    def _scan(self) -> List[_PastRunSummary]:
+        if not self._runs_root.exists():
+            return []
+        out: List[_PastRunSummary] = []
+        for entry in sorted(self._runs_root.iterdir(), reverse=True):
+            if not entry.is_dir():
+                continue
+            exp_path = entry / "experiment.json"
+            res_path = entry / "results.json"
+            if not exp_path.exists():
+                continue
+            try:
+                exp = json.loads(exp_path.read_text())
+            except Exception:  # noqa: BLE001
+                continue
+
+            ts = entry.name.split("__", 1)[0]
+            name = exp.get("name", entry.name.split("__", 1)[-1])
+            strategy = (exp.get("cv") or {}).get("strategy", "?")
+
+            n_folds, best_model, best_acc, cancelled = 0, "—", 0.0, False
+            if res_path.exists():
+                try:
+                    res = json.loads(res_path.read_text())
+                    n_folds = len(res.get("folds") or [])
+                    cancelled = bool(res.get("cancelled"))
+                    agg = res.get("aggregate") or {}
+                    if agg:
+                        best_model, best_meta = max(
+                            agg.items(),
+                            key=lambda kv: kv[1].get("accuracy_mean", 0.0),
+                        )
+                        best_acc = float(best_meta.get("accuracy_mean", 0.0))
+                except Exception:  # noqa: BLE001
+                    pass
+
+            out.append(_PastRunSummary(
+                path=entry, name=name, timestamp=ts, strategy=strategy,
+                n_folds=n_folds, best_model=best_model, best_acc=best_acc,
+                cancelled=cancelled,
+            ))
+        return out
+
+    def _selected(self) -> Optional[_PastRunSummary]:
+        row = self.table.currentRow()
+        if row < 0 or row >= len(self._rows):
+            return None
+        return self._rows[row]
+
+    @Slot()
+    def _on_open_selected(self):
+        sel = self._selected()
+        if sel is None:
+            return
+        _open_in_file_manager(sel.path)
+
+    @Slot()
+    def _on_reload_selected(self):
+        sel = self._selected()
+        if sel is None:
+            return
+        try:
+            cfg = load_experiment(sel.path / "experiment.json")
+            self.reload_requested.emit(cfg)
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.critical(self, "Reload failed", str(e))
+
+
+# ---------------------------------------------------------------------------
+# The main tab
 # ---------------------------------------------------------------------------
 
 class ValidationTab(QWidget):
@@ -183,8 +445,7 @@ class ValidationTab(QWidget):
     Modular, reproducible validation harness embedded in the main window.
 
     Constructed with the application's ``DataManager`` so it can find the
-    same data the rest of the GUI uses. All other dependencies are
-    discovered lazily.
+    same data the rest of the GUI uses.
     """
 
     def __init__(self, data_manager, parent=None):
@@ -198,11 +459,19 @@ class ValidationTab(QWidget):
 
         self._last_result: Optional[RunResult] = None
 
+        # Worker state
+        self._worker: Optional[_ValidationWorker] = None
+        self._bridge: Optional[_ProgressBridge] = None
+
+        # Progress tracking
+        self._fold_times: List[float] = []
+        self._fold_start_time: float = 0.0
+
         self._build_ui()
         self._refresh_corpus()
 
     # ------------------------------------------------------------------
-    # Registry discovery (with graceful fallback)
+    # Registry discovery
     # ------------------------------------------------------------------
 
     def _discover_features(self) -> List[tuple]:
@@ -217,8 +486,6 @@ class ValidationTab(QWidget):
         return list(_DEFAULT_FEATURES)
 
     def _discover_models(self) -> List[tuple]:
-        # We can't reliably introspect ModelManager (it varies by model),
-        # so we offer the same canonical list the Train tab uses.
         return list(_DEFAULT_MODELS)
 
     # ------------------------------------------------------------------
@@ -229,15 +496,12 @@ class ValidationTab(QWidget):
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 8, 8, 8)
 
-        # Header with one-line explanation + buttons
-        header = self._build_header()
-        outer.addWidget(header)
+        outer.addWidget(self._build_header())
 
-        # Main horizontal splitter: knobs on the left, results on the right
         splitter = QSplitter(Qt.Orientation.Horizontal)
         splitter.addWidget(self._build_left_panel())
         splitter.addWidget(self._build_right_panel())
-        splitter.setSizes([460, 700])
+        splitter.setSizes([480, 760])
         outer.addWidget(splitter, 1)
 
     # -- Header --------------------------------------------------------
@@ -308,18 +572,17 @@ class ValidationTab(QWidget):
         self.cb_pipeline = QCheckBox("pipeline")
         self.cb_pipeline.setChecked(True)
         self.cb_pipeline.toggled.connect(self._refresh_pickers)
+        self.cb_pipeline.toggled.connect(self._refresh_preview)
         domain_row.addWidget(self.cb_pipeline)
         self.cb_unity = QCheckBox("unity")
         self.cb_unity.toggled.connect(self._refresh_pickers)
+        self.cb_unity.toggled.connect(self._refresh_preview)
         domain_row.addWidget(self.cb_unity)
         domain_row.addStretch()
         data_lay.addLayout(domain_row)
 
-        # Two-tab picker: pick by subject (fast) or by individual session
-        # (precise). Whichever tab is active when the user hits Run is
-        # what populates DataSelection — Subject tab → DataSelection.subjects,
-        # Session tab → DataSelection.explicit (a list of "subject/session_id").
         self._data_tabs = QTabWidget()
+        self._data_tabs.currentChanged.connect(lambda *_: self._refresh_preview())
 
         # Tab 1 — pick subjects
         subj_tab = QWidget()
@@ -331,6 +594,7 @@ class ValidationTab(QWidget):
         self.subject_list = QListWidget()
         self.subject_list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         self.subject_list.setMinimumHeight(110)
+        self.subject_list.itemSelectionChanged.connect(self._refresh_preview)
         subj_lay.addWidget(self.subject_list)
         self._data_tabs.addTab(subj_tab, "By subject")
 
@@ -368,7 +632,6 @@ class ValidationTab(QWidget):
         sess_lay.addLayout(sess_btn_row)
 
         self._data_tabs.addTab(sess_tab, "By session")
-
         data_lay.addWidget(self._data_tabs)
 
         refresh_btn = QPushButton("↻ Re-scan corpus")
@@ -399,39 +662,51 @@ class ValidationTab(QWidget):
 
         # ── Modular features
         self.features_box = _CheckboxGroup("Features", self._features)
-        # Sensible defaults: the classic Hudgins set
         self.features_box.set_selected(
             [k for k, _ in self._features if k in {"mav", "rms", "wl", "zc"}]
         )
+        self.features_box.selection_changed.connect(self._refresh_preview)
         layout.addWidget(self.features_box)
 
         # ── Modular models
         self.models_box = _CheckboxGroup("Models", self._models)
-        # Default: enable the three tabular baselines
         self.models_box.set_selected(["lda", "random_forest", "catboost"])
+        self.models_box.selection_changed.connect(self._refresh_preview)
         layout.addWidget(self.models_box)
 
         # ── CV strategy
         cv_box = QGroupBox("Cross-Validation")
         cv_lay = QVBoxLayout(cv_box)
         self.cv_combo = QComboBox()
+        # NOTE: v1 forgot to add holdout_split here even though the
+        # rest of the code supported it. Now included.
         for key in ("loso_subject", "loso_session", "within_session",
-                    "k_fold_subjects", "cross_domain"):
+                    "k_fold_subjects", "cross_domain", "holdout_split"):
             self.cv_combo.addItem(_CV_DESCRIPTIONS.get(key, key), userData=key)
         self.cv_combo.currentIndexChanged.connect(self._on_cv_changed)
+        self.cv_combo.currentIndexChanged.connect(self._refresh_preview)
         cv_lay.addWidget(self.cv_combo)
 
-        # k-fold knob (only relevant for k_fold_subjects)
+        # Tooltip tracker — hover text matches current selection
+        self.cv_hint = QLabel("")
+        self.cv_hint.setWordWrap(True)
+        self.cv_hint.setStyleSheet(
+            "color: #475569; font-size: 10px; padding: 4px 2px;"
+        )
+        cv_lay.addWidget(self.cv_hint)
+
+        # k-fold knob
         self._kfold_container = QWidget()
         kfold_row = QFormLayout(self._kfold_container)
         kfold_row.setContentsMargins(0, 0, 0, 0)
         self.kfold_spin = QSpinBox()
         self.kfold_spin.setRange(2, 20)
         self.kfold_spin.setValue(5)
+        self.kfold_spin.valueChanged.connect(self._refresh_preview)
         kfold_row.addRow("k (k-fold only):", self.kfold_spin)
         cv_lay.addWidget(self._kfold_container)
 
-        # cross-domain direction (only relevant for cross_domain)
+        # cross-domain direction
         self._xd_container = QWidget()
         xd_row = QFormLayout(self._xd_container)
         xd_row.setContentsMargins(0, 0, 0, 0)
@@ -443,14 +718,32 @@ class ValidationTab(QWidget):
         xd_row.addRow("Test on (cross-domain):", self.xd_test_combo)
         cv_lay.addWidget(self._xd_container)
 
-        # holdout train/val/test ratios (only relevant for holdout_split)
+        # holdout ratios
         self._holdout_container = self._build_holdout_controls()
         cv_lay.addWidget(self._holdout_container)
 
-        # Initialise visibility
         self._on_cv_changed()
-
         layout.addWidget(cv_box)
+
+        # ── Preview panel ("about to run…")
+        self.preview_box = QFrame()
+        self.preview_box.setStyleSheet(
+            "QFrame { background: #ecfeff; border: 1px solid #a5f3fc; "
+            "border-radius: 4px; padding: 2px; }"
+        )
+        prev_lay = QVBoxLayout(self.preview_box)
+        prev_lay.setContentsMargins(8, 6, 8, 6)
+        pt = QLabel("About to run")
+        ptf = QFont(); ptf.setBold(True); pt.setFont(ptf)
+        pt.setStyleSheet("color: #0e7490; background: transparent; border: none;")
+        prev_lay.addWidget(pt)
+        self.preview_label = QLabel("")
+        self.preview_label.setWordWrap(True)
+        self.preview_label.setStyleSheet(
+            "color: #155e75; font-size: 11px; background: transparent; border: none;"
+        )
+        prev_lay.addWidget(self.preview_label)
+        layout.addWidget(self.preview_box)
 
         # ── Run controls
         run_row = QHBoxLayout()
@@ -460,22 +753,43 @@ class ValidationTab(QWidget):
             "QPushButton{background:#1a2e4a;color:#06b6d4;"
             "border:1px solid #06b6d4;border-radius:6px;"
             "font-weight:700;font-size:12px;padding:6px 18px;}"
-            "QPushButton:hover{background:#06b6d4;color:#fff;}")
+            "QPushButton:hover{background:#06b6d4;color:#fff;}"
+            "QPushButton:disabled{background:#e5e7eb;color:#9ca3af;"
+            "border:1px solid #d1d5db;}"
+        )
         self.run_btn.clicked.connect(self._on_run)
         run_row.addWidget(self.run_btn, 1)
+
+        self.cancel_btn = QPushButton("■ Cancel")
+        self.cancel_btn.setFixedHeight(36)
+        self.cancel_btn.setEnabled(False)
+        self.cancel_btn.setStyleSheet(
+            "QPushButton{background:#7f1d1d;color:#fecaca;"
+            "border:1px solid #ef4444;border-radius:6px;"
+            "font-weight:700;padding:6px 18px;}"
+            "QPushButton:hover:enabled{background:#b91c1c;color:#fff;}"
+            "QPushButton:disabled{background:#f3f4f6;color:#d1d5db;"
+            "border:1px solid #e5e7eb;}"
+        )
+        self.cancel_btn.clicked.connect(self._on_cancel)
+        run_row.addWidget(self.cancel_btn)
+
         layout.addLayout(run_row)
 
         layout.addStretch()
         scroll.setWidget(content)
+        self._on_cv_changed()  # set initial hint
+        self._refresh_preview()
         return scroll
 
-    # -- Right panel: results table + per-fold breakdown ---------------
+    # -- Right panel: progress + results -------------------------------
 
     def _build_right_panel(self) -> QWidget:
         wrap = QWidget()
         layout = QVBoxLayout(wrap)
+        layout.setContentsMargins(0, 0, 0, 0)
 
-        # ── Live progress panel (shown while a run is in flight) ─────────
+        # ── Progress panel (visible while running OR shows last-run status)
         self._progress_panel = QFrame()
         self._progress_panel.setStyleSheet(
             "QFrame { background: #0f172a; border-radius: 6px; border: 1px solid #1e3a5f; }"
@@ -484,44 +798,51 @@ class ValidationTab(QWidget):
         prog_lay.setContentsMargins(10, 8, 10, 8)
         prog_lay.setSpacing(4)
 
+        # Title row
         prog_title_row = QHBoxLayout()
-        _prog_title = QLabel("⚙  Validation in progress…")
-        _prog_title_font = QFont()
-        _prog_title_font.setBold(True)
-        _prog_title_font.setPointSize(11)
-        _prog_title.setFont(_prog_title_font)
-        _prog_title.setStyleSheet("color: #06b6d4; background: transparent; border: none;")
-        prog_title_row.addWidget(_prog_title)
+        self._prog_title_lbl = QLabel("Ready")
+        _ptf = QFont(); _ptf.setBold(True); _ptf.setPointSize(11)
+        self._prog_title_lbl.setFont(_ptf)
+        self._prog_title_lbl.setStyleSheet("color: #06b6d4; background: transparent; border: none;")
+        prog_title_row.addWidget(self._prog_title_lbl)
         prog_title_row.addStretch()
-        self._prog_step_lbl = QLabel("")
-        self._prog_step_lbl.setStyleSheet("color: #94a3b8; font-size: 10px; background: transparent; border: none;")
-        prog_title_row.addWidget(self._prog_step_lbl)
+        self._prog_eta_lbl = QLabel("")
+        self._prog_eta_lbl.setStyleSheet("color: #94a3b8; font-size: 10px; background: transparent; border: none;")
+        prog_title_row.addWidget(self._prog_eta_lbl)
         prog_lay.addLayout(prog_title_row)
 
+        # Determinate progress bar with N/M label
         self._progress_bar = QProgressBar()
-        self._progress_bar.setRange(0, 0)          # indeterminate (spinning)
-        self._progress_bar.setFixedHeight(6)
+        self._progress_bar.setRange(0, 1)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setFixedHeight(8)
         self._progress_bar.setTextVisible(False)
         self._progress_bar.setStyleSheet(
-            "QProgressBar { background: #1e293b; border-radius: 3px; border: none; }"
-            "QProgressBar::chunk { background: #06b6d4; border-radius: 3px; }"
+            "QProgressBar { background: #1e293b; border-radius: 4px; border: none; }"
+            "QProgressBar::chunk { background: #06b6d4; border-radius: 4px; }"
         )
         prog_lay.addWidget(self._progress_bar)
 
+        # Live log
         self._prog_log = QTextEdit()
         self._prog_log.setReadOnly(True)
-        self._prog_log.setFixedHeight(90)
+        self._prog_log.setFixedHeight(130)
         self._prog_log.setStyleSheet(
-            "QTextEdit { background: transparent; color: #94a3b8; "
-            "font-family: monospace; font-size: 10px; border: none; }"
+            "QTextEdit { background: transparent; color: #cbd5e1; "
+            "font-family: 'Menlo', 'Consolas', monospace; font-size: 10px; border: none; }"
         )
         prog_lay.addWidget(self._prog_log)
 
-        self._progress_panel.setVisible(False)
         layout.addWidget(self._progress_panel)
 
-        # Aggregate (per-model) summary
-        agg_box = QGroupBox("Aggregate results  (mean ± std across folds)")
+        # ── Results tabs: Overview · Per-class · Previous runs
+        self._results_tabs = QTabWidget()
+
+        # Tab 1: Overview
+        overview_tab = QWidget()
+        ov_lay = QVBoxLayout(overview_tab)
+
+        agg_box = QGroupBox("Aggregate — mean ± std across folds")
         agg_lay = QVBoxLayout(agg_box)
         self.agg_table = QTableWidget(0, 4)
         self.agg_table.setHorizontalHeaderLabels(
@@ -532,9 +853,8 @@ class ValidationTab(QWidget):
         )
         self.agg_table.verticalHeader().setVisible(False)
         agg_lay.addWidget(self.agg_table)
-        layout.addWidget(agg_box, 1)
+        ov_lay.addWidget(agg_box, 1)
 
-        # Per-fold breakdown
         fold_box = QGroupBox("Per-fold results")
         fold_lay = QVBoxLayout(fold_box)
         self.fold_table = QTableWidget(0, 6)
@@ -546,43 +866,174 @@ class ValidationTab(QWidget):
         )
         self.fold_table.verticalHeader().setVisible(False)
         fold_lay.addWidget(self.fold_table)
-        layout.addWidget(fold_box, 2)
+        ov_lay.addWidget(fold_box, 2)
 
-        # Footer with output-folder access
         footer = QHBoxLayout()
         self.output_path_lbl = QLabel("No run yet.")
         self.output_path_lbl.setStyleSheet("color: #64748b; font-size: 10px;")
         footer.addWidget(self.output_path_lbl, 1)
-
         self.open_folder_btn = QPushButton("Open results folder")
         self.open_folder_btn.setEnabled(False)
         self.open_folder_btn.clicked.connect(self._on_open_folder)
         footer.addWidget(self.open_folder_btn)
-        layout.addLayout(footer)
+        ov_lay.addLayout(footer)
+
+        self._results_tabs.addTab(overview_tab, "Overview")
+
+        # Tab 2: Per-class breakdown
+        perclass_tab = QWidget()
+        pc_lay = QVBoxLayout(perclass_tab)
+        pc_help = QLabel(
+            "Mean F1 per class across folds. Lower scores mark "
+            "gestures the model struggles with."
+        )
+        pc_help.setWordWrap(True)
+        pc_help.setStyleSheet("color: #64748b; font-size: 10px; padding: 4px;")
+        pc_lay.addWidget(pc_help)
+        self.perclass_table = QTableWidget(0, 0)
+        self.perclass_table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Stretch
+        )
+        self.perclass_table.verticalHeader().setVisible(True)
+        pc_lay.addWidget(self.perclass_table, 1)
+        self._results_tabs.addTab(perclass_tab, "Per-class F1")
+
+        # Tab 3: Previous runs
+        self.runs_browser = _RunsBrowser(
+            self.data_dir / "validation_runs", parent=self,
+        )
+        self.runs_browser.reload_requested.connect(self._apply_config)
+        self._results_tabs.addTab(self.runs_browser, "Previous runs")
+
+        layout.addWidget(self._results_tabs, 1)
 
         return wrap
+
+    # ------------------------------------------------------------------
+    # Preview ("about to run…") panel
+    # ------------------------------------------------------------------
+
+    def _refresh_preview(self, *_):
+        """Compute and display what clicking Run *would* do, right now.
+
+        Signals like ``_data_tabs.currentChanged`` can fire during
+        construction of the left panel — before ``models_box`` /
+        ``features_box`` / ``preview_label`` have been instantiated —
+        so we guard against every attribute we need and silently
+        no-op if the UI isn't fully built yet.
+        """
+        required = ("models_box", "features_box", "preview_label",
+                    "cv_combo", "subject_list", "session_tree")
+        if not all(hasattr(self, name) for name in required):
+            return
+        try:
+            recs = self._selected_records()
+            n_subjects = len({r.subject_id for r in recs})
+            n_sessions = len(recs)
+            n_models = len(self.models_box.selected())
+            n_features = len(self.features_box.selected())
+
+            strategy_key = self.cv_combo.currentData()
+            strategy = _CV_DESCRIPTIONS.get(strategy_key, strategy_key)
+
+            # Rough fold-count estimate (without instantiating the strategy)
+            est_folds = self._estimate_fold_count(strategy_key, n_subjects, n_sessions)
+            est_evals = est_folds * max(1, n_models)
+
+            msg = (
+                f"<b>{n_sessions}</b> session(s) · "
+                f"<b>{n_subjects}</b> subject(s) · "
+                f"<b>{n_features}</b> feature(s) · "
+                f"<b>{n_models}</b> model(s)<br>"
+                f"Strategy: {strategy}<br>"
+                f"Estimated <b>{est_folds}</b> fold(s) "
+                f"→ <b>{est_evals}</b> total evaluation(s)."
+            )
+
+            # Guardrails
+            warnings = []
+            if n_sessions == 0:
+                warnings.append(
+                    "⚠ No sessions selected — the run would do nothing."
+                )
+            if n_models == 0:
+                warnings.append("⚠ No models selected.")
+            if n_features == 0:
+                warnings.append(
+                    "⚠ No features selected — the dataset will be raw windows."
+                )
+            if strategy_key == "loso_subject" and n_subjects < 2:
+                warnings.append(
+                    "⚠ LOSO-Subject needs ≥2 subjects — adjust the filter."
+                )
+            if strategy_key == "loso_session" and n_sessions < 2:
+                warnings.append(
+                    "⚠ LOSO-Session needs ≥2 sessions."
+                )
+            if strategy_key == "cross_domain":
+                selected_domains = set(self._selected_domains())
+                if len(selected_domains) < 2 and (selected_domains != set()):
+                    warnings.append(
+                        "⚠ Cross-domain needs both 'pipeline' and 'unity' "
+                        "ticked (or neither, to use all)."
+                    )
+
+            # Deep CNN-family models expect raw windows; features break
+            # their predict path. The runner now auto-detects this and
+            # materialises raw windows for those models, but surface a
+            # hint so users aren't surprised that their feature selection
+            # is silently skipped for CNN folds.
+            raw_models = {"cnn", "attention_net", "mstnet"}
+            selected_raw = [m for m in self.models_box.selected()
+                            if _MODEL_KEY_NORMALISE.get(m, m.lower()) in raw_models]
+            if selected_raw and n_features > 0:
+                warnings.append(
+                    f"ℹ {', '.join(selected_raw)} need raw windows — "
+                    "the feature selection will be ignored for those "
+                    "models (other models still use it)."
+                )
+
+            if warnings:
+                msg += "<br><br>" + "<br>".join(warnings)
+
+            self.preview_label.setText(msg)
+        except Exception as e:  # noqa: BLE001
+            self.preview_label.setText(f"(preview failed: {e})")
+
+    @staticmethod
+    def _estimate_fold_count(strategy: str, n_subjects: int, n_sessions: int) -> int:
+        # Best-effort; exact counts require instantiating the strategy.
+        if strategy == "loso_subject":
+            return max(0, n_subjects)
+        if strategy == "loso_session":
+            return max(0, n_sessions)
+        if strategy == "within_session":
+            return max(0, n_sessions)
+        if strategy == "k_fold_subjects":
+            return 0  # shown separately; users see k in the spin box
+        if strategy == "cross_domain":
+            return 1
+        if strategy == "holdout_split":
+            return 1
+        return 0
 
     # ------------------------------------------------------------------
     # Corpus + UI refresh
     # ------------------------------------------------------------------
 
     def _refresh_corpus(self):
-        # Force a re-scan by rebuilding the corpus.
         self._corpus = SessionCorpus(self.data_dir)
         self._corpus.discover()
-        self.corpus_summary_lbl.setText(self._corpus.summary().replace("\n", "  ·  "))
+        self.corpus_summary_lbl.setText(
+            self._corpus.summary().replace("\n", "  ·  ")
+        )
         self._refresh_pickers()
+        self._refresh_preview()
 
     def _refresh_pickers(self):
-        """Re-populate both the subject list and the session tree from the
-        current domain filter."""
         domains = self._selected_domains()
-        # When no domain is checked, show all subjects rather than nothing —
-        # an empty domain selection is more likely "don't filter" than
-        # "hide all".
         recs = self._corpus.filter(domains=domains) if domains else self._corpus.all()
 
-        # ── Subject list ────────────────────────────────────────────────
         previously_selected = set(self._selected_subjects() or [])
         self.subject_list.clear()
         for s in sorted({r.subject_id for r in recs}):
@@ -593,7 +1044,6 @@ class ValidationTab(QWidget):
             if s in previously_selected:
                 item.setSelected(True)
 
-        # ── Session tree ────────────────────────────────────────────────
         previously_ticked = set(self._selected_sessions() or [])
         self.session_tree.blockSignals(True)
         try:
@@ -630,8 +1080,7 @@ class ValidationTab(QWidget):
                                       ("session", key))
                     sess_item.setCheckState(
                         0,
-                        Qt.CheckState.Checked
-                        if key in previously_ticked
+                        Qt.CheckState.Checked if key in previously_ticked
                         else Qt.CheckState.Unchecked,
                     )
                     subj_item.addChild(sess_item)
@@ -645,6 +1094,7 @@ class ValidationTab(QWidget):
     @Slot()
     def _on_session_tree_changed(self, *_):
         self._update_session_count()
+        self._refresh_preview()
 
     def _update_session_count(self):
         n = len(self._selected_sessions() or [])
@@ -661,13 +1111,12 @@ class ValidationTab(QWidget):
             for i in range(self.session_tree.topLevelItemCount()):
                 top = self.session_tree.topLevelItem(i)
                 top.setCheckState(0, state)
-                # Children inherit from parent due to ItemIsAutoTristate,
-                # but be explicit so the visual update is immediate.
                 for j in range(top.childCount()):
                     top.child(j).setCheckState(0, state)
         finally:
             self.session_tree.blockSignals(False)
         self._update_session_count()
+        self._refresh_preview()
 
     def _selected_domains(self) -> List[str]:
         out = []
@@ -680,11 +1129,10 @@ class ValidationTab(QWidget):
     def _selected_subjects(self) -> Optional[List[str]]:
         items = self.subject_list.selectedItems()
         if not items:
-            return None  # → "all"
+            return None
         return [it.data(Qt.ItemDataRole.UserRole) for it in items]
 
     def _selected_sessions(self) -> Optional[List[str]]:
-        """Return ticked sessions in the tree as ``["subject/session_id", ...]``."""
         keys: List[str] = []
         for i in range(self.session_tree.topLevelItemCount()):
             top = self.session_tree.topLevelItem(i)
@@ -697,15 +1145,28 @@ class ValidationTab(QWidget):
         return keys or None
 
     def _data_picker_mode(self) -> str:
-        """Which data sub-tab is active: 'subjects' or 'sessions'."""
         return "sessions" if self._data_tabs.currentIndex() == 1 else "subjects"
 
+    def _selected_records(self) -> list:
+        """Resolve the currently-selected (subjects|sessions|domains) to records."""
+        domains = self._selected_domains() or None
+        if self._data_picker_mode() == "sessions":
+            keys = set(self._selected_sessions() or [])
+            if not keys:
+                return []
+            return [
+                r for r in self._corpus.all()
+                if f"{r.subject_id}/{r.session_id}" in keys
+                and (domains is None or r.source_domain in domains)
+            ]
+        subjects = self._selected_subjects()
+        return self._corpus.filter(subjects=subjects, domains=domains)
+
     # ------------------------------------------------------------------
-    # Holdout-ratio controls (Train / Val / Test)
+    # Holdout ratio controls
     # ------------------------------------------------------------------
 
     def _build_holdout_controls(self) -> QWidget:
-        """Two sliders + live "train / val / test = X / Y / Z %" readout."""
         wrap = QWidget()
         lay = QVBoxLayout(wrap)
         lay.setContentsMargins(0, 4, 0, 0)
@@ -719,11 +1180,11 @@ class ValidationTab(QWidget):
         info.setStyleSheet("color: #64748b; font-size: 10px;")
         lay.addWidget(info)
 
-        # Val ratio slider
+        # Val ratio
         val_row = QHBoxLayout()
         val_row.addWidget(QLabel("Val %:"))
         self.holdout_val_slider = QSlider(Qt.Orientation.Horizontal)
-        self.holdout_val_slider.setRange(0, 50)   # percent
+        self.holdout_val_slider.setRange(0, 50)
         self.holdout_val_slider.setValue(15)
         self.holdout_val_slider.valueChanged.connect(self._update_holdout_readout)
         val_row.addWidget(self.holdout_val_slider, 1)
@@ -732,7 +1193,7 @@ class ValidationTab(QWidget):
         val_row.addWidget(self.holdout_val_lbl)
         lay.addLayout(val_row)
 
-        # Test ratio slider
+        # Test ratio
         test_row = QHBoxLayout()
         test_row.addWidget(QLabel("Test %:"))
         self.holdout_test_slider = QSlider(Qt.Orientation.Horizontal)
@@ -745,7 +1206,7 @@ class ValidationTab(QWidget):
         test_row.addWidget(self.holdout_test_lbl)
         lay.addLayout(test_row)
 
-        # Stratification choice
+        # Stratification
         strat_row = QHBoxLayout()
         strat_row.addWidget(QLabel("Stratify by:"))
         self.holdout_strat_combo = QComboBox()
@@ -754,7 +1215,6 @@ class ValidationTab(QWidget):
         strat_row.addWidget(self.holdout_strat_combo, 1)
         lay.addLayout(strat_row)
 
-        # Live readout
         self.holdout_summary_lbl = QLabel("")
         self.holdout_summary_lbl.setStyleSheet(
             "color: #06b6d4; font-weight: 600; font-size: 11px;"
@@ -767,7 +1227,6 @@ class ValidationTab(QWidget):
     def _update_holdout_readout(self, *_):
         v = self.holdout_val_slider.value()
         t = self.holdout_test_slider.value()
-        # Cap test if val + test would exceed 95% so train always has data.
         if v + t > 95:
             t = 95 - v
             self.holdout_test_slider.blockSignals(True)
@@ -786,6 +1245,7 @@ class ValidationTab(QWidget):
         self._kfold_container.setVisible(key == "k_fold_subjects")
         self._xd_container.setVisible(key == "cross_domain")
         self._holdout_container.setVisible(key == "holdout_split")
+        self.cv_hint.setText(_CV_TOOLTIPS.get(key, ""))
 
     # ------------------------------------------------------------------
     # Build an ExperimentConfig from the live UI state
@@ -814,10 +1274,6 @@ class ValidationTab(QWidget):
                 "stratify_by": self.holdout_strat_combo.currentData(),
             }
 
-        # Two ways the user can narrow the data:
-        #   * "By subject" tab → DataSelection.subjects (predicate filter)
-        #   * "By session" tab → DataSelection.explicit (allow-list, takes
-        #     precedence over the subject filter inside SessionCorpus.select).
         if self._data_picker_mode() == "sessions":
             data_sel = DataSelection(
                 domains=self._selected_domains() or None,
@@ -845,7 +1301,7 @@ class ValidationTab(QWidget):
         )
 
     # ------------------------------------------------------------------
-    # Run
+    # Run / Cancel
     # ------------------------------------------------------------------
 
     @Slot()
@@ -857,125 +1313,195 @@ class ValidationTab(QWidget):
             return
 
         if not cfg.features:
-            QMessageBox.warning(self, "No features",
-                                "Select at least one feature.")
-            return
+            if QMessageBox.question(
+                self, "No features",
+                "No features are selected — models will be trained on raw "
+                "windows (only supported by deep models). Continue?",
+            ) != QMessageBox.StandardButton.Yes:
+                return
         if not cfg.models:
             QMessageBox.warning(self, "No models",
                                 "Select at least one model.")
             return
 
-        runner = ValidationRunner(self.data_dir)
-        self.run_btn.setEnabled(False)
+        # Hard guardrails — we refuse to start runs that can't produce
+        # meaningful output. Warnings only (preview catches soft issues).
+        n_sessions = len(self._selected_records())
+        if n_sessions == 0:
+            QMessageBox.warning(
+                self, "No sessions",
+                "No sessions match the current filter. Check the Data "
+                "panel on the left.",
+            )
+            return
 
-        # ── Show progress panel ──────────────────────────────────────────
-        n_models = len(cfg.models)
-        n_features = len(cfg.features)
-        cv_label = _CV_DESCRIPTIONS.get(cfg.cv.strategy, cfg.cv.strategy)
+        # Reset progress view
+        self._fold_times = []
         self._prog_log.clear()
-        self._progress_panel.setVisible(True)
-        self._prog_step_lbl.setText(f"{n_models} model(s) · {n_features} feature(s)")
+        self._progress_bar.setRange(0, 1)
+        self._progress_bar.setValue(0)
+        self._progress_bar.setStyleSheet(
+            "QProgressBar { background: #1e293b; border-radius: 4px; border: none; }"
+            "QProgressBar::chunk { background: #06b6d4; border-radius: 4px; }"
+        )
+        self._prog_title_lbl.setText("⚙  Starting…")
+        self._prog_eta_lbl.setText("")
 
-        def _log(msg: str):
-            self._prog_log.append(msg)
-            # Scroll to bottom
-            sb = self._prog_log.verticalScrollBar()
-            sb.setValue(sb.maximum())
+        self.run_btn.setEnabled(False)
+        self.cancel_btn.setEnabled(True)
 
-        _log(f"Strategy : {cv_label}")
-        _log(f"Features : {', '.join(f.name for f in cfg.features)}")
-        _log(f"Models   : {', '.join(m.type for m in cfg.models)}")
+        # Log the plan
+        cv_label = _CV_DESCRIPTIONS.get(cfg.cv.strategy, cfg.cv.strategy)
+        self._log_line(f"Strategy : {cv_label}")
+        self._log_line(f"Features : {', '.join(f.name for f in cfg.features) or '(raw)'}")
+        self._log_line(f"Models   : {', '.join(m.type for m in cfg.models)}")
         if cfg.data.explicit:
-            _log(f"Sessions : {len(cfg.data.explicit)} explicit session(s)")
+            self._log_line(f"Sessions : {len(cfg.data.explicit)} explicit session(s)")
         else:
             subjects = cfg.data.subjects or ["all"]
-            _log(f"Subjects : {', '.join(subjects)}")
+            self._log_line(f"Subjects : {', '.join(subjects)}")
         if cfg.cv.strategy == "holdout_split":
             v = float(cfg.cv.kwargs.get("val_ratio", 0.0)) * 100
             t = float(cfg.cv.kwargs.get("test_ratio", 0.0)) * 100
-            _log(f"Ratios   : train {100 - v - t:.0f}% / val {v:.0f}% / test {t:.0f}%")
-        _log("─" * 42)
+            self._log_line(f"Ratios   : train {100 - v - t:.0f}% / val {v:.0f}% / test {t:.0f}%")
+        self._log_line("─" * 42)
 
-        # Animate step label while running
-        _dots = ["   ", ".  ", ".. ", "..."]
-        _dot_idx = [0]
+        # Start worker
+        self._bridge = _ProgressBridge(parent=self)
+        self._bridge.run_started.connect(self._on_run_started, Qt.ConnectionType.QueuedConnection)
+        self._bridge.fold_started.connect(self._on_fold_started, Qt.ConnectionType.QueuedConnection)
+        self._bridge.fold_finished.connect(self._on_fold_finished, Qt.ConnectionType.QueuedConnection)
+        self._bridge.run_finished.connect(self._on_run_finished, Qt.ConnectionType.QueuedConnection)
+        self._bridge.log_line.connect(self._log_line, Qt.ConnectionType.QueuedConnection)
 
-        def _tick():
-            _dot_idx[0] = (_dot_idx[0] + 1) % len(_dots)
-            self._prog_step_lbl.setText(
-                f"Running{_dots[_dot_idx[0]]}  "
-                f"{n_models} model(s) · {n_features} feature(s)"
+        self._worker = _ValidationWorker(self.data_dir, cfg, self._bridge, parent=self)
+        self._worker.failed.connect(self._on_run_failed, Qt.ConnectionType.QueuedConnection)
+        self._worker.finished.connect(self._on_worker_finished)  # cleanup only
+        self._worker.start()
+
+    @Slot()
+    def _on_cancel(self):
+        if self._bridge is None:
+            return
+        self.cancel_btn.setEnabled(False)
+        self._bridge.request_cancel()
+        self._log_line("✖ Cancellation requested — will stop after current fold.")
+        self._prog_title_lbl.setText("⚙  Cancelling…")
+
+    # -- Worker signal handlers ---------------------------------------
+
+    @Slot(int, int)
+    def _on_run_started(self, n_folds: int, n_models: int):
+        total = n_folds * n_models
+        self._progress_bar.setRange(0, max(1, total))
+        self._progress_bar.setValue(0)
+        self._prog_title_lbl.setText(
+            f"⚙  Running  ·  0 / {total} evaluation(s)"
+        )
+        self._prog_eta_lbl.setText("")
+
+    @Slot(int, int, str, str)
+    def _on_fold_started(self, idx: int, total: int, fold_id: str, model_type: str):
+        self._fold_start_time = time.time()
+        self._prog_title_lbl.setText(
+            f"⚙  {idx} / {total}  ·  {model_type}  ·  {fold_id}"
+        )
+
+    @Slot(int, int, object)
+    def _on_fold_finished(self, idx: int, total: int, fold_result: FoldResult):
+        dt = time.time() - self._fold_start_time
+        self._fold_times.append(dt)
+        self._progress_bar.setValue(idx)
+
+        # ETA from running mean
+        if self._fold_times:
+            mean_dt = sum(self._fold_times) / len(self._fold_times)
+            remaining = total - idx
+            eta_sec = mean_dt * remaining
+            self._prog_eta_lbl.setText(
+                f"~{_fmt_dur(eta_sec)} remaining  ·  {_fmt_dur(mean_dt)}/fold avg"
             )
+        self._prog_title_lbl.setText(
+            f"⚙  {idx} / {total}  ·  last: {fold_result.model_type} "
+            f"acc {fold_result.accuracy:.3f}"
+        )
 
-        self._run_timer = QTimer(self)
-        self._run_timer.setInterval(400)
-        self._run_timer.timeout.connect(_tick)
-        self._run_timer.start()
+    @Slot(object)
+    def _on_run_finished(self, result: RunResult):
+        self._last_result = result
+        self.run_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
 
-        def _do():
-            return runner.run(cfg)
-
-        def _done(result: RunResult):
-            self._run_timer.stop()
-            self.run_btn.setEnabled(True)
-            self._last_result = result
-            n_folds = len(result.folds)
-            _log(f"✓ Finished — {n_folds} fold(s) completed.")
-            agg = result.aggregate()
-            for model, m in sorted(agg.items()):
-                _log(
-                    f"  {model:<18}  "
-                    f"acc {m['accuracy_mean']:.3f} ± {m['accuracy_std']:.3f}  "
-                    f"F1 {m['macro_f1_mean']:.3f}"
-                )
-            self._prog_step_lbl.setText("Done ✓")
+        n_folds = len(result.folds)
+        if result.cancelled:
+            self._prog_title_lbl.setText(f"Cancelled  ·  {n_folds} fold(s) completed")
+            self._progress_bar.setStyleSheet(
+                "QProgressBar { background: #1e293b; border-radius: 4px; border: none; }"
+                "QProgressBar::chunk { background: #f59e0b; border-radius: 4px; }"
+            )
+        else:
+            self._prog_title_lbl.setText(f"✓ Done  ·  {n_folds} fold(s)")
             self._progress_bar.setRange(0, 1)
             self._progress_bar.setValue(1)
             self._progress_bar.setStyleSheet(
-                "QProgressBar { background: #1e293b; border-radius: 3px; border: none; }"
-                "QProgressBar::chunk { background: #16a34a; border-radius: 3px; }"
+                "QProgressBar { background: #1e293b; border-radius: 4px; border: none; }"
+                "QProgressBar::chunk { background: #16a34a; border-radius: 4px; }"
             )
-            self._populate_results(result)
+        self._prog_eta_lbl.setText("")
 
-        def _err(tb: str):
-            self._run_timer.stop()
-            self.run_btn.setEnabled(True)
-            _log(f"✗ Run failed.")
-            _log(tb[-600:])
-            self._prog_step_lbl.setText("Failed ✗")
-            self._progress_bar.setRange(0, 1)
-            self._progress_bar.setValue(1)
-            self._progress_bar.setStyleSheet(
-                "QProgressBar { background: #1e293b; border-radius: 3px; border: none; }"
-                "QProgressBar::chunk { background: #dc2626; border-radius: 3px; }"
+        agg = result.aggregate()
+        for model, m in sorted(agg.items()):
+            self._log_line(
+                f"  {model:<18}  "
+                f"acc {m['accuracy_mean']:.3f} ± {m['accuracy_std']:.3f}  "
+                f"F1  {m['macro_f1_mean']:.3f} ± {m['macro_f1_std']:.3f}"
             )
-            log.error("Validation run failed:\n%s", tb)
-            QMessageBox.critical(self, "Validation failed",
-                                 f"The run raised an exception:\n\n{tb[-1000:]}")
 
-        run_blocking(self, _do, _done, _err,
-                     label=f"Running validation ({cfg.cv.strategy})…")
+        self._populate_results(result)
+        self.runs_browser.refresh()
+
+    @Slot(str)
+    def _on_run_failed(self, tb: str):
+        self.run_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(False)
+        self._prog_title_lbl.setText("✗ Failed")
+        self._progress_bar.setStyleSheet(
+            "QProgressBar { background: #1e293b; border-radius: 4px; border: none; }"
+            "QProgressBar::chunk { background: #dc2626; border-radius: 4px; }"
+        )
+        self._log_line("✗ Run failed.")
+        self._log_line(tb[-800:])
+        log.error("Validation run failed:\n%s", tb)
+        QMessageBox.critical(self, "Validation failed",
+                             f"The run raised an exception:\n\n{tb[-1200:]}")
+
+    @Slot()
+    def _on_worker_finished(self):
+        # Thread-cleanup only — results are delivered via run_finished.
+        self._worker = None
+        self._bridge = None
+
+    @Slot(str)
+    def _log_line(self, msg: str):
+        self._prog_log.append(msg)
+        sb = self._prog_log.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     # ------------------------------------------------------------------
     # Results rendering
     # ------------------------------------------------------------------
 
     def _populate_results(self, result: RunResult):
-        # Decide whether any fold actually has a val score — if so, show
-        # the val columns; if not, hide them to keep the tables compact.
         any_val = any(fr.val_accuracy is not None for fr in result.folds)
 
-        # Aggregate table
-        agg_headers = ["Model", "Folds", "Accuracy", "Macro-F1"]
+        # ── Aggregate table ────────────────────────────────────────────
+        agg_headers = ["Model", "Folds", "Accuracy", "Macro-F1", "Mean train time"]
         if any_val:
             agg_headers += ["Val Accuracy", "Val Macro-F1"]
         self.agg_table.setColumnCount(len(agg_headers))
         self.agg_table.setHorizontalHeaderLabels(agg_headers)
 
         agg = result.aggregate()
-        # Pre-compute val means per model from the per-fold list because
-        # the aggregate dict doesn't carry val numbers (we keep the
-        # public RunResult.aggregate() API stable).
         val_by_model: Dict[str, list] = {}
         for fr in result.folds:
             if fr.val_accuracy is not None:
@@ -995,6 +1521,10 @@ class ValidationTab(QWidget):
                 row, 3,
                 QTableWidgetItem(f"{m['macro_f1_mean']:.3f} ± {m['macro_f1_std']:.3f}")
             )
+            self.agg_table.setItem(
+                row, 4,
+                QTableWidgetItem(_fmt_dur(m["train_seconds_mean"]))
+            )
             if any_val:
                 vals = val_by_model.get(model, [])
                 if vals:
@@ -1002,18 +1532,29 @@ class ValidationTab(QWidget):
                     accs = _np.array([v[0] for v in vals], dtype=float)
                     f1s  = _np.array([v[1] for v in vals], dtype=float)
                     self.agg_table.setItem(
-                        row, 4,
+                        row, 5,
                         QTableWidgetItem(f"{accs.mean():.3f} ± {accs.std():.3f}")
                     )
                     self.agg_table.setItem(
-                        row, 5,
+                        row, 6,
                         QTableWidgetItem(f"{f1s.mean():.3f} ± {f1s.std():.3f}")
                     )
                 else:
-                    self.agg_table.setItem(row, 4, QTableWidgetItem("—"))
                     self.agg_table.setItem(row, 5, QTableWidgetItem("—"))
+                    self.agg_table.setItem(row, 6, QTableWidgetItem("—"))
 
-        # Per-fold table
+        # Highlight best accuracy row
+        if agg:
+            best_model = max(agg.items(),
+                             key=lambda kv: kv[1]["accuracy_mean"])[0]
+            for row, (model, _m) in enumerate(sorted(agg.items())):
+                if model == best_model:
+                    for col in range(self.agg_table.columnCount()):
+                        itm = self.agg_table.item(row, col)
+                        if itm:
+                            itm.setBackground(QBrush(QColor("#ecfdf5")))
+
+        # ── Per-fold table ─────────────────────────────────────────────
         fold_headers = ["Fold", "Model", "n_train", "n_test",
                         "Accuracy", "Macro-F1"]
         if any_val:
@@ -1046,6 +1587,39 @@ class ValidationTab(QWidget):
                 self.fold_table.setItem(row, 4, QTableWidgetItem(f"{fr.accuracy:.3f}"))
                 self.fold_table.setItem(row, 5, QTableWidgetItem(f"{fr.macro_f1:.3f}"))
 
+        # ── Per-class F1 table (class × model) ─────────────────────────
+        all_classes = sorted({
+            cls for fr in result.folds for cls in fr.per_class_f1.keys()
+        })
+        all_models = sorted({fr.model_type for fr in result.folds})
+        self.perclass_table.setRowCount(len(all_classes))
+        self.perclass_table.setColumnCount(len(all_models))
+        self.perclass_table.setHorizontalHeaderLabels(all_models)
+        self.perclass_table.setVerticalHeaderLabels(all_classes)
+
+        import numpy as _np
+        for ri, cls in enumerate(all_classes):
+            for ci, model in enumerate(all_models):
+                vals = [
+                    fr.per_class_f1.get(cls)
+                    for fr in result.folds
+                    if fr.model_type == model and cls in fr.per_class_f1
+                ]
+                if vals:
+                    mean = float(_np.mean(vals))
+                    item = QTableWidgetItem(f"{mean:.3f}")
+                    # Colour-scale: red < 0.5 < orange < 0.75 < green
+                    if mean >= 0.75:
+                        item.setBackground(QBrush(QColor("#dcfce7")))
+                    elif mean >= 0.5:
+                        item.setBackground(QBrush(QColor("#fef3c7")))
+                    else:
+                        item.setBackground(QBrush(QColor("#fee2e2")))
+                else:
+                    item = QTableWidgetItem("—")
+                    item.setForeground(QBrush(QColor("#9ca3af")))
+                self.perclass_table.setItem(ri, ci, item)
+
         if result.output_dir is not None:
             self.output_path_lbl.setText(f"Wrote: {result.output_dir}")
             self.open_folder_btn.setEnabled(True)
@@ -1070,7 +1644,6 @@ class ValidationTab(QWidget):
         p = Path(path)
         try:
             if p.suffix.lower() in (".yaml", ".yml"):
-                # Best-effort YAML; fall back to JSON if PyYAML missing.
                 try:
                     import yaml
                     p.write_text(yaml.safe_dump(cfg.to_dict(), sort_keys=False),
@@ -1110,11 +1683,8 @@ class ValidationTab(QWidget):
         self.cb_unity.setChecked("unity" in domains)
         self._refresh_pickers()
 
-        # Subjects vs explicit sessions — switch to whichever tab the
-        # config actually populated, so the user sees a faithful
-        # reproduction of what the run will use.
         if cfg.data.explicit:
-            self._data_tabs.setCurrentIndex(1)   # By session
+            self._data_tabs.setCurrentIndex(1)
             wanted = set(cfg.data.explicit)
             self.session_tree.blockSignals(True)
             try:
@@ -1133,7 +1703,7 @@ class ValidationTab(QWidget):
                 self.session_tree.blockSignals(False)
             self._update_session_count()
         elif cfg.data.subjects:
-            self._data_tabs.setCurrentIndex(0)   # By subject
+            self._data_tabs.setCurrentIndex(0)
             wanted = set(cfg.data.subjects)
             for i in range(self.subject_list.count()):
                 it = self.subject_list.item(i)
@@ -1168,21 +1738,47 @@ class ValidationTab(QWidget):
                     self.holdout_strat_combo.setCurrentIndex(i)
                     break
 
+        self._refresh_preview()
+
     # ------------------------------------------------------------------
-    # Open output folder in the OS file manager
+    # Open output folder
     # ------------------------------------------------------------------
 
     @Slot()
     def _on_open_folder(self):
         if self._last_result is None or self._last_result.output_dir is None:
             return
-        path = str(self._last_result.output_dir)
-        try:
-            if sys.platform.startswith("darwin"):
-                subprocess.Popen(["open", path])
-            elif sys.platform.startswith("win"):
-                subprocess.Popen(["explorer", path])
-            else:
-                subprocess.Popen(["xdg-open", path])
-        except Exception as e:  # noqa: BLE001
-            QMessageBox.warning(self, "Open failed", str(e))
+        _open_in_file_manager(self._last_result.output_dir)
+
+
+# ---------------------------------------------------------------------------
+# Misc helpers
+# ---------------------------------------------------------------------------
+
+def _fmt_dur(seconds: float) -> str:
+    """Human-readable short duration: 0.8s, 12s, 3m 20s, 1h 15m."""
+    if seconds < 0:
+        seconds = 0
+    if seconds < 1:
+        return f"{seconds * 1000:.0f}ms"
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 3600:
+        m = int(seconds // 60)
+        s = int(seconds % 60)
+        return f"{m}m {s}s"
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    return f"{h}h {m}m"
+
+
+def _open_in_file_manager(path: Path) -> None:
+    try:
+        if sys.platform.startswith("darwin"):
+            subprocess.Popen(["open", str(path)])
+        elif sys.platform.startswith("win"):
+            subprocess.Popen(["explorer", str(path)])
+        else:
+            subprocess.Popen(["xdg-open", str(path)])
+    except Exception as e:  # noqa: BLE001
+        log.warning("Could not open %s: %s", path, e)
