@@ -283,10 +283,12 @@ class _TrainWorker(QThread):
         early_stopping_patience: int,
         use_trigger_segments: bool = True,
         onset_delay_ms: float = 150.0,
-        intra_trial_split: bool = False,
-        split_ratios: Tuple[float, float, float] = _DEFAULT_INTRA_SPLIT_RATIOS,
+            intra_trial_split: bool = False,
+            split_ratios: Tuple[float, float, float] = _DEFAULT_INTRA_SPLIT_RATIOS,
+            random_state: int = 42,
     ):
         super().__init__()
+        self._seed = int(random_state)
         self._loader    = loader
         self._train_recs = train_recs
         self._test_recs  = test_recs
@@ -609,7 +611,8 @@ class _TrainWorker(QThread):
         elif self._ch_reduce == "pca":
             from sklearn.decomposition import PCA
             flat_tr = X_tr.reshape(len(X_tr), -1)
-            pca = PCA(n_components=n_keep, svd_solver="randomized", random_state=42)
+            pca = PCA(n_components=n_keep, svd_solver="randomized",
+                      random_state=self._seed)
             flat_tr2 = pca.fit_transform(flat_tr).astype(np.float32)
             flat_v   = pca.transform(X_v.reshape(len(X_v), -1)).astype(np.float32) if len(X_v)  else np.empty((0, n_keep), np.float32)
             flat_te  = pca.transform(X_te.reshape(len(X_te), -1)).astype(np.float32) if len(X_te) else np.empty((0, n_keep), np.float32)
@@ -627,7 +630,8 @@ class _TrainWorker(QThread):
         # higher than cross-subject test performance and is NOT a reliable
         # predictor of how the model generalises to new subjects.  Use LOSO
         # whenever train / test are split by subject.
-        skf = StratifiedKFold(n_splits=self._cv_folds, shuffle=True, random_state=42)
+        skf = StratifiedKFold(n_splits=self._cv_folds, shuffle=True,
+                              random_state=self._seed)
         results = []
         for fold_i, (tr_idx, va_idx) in enumerate(skf.split(X, y)):
             self.progress.emit(38 + fold_i * 3, f"CV fold {fold_i+1}/{self._cv_folds}…")
@@ -2274,6 +2278,7 @@ class QuattrocentoTrainingDialog(QDialog):
             onset_delay_ms=cfg.onset_delay,
             intra_trial_split=cfg.use_intra_split,
             split_ratios=cfg.split_ratios,
+            random_state=int(getattr(self.config, "seed", 42) or 42),
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.epoch_update.connect(self._on_epoch_update)

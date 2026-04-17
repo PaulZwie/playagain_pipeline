@@ -1245,30 +1245,68 @@ class CNNClassifier(BaseClassifier):
                 "feature_count": C, "training_time": time.time() - start_time,
                 "epochs_trained": len(history["train_loss"])}
 
+    def _coerce_to_3d(self, X: np.ndarray) -> np.ndarray:
+        """
+        Mirror the shape-handling from ``train()``. Accepts:
+          - (N, C, T) — return as-is (after extract_features transpose)
+          - (N, F)    — reshape to (N, 1, F) as a single-channel view
+          - (N, C1, C2, T) — flatten the two channel axes into one
+
+        Raises ValueError for anything else, with a message pointing at
+        the exact shape seen so callers can diagnose upstream bugs.
+        """
+        X_proc = self.extract_features(X)
+        if X_proc.ndim == 2:
+            # (N, F) — matches the train-time 2-D fallback at line 1136.
+            return X_proc[:, np.newaxis, :]
+        if X_proc.ndim == 4:
+            # (N, C1, C2, T) — collapse channel axes, matches line 1143–1145.
+            N = X_proc.shape[0]
+            C = X_proc.shape[1] * X_proc.shape[2]
+            T = X_proc.shape[3]
+            return X_proc.reshape(N, C, T)
+        if X_proc.ndim == 3:
+            return X_proc
+        raise ValueError(
+            f"CNN expects input with 2, 3, or 4 dimensions, got {X_proc.shape}"
+        )
+
     def predict(self, X):
-        if not self._is_trained: raise ValueError("Model not trained")
-        X_proc = self.extract_features(X); N, C, T = X_proc.shape
-        expected_C = self._scaler.n_features_in_ if hasattr(self._scaler, 'n_features_in_') else C
+        if not self._is_trained:
+            raise ValueError("Model not trained")
+        X_proc = self._coerce_to_3d(X)
+        N, C, T = X_proc.shape
+        expected_C = self._scaler.n_features_in_ if hasattr(self._scaler, "n_features_in_") else C
         if C == expected_C:
-            X_scaled = self._scaler.transform(X_proc.transpose(0, 2, 1).reshape(-1, C)).reshape(N, T, C).transpose(0, 2, 1)
-        else: X_scaled = X_proc
+            X_scaled = self._scaler.transform(
+                X_proc.transpose(0, 2, 1).reshape(-1, C)
+            ).reshape(N, T, C).transpose(0, 2, 1)
+        else:
+            X_scaled = X_proc
         device = resolve_device(self.hyperparameters["device"])
         X_tensor = torch.FloatTensor(X_scaled).to(device)
         self._model.eval()
-        with torch.inference_mode(): _, predicted = self._model(X_tensor).max(1)
+        with torch.inference_mode():
+            _, predicted = self._model(X_tensor).max(1)
         return predicted.cpu().numpy()
 
     def predict_proba(self, X):
-        if not self._is_trained: raise ValueError("Model not trained")
-        X_proc = self.extract_features(X); N, C, T = X_proc.shape
-        expected_C = self._scaler.n_features_in_ if hasattr(self._scaler, 'n_features_in_') else C
+        if not self._is_trained:
+            raise ValueError("Model not trained")
+        X_proc = self._coerce_to_3d(X)
+        N, C, T = X_proc.shape
+        expected_C = self._scaler.n_features_in_ if hasattr(self._scaler, "n_features_in_") else C
         if C == expected_C:
-            X_scaled = self._scaler.transform(X_proc.transpose(0, 2, 1).reshape(-1, C)).reshape(N, T, C).transpose(0, 2, 1)
-        else: X_scaled = X_proc
+            X_scaled = self._scaler.transform(
+                X_proc.transpose(0, 2, 1).reshape(-1, C)
+            ).reshape(N, T, C).transpose(0, 2, 1)
+        else:
+            X_scaled = X_proc
         device = resolve_device(self.hyperparameters["device"])
         X_tensor = torch.FloatTensor(X_scaled).to(device)
         self._model.eval()
-        with torch.inference_mode(): probs = torch.softmax(self._model(X_tensor), dim=1)
+        with torch.inference_mode():
+            probs = torch.softmax(self._model(X_tensor), dim=1)
         return probs.cpu().numpy()
 
     def save(self, path):

@@ -897,6 +897,17 @@ class TrainingProgressDialog(QDialog):
             else:
                 self.dataset_combo = None
 
+            self.seed_spin = QSpinBox()
+            self.seed_spin.setRange(0, 2 ** 31 - 1)
+            self.seed_spin.setValue(int(getattr(self.config, "seed", 42) or 42))
+            self.seed_spin.setToolTip(
+                "Random seed for the train/val split. Keep constant across runs "
+                "for reproducibility; change it to see how sensitive the numbers "
+                "are to the split."
+            )
+            selection_layout.addWidget(QLabel("Random seed:"), 2, 0)
+            selection_layout.addWidget(self.seed_spin, 2, 1)
+
             layout.addWidget(selection_group)
 
         # Dataset info group
@@ -1190,8 +1201,15 @@ class TrainingProgressDialog(QDialog):
             # Split data
             X = self.dataset["X"]
             y = self.dataset["y"]
+
+            # Seed from config if present, else preserve v1 default of 42.
+            # Using getattr keeps PipelineConfig definitions backward compatible
+            # — older configs without a `seed` field still work.
+            random_state = int(getattr(self.config, "seed", 42) or 42)
+            self._log(f"  split seed: {random_state}")
+
             X_train, X_val, y_train, y_val = train_test_split(
-                X, y, test_size=0.2, stratify=y, random_state=42
+                X, y, test_size=0.2, stratify=y, random_state=random_state
             )
 
             self._log(f"Dataset split: Train={len(X_train)}, Validation={len(X_val)}")
@@ -1205,6 +1223,7 @@ class TrainingProgressDialog(QDialog):
                 "window_size_ms": self.dataset["metadata"].get("window_size_ms", 200),
                 "sampling_rate": self.dataset["metadata"].get("sampling_rate", 2000),
                 "num_channels": self.dataset["metadata"].get("num_channels", 0),
+                "random_state": random_state,
             }
 
             self._worker = TrainingWorker(model, X_train, y_train, X_val, y_val, kwargs)
