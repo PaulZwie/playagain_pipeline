@@ -145,6 +145,16 @@ playagain_pipeline/
 ├── utils/
 │   ├── __init__.py
 │   └── platform_utils.py
+├── validation/
+│   ├── __init__.py
+│   ├── __main__.py
+│   ├── config.py
+│   ├── corpus.py
+│   ├── cv_strategies_holdout.py
+│   ├── cv_strategies.py
+│   ├── README.md
+│   ├── runner.py
+│   └── configurations/
 └── data/
     ├── Participant_Info/
     ├── calibrations/
@@ -153,8 +163,8 @@ playagain_pipeline/
     ├── models/
     ├── quattrocento/
     ├── scripts/
-    └── sessions/
-```
+    ├── sessions/
+    └── validation_runs/
 
 ## Core Concepts
 
@@ -300,6 +310,15 @@ The Performance Review tab supports comparison experiments with:
 - Deep model live training curves (MLP/CNN/AttentionNet/MSTNet).
 - Aggregated metrics and confusion/report outputs.
 
+### Validation Harness (`validation/`)
+
+A reproducible, config-driven validation harness for the EMG pipeline. It allows for rigorous evaluation of features and models, supporting:
+
+- **Two domains, one corpus:** Uniformly reads sessions from both the Python `pipeline` and Unity C# `game` recorders, allowing cross-domain experiments (e.g., train on pipeline, test on Unity).
+- **Honest Cross-Validation (CV):** Validates models using rigorous boundaries (`loso_session`, `loso_subject`, `k_fold_subjects`, `cross_domain`, `holdout_split`) to prevent train/test data leakage.
+- **Reproducibility:** Every run outputs timestamped artifacts including the config, git SHA, and results. Rerunning with the same git commit and data produces bit-identical numbers.
+- **CLI Commands:** Use `python -m playagain_pipeline.validation summary | list | run <yaml_config>`.
+
 ## End-to-End Workflow
 
 ### 1) Record Sessions
@@ -334,6 +353,12 @@ The Performance Review tab supports comparison experiments with:
 2. Stream EMG and Unity game-state messages concurrently.
 3. Stop recording to finalize CSV and session config output.
 
+### 6) Run Automated Validation
+
+1. Define an experiment YAML config (e.g. `experiments/loso_baseline.yaml`).
+2. Run `python -m playagain_pipeline.validation run experiments/loso_baseline.yaml`.
+3. Review results in `data/validation_runs/<timestamp>_<name>/`.
+
 ## Data Artifacts
 
 ### Sessions (`data/sessions/<subject>/<session>/`)
@@ -358,6 +383,14 @@ The Performance Review tab supports comparison experiments with:
 
 - CSV samples with prediction and game-state fields
 - Session-level config/metadata companion files (when enabled by recorder)
+
+### Validation Runs (`data/validation_runs/<timestamp>_<name>/`)
+
+- `experiment.json` (frozen configuration used for the run)
+- `environment.json` (git SHA, python and key dependency versions)
+- `session_index.json` (all session paths used across all folds)
+- `results.json` (machine-readable metrics)
+- `results.csv` (pandas/Excel-friendly flat table)
 
 ## Scripting API
 

@@ -70,9 +70,12 @@ class DataManager:
         """Resolve a session folder across legacy (raw) and sanitised naming."""
         raw_subject = self.sessions_dir / str(subject_id)
         safe_subject = self.sessions_dir / self._sanitize_path_component(subject_id)
+        
+        unity_raw_subject = self.sessions_dir / "unity_sessions" / str(subject_id)
+        unity_safe_subject = self.sessions_dir / "unity_sessions" / self._sanitize_path_component(subject_id)
 
         subject_candidates = []
-        for candidate in (raw_subject, safe_subject):
+        for candidate in (raw_subject, safe_subject, unity_raw_subject, unity_safe_subject):
             if candidate not in subject_candidates:
                 subject_candidates.append(candidate)
 
@@ -210,30 +213,42 @@ class DataManager:
         subject_dir = self.sessions_dir / str(subject_id)
         if not subject_dir.exists():
             subject_dir = self.sessions_dir / self._sanitize_path_component(subject_id)
-        if not subject_dir.exists():
+        
+        unity_dir = self.sessions_dir / "unity_sessions" / str(subject_id)
+        if not unity_dir.exists():
+            unity_dir = self.sessions_dir / "unity_sessions" / self._sanitize_path_component(subject_id)
+            
+        directories_to_check = []
+        if subject_dir.exists():
+            directories_to_check.append(subject_dir)
+        if unity_dir.exists():
+            directories_to_check.append(unity_dir)
+            
+        if not directories_to_check:
             return []
 
         sessions = []
-        for d in subject_dir.iterdir():
-            if d.is_dir():
-                metadata_path = d / "metadata.json"
-                if metadata_path.exists():
-                    try:
-                        with open(metadata_path, 'r') as f:
-                            data = json.load(f)
-                        # created_at lives at the top level of metadata.json,
-                        # not nested under a "metadata" key.
-                        raw_ts = (
-                            data.get("created_at")
-                            or data.get("metadata", {}).get("created_at")
-                        )
-                        created_at = datetime.fromisoformat(raw_ts) if raw_ts else datetime.min
-                        sessions.append((d.name, created_at))
-                    except (KeyError, ValueError, TypeError):
-                        # If can't parse, use directory name as fallback
+        for d_t in directories_to_check:
+            for d in d_t.iterdir():
+                if d.is_dir():
+                    metadata_path = d / "metadata.json"
+                    if metadata_path.exists():
+                        try:
+                            with open(metadata_path, 'r') as f:
+                                data = json.load(f)
+                            # created_at lives at the top level of metadata.json,
+                            # not nested under a "metadata" key.
+                            raw_ts = (
+                                data.get("created_at")
+                                or data.get("metadata", {}).get("created_at")
+                            )
+                            created_at = datetime.fromisoformat(raw_ts) if raw_ts else datetime.min
+                            sessions.append((d.name, created_at))
+                        except (KeyError, ValueError, TypeError):
+                            # If can't parse, use directory name as fallback
+                            sessions.append((d.name, datetime.min))
+                    else:
                         sessions.append((d.name, datetime.min))
-                else:
-                    sessions.append((d.name, datetime.min))
 
         # Sort by creation time, then by name for stable ordering
         sessions.sort(key=lambda x: (x[1], self._natural_sort_key(x[0])))

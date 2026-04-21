@@ -33,7 +33,7 @@ from playagain_pipeline.core.data_manager import DataManager
 from playagain_pipeline.core.gesture import GestureSet, create_default_gesture_set, create_single_gesture_set
 from playagain_pipeline.core.session import RecordingSession
 from playagain_pipeline.devices.emg_device import (DeviceManager, DeviceType, SyntheticEMGDevice)
-from playagain_pipeline.gui.widgets.emg_plot import EMGPlotWidget
+from playagain_pipeline.gui.widgets.emg_plot_reworked import EMGPlotWidget
 from playagain_pipeline.gui.widgets.performance_tab import PerformanceReviewTab
 from playagain_pipeline.gui.widgets.protocol_widget import ProtocolWidget
 from playagain_pipeline.models.classifier import ModelManager, BaseClassifier, apply_bad_channel_strategy

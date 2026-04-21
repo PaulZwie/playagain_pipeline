@@ -33,9 +33,9 @@ from playagain_pipeline.core.data_manager import DataManager
 from playagain_pipeline.core.gesture import GestureSet, create_default_gesture_set, create_single_gesture_set
 from playagain_pipeline.core.session import RecordingSession
 from playagain_pipeline.devices.emg_device import (DeviceManager, DeviceType, SyntheticEMGDevice)
-from playagain_pipeline.gui.widgets.emg_plot import EMGPlotWidget
+from playagain_pipeline.gui.widgets.emg_plot_panel import EMGPlotPanel
 from playagain_pipeline.gui.widgets.validation_tab import ValidationTab
-from playagain_pipeline.gui.widgets.protocol_widget import ProtocolWidget
+from playagain_pipeline.gui.widgets.protocol_popup import ProtocolPopup
 from playagain_pipeline.models.classifier import ModelManager, BaseClassifier, apply_bad_channel_strategy
 from playagain_pipeline.protocols.protocol import (
     RecordingProtocol,
@@ -51,6 +51,7 @@ from playagain_pipeline.prediction_server import PredictionServer, PredictionSmo
 from playagain_pipeline.gui.widgets.busy_overlay import run_blocking
 from playagain_pipeline.gui.widgets.workflow_stepper import WorkflowStepper
 from playagain_pipeline.game_recorder import GameRecorder
+
 
 
 # ---------------------------------------------------------------------------
@@ -267,7 +268,7 @@ class MainWindow(QMainWindow):
         self._gui_smoother: Optional[PredictionSmoother] = None
 
         # Plot widget
-        self._plot_widget: Optional[EMGPlotWidget] = None
+        #self._plot_widget: Optional[EMGPlotWidget] = None
 
         # Ground truth label for session replay
         self._current_ground_truth_label: Optional[str] = None
@@ -441,29 +442,30 @@ class MainWindow(QMainWindow):
 
         splitter.addWidget(left_panel)
 
-        # Right panel - Visualization
+        # Right panel — fixed live EMG plot (always visible while the
+        # app is running). ``self._plot_widget`` was already created in
+        # ``_create_recording_tab`` as an EMGPlotPanel; we just host it
+        # here in the main splitter rather than inside the Record tab.
         right_panel = QWidget()
         right_layout = QVBoxLayout(right_panel)
-
-        # EMG Visualization Widget
-        plot_group = QGroupBox("EMG Visualization")
-        plot_layout = QVBoxLayout(plot_group)
-
-        # Initialize with default settings, will be updated when device connects
-        self._plot_widget = EMGPlotWidget(num_channels=32, sampling_rate=2000)
-        self._plot_widget.bad_channels_updated.connect(self._on_bad_channels_updated)
-        plot_layout.addWidget(self._plot_widget)
-
-        right_layout.addWidget(plot_group, stretch=3)
-
-        # Protocol display
-        self.protocol_widget = ProtocolWidget()
-        right_layout.addWidget(self.protocol_widget, stretch=1)
+        right_layout.setContentsMargins(0, 0, 0, 0)
+        right_layout.addWidget(self._plot_widget, stretch=1)
 
         splitter.addWidget(right_panel)
 
-        # Set splitter proportions
-        splitter.setSizes([500, 700])
+        # Gesture instructions are shown in a floating popup during
+        # recording instead of occupying the sidebar. Existing calls
+        # like ``self.protocol_widget.set_protocol(...)``, ``.start()``,
+        # ``.stop()``, and ``.gesture_display.clear()`` all continue to
+        # work — ProtocolPopup forwards them to its inner ProtocolWidget.
+        self.protocol_widget = ProtocolPopup(parent=self)
+        # Let the popup's red "Stop Recording" button drive the existing
+        # stop handler, so the popup acts as a remote for the Record tab.
+        self.protocol_widget.stop_requested.connect(self._on_stop_recording)
+
+        # Set splitter proportions — left (controls + log) vs. right
+        # (live plot). The plot benefits from a generous share.
+        splitter.setSizes([700, 600])
 
         # Status bar
         self.status_bar = QStatusBar()
@@ -593,6 +595,21 @@ class MainWindow(QMainWindow):
         self.disconnect_btn.clicked.connect(self._on_disconnect_device)
         device_btn_layout.addWidget(self.disconnect_btn)
         device_layout.addRow(device_btn_layout)
+
+        # Build the live plot panel here (where we already have the
+        # channel/sampling-rate defaults handy) but do NOT add it to
+        # the Record-tab form layout — ``_setup_ui`` re-parents it to
+        # the main splitter's right panel so it stays visible across
+        # every tab. A small breadcrumb replaces it in the form so
+        # users wondering "where did the plot go?" can find it.
+        self._plot_widget = EMGPlotPanel(num_channels=32, sampling_rate=2000)
+        self._plot_widget.bad_channels_updated.connect(self._on_bad_channels_updated)
+
+        _live_plot_note = QLabel("Shown in the right panel  →")
+        _live_plot_note.setStyleSheet(
+            "color: #64748b; font-size: 10px; font-style: italic;"
+        )
+        device_layout.addRow("Live plot:", _live_plot_note)
 
         scroll_layout.addWidget(device_group)
 
@@ -1646,22 +1663,28 @@ class MainWindow(QMainWindow):
 
     def _log(self, message: str):
         """Add message to log with color coding."""
-        timestamp = datetime.now().strftime("%H:%M:%S")
-        # Color-code by content keywords for quick visual scanning
-        if any(k in message.lower() for k in ("error", "failed", "critical")):
-            color = "#f48771"  # red-ish
-        elif any(k in message.lower() for k in ("warning", "mismatch", "skipped")):
-            color = "#e5c07b"  # amber
-        elif any(k in message.lower() for k in ("complete", "success", "loaded", "saved", "started", "connected")):
-            color = "#98c379"  # green
-        else:
-            color = "#d4d4d4"  # default light grey
-        ts_html = f'<span style="color:#858585;">[{timestamp}]</span>'
-        msg_html = f'<span style="color:{color};">{message}</span>'
-        self.log_text.append(f"{ts_html} {msg_html}")
-        self.log_text.verticalScrollBar().setValue(
-            self.log_text.verticalScrollBar().maximum()
-        )
+        try:
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            # Color-code by content keywords for quick visual scanning
+            if any(k in message.lower() for k in ("error", "failed", "critical")):
+                color = "#f48771"  # red-ish
+            elif any(k in message.lower() for k in ("warning", "mismatch", "skipped")):
+                color = "#e5c07b"  # amber
+            elif any(k in message.lower() for k in ("complete", "success", "loaded", "saved", "started", "connected")):
+                color = "#98c379"  # green
+            else:
+                color = "#d4d4d4"  # default light grey
+            ts_html = f'<span style="color:#858585;">[{timestamp}]</span>'
+            msg_html = f'<span style="color:{color};">{message}</span>'
+            self.log_text.append(f"{ts_html} {msg_html}")
+            self.log_text.verticalScrollBar().setValue(
+                self.log_text.verticalScrollBar().maximum()
+            )
+        except RuntimeError as e:
+            if "already deleted" in str(e):
+                pass
+            else:
+                raise
 
     def closeEvent(self, event):
         """Handle window close."""
@@ -2068,16 +2091,22 @@ class MainWindow(QMainWindow):
     @Slot(np.ndarray)
     def _on_data_received(self, data: np.ndarray):
         """Handle incoming EMG data."""
-        bad_channels = self._get_excluded_channels()
+        try:
+            bad_channels = self._get_excluded_channels()
 
-        # Always show ALL channels in the plot (including bad ones) so the
-        # checkbox state is not reset by reconfiguring the plot widget.
-        if self._plot_widget and self._plot_widget.isVisible():
-            if data.shape[1] != self._plot_widget.num_channels:
-                old_ch = self._plot_widget.num_channels
-                self._plot_widget.set_num_channels(data.shape[1])
-                self._log(f"Plot display reconfigured: {old_ch} -> {data.shape[1]} channels")
-            self._plot_widget.update_data(data)
+            # Always show ALL channels in the plot (including bad ones) so the
+            # checkbox state is not reset by reconfiguring the plot widget.
+            if self._plot_widget and self._plot_widget.isVisible():
+                if data.shape[1] != self._plot_widget.num_channels:
+                    old_ch = self._plot_widget.num_channels
+                    self._plot_widget.set_num_channels(data.shape[1])
+                    self._log(f"Plot display reconfigured: {old_ch} -> {data.shape[1]} channels")
+                self._plot_widget.update_data(data)
+        except RuntimeError as e:
+            if "already deleted" in str(e):
+                pass
+            else:
+                raise
 
         downstream_data = apply_bad_channel_strategy(
             data,
@@ -2376,15 +2405,21 @@ class MainWindow(QMainWindow):
     # Calibration handlers
     def _refresh_cal_sessions(self):
         """Refresh the subject and session combos in the calibration tab."""
-        self.cal_subject_combo.blockSignals(True)
-        self.cal_subject_combo.clear()
-        subjects = self.data_manager.list_subjects()
-        self.cal_subject_combo.addItems(subjects)
-        self.cal_subject_combo.blockSignals(False)
+        try:
+            self.cal_subject_combo.blockSignals(True)
+            self.cal_subject_combo.clear()
+            subjects = self.data_manager.list_subjects()
+            self.cal_subject_combo.addItems(subjects)
+            self.cal_subject_combo.blockSignals(False)
 
-        # Trigger session reload for current subject
-        if subjects:
-            self._on_cal_subject_changed(self.cal_subject_combo.currentText())
+            # Trigger session reload for current subject
+            if subjects:
+                self._on_cal_subject_changed(self.cal_subject_combo.currentText())
+        except RuntimeError as e:
+            if "already deleted" in str(e):
+                pass
+            else:
+                raise
 
     def _on_cal_subject_changed(self, subject: str):
         """Load sessions for the selected calibration subject."""
@@ -4079,13 +4114,13 @@ class MainWindow(QMainWindow):
         self.connect_btn.setEnabled(True)
         self.disconnect_btn.setEnabled(False)
 
-
 def main():
     """Entry point for the GUI application."""
     import sys
     from PySide6.QtWidgets import QApplication
+    from playagain_pipeline.gui.widgets.main_window_v2 import MainWindowV2
 
     app = QApplication.instance() or QApplication(sys.argv)
-    window = MainWindow()
+    window = MainWindowV2()
     window.show()
     sys.exit(app.exec())

@@ -2278,7 +2278,7 @@ class QuattrocentoTrainingDialog(QDialog):
             onset_delay_ms=cfg.onset_delay,
             intra_trial_split=cfg.use_intra_split,
             split_ratios=cfg.split_ratios,
-            random_state=int(getattr(self.config, "seed", 42) or 42),
+            random_state=int(getattr(cfg, "seed", 42) or 42),
         )
         self._worker.progress.connect(self._on_progress)
         self._worker.epoch_update.connect(self._on_epoch_update)
