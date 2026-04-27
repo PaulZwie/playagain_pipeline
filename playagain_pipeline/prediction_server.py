@@ -216,6 +216,11 @@ class PredictionServer:
         # Callbacks for external consumers (e.g., GameRecorder, GUI updates)
         self._prediction_callbacks: List[Callable] = []
         self._game_state_callbacks: List[Callable] = []
+        # Fired once per Unity session when Level 1 finishes loading and the
+        # child has pressed Start. TrainingGameCoordinator uses this to defer
+        # recording until the child is actually playing, not looking at the
+        # "Fuchs Abenteuer" main menu.
+        self._game_level_started_callbacks: List[Callable] = []
 
         # Pause flag: when True, EMG data is accepted but predictions are not run
         self._paused = False
@@ -246,7 +251,7 @@ class PredictionServer:
     def set_model(self, model: BaseClassifier):
         """Set the model to use for predictions."""
         self._model = model
-        
+
         # Initialize prediction buffer with a reasonable default.
         # The actual channel count is determined when EMG data arrives via
         # on_emg_data, which will resize the buffer if needed.
@@ -343,19 +348,45 @@ class PredictionServer:
         except ValueError:
             pass
 
+    def add_game_level_started_callback(self, callback: Callable):
+        """
+        Register a callback for the ``game_level_started`` message.
+
+        Callback signature: ``callback() -> None``
+
+        Fired once per Unity session when the child has clicked Start
+        and Level 1 has finished loading. This is the signal the
+        TrainingGameCoordinator waits for before it begins recording —
+        it guarantees the first CSV sample lines up with the first
+        frame of gameplay, not with the Unity boot screen or the main
+        menu.
+
+        Older Unity builds that don't send this message will not
+        trigger the callback; the coordinator falls back to a timeout
+        in that case.
+        """
+        self._game_level_started_callbacks.append(callback)
+
+    def remove_game_level_started_callback(self, callback: Callable):
+        """Remove a previously registered game_level_started callback."""
+        try:
+            self._game_level_started_callbacks.remove(callback)
+        except ValueError:
+            pass
+
     def start(self):
         """Start the TCP server and begin accepting connections."""
         if self._running:
             print("[PredictionServer] Already running")
             return
-        
+
         try:
             self._server_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self._server_socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
             self._server_socket.bind((self.host, self.port))
             self._server_socket.listen(5)
             self._server_socket.settimeout(1.0)  # Allow periodic check for shutdown
-            
+
             self._running = True
 
             # Drain any stale data in the queue
@@ -382,7 +413,7 @@ class PredictionServer:
                 target=self._accept_loop, daemon=True, name="PredictionServer-Accept"
             )
             self._accept_thread.start()
-            
+
             print(f"[PredictionServer] Listening on {self.host}:{self.port}")
         except OSError as e:
             print(f"[PredictionServer] Failed to start: {e}")
@@ -392,10 +423,10 @@ class PredictionServer:
         """Stop the server and disconnect all clients."""
         if not self._running:
             return
-        
+
         print("[PredictionServer] Stopping...")
         self._running = False
-        
+
         # Close all client connections
         with self._clients_lock:
             for client in self._clients:
@@ -404,7 +435,7 @@ class PredictionServer:
                 except OSError:
                     pass
             self._clients.clear()
-        
+
         # Close server socket
         if self._server_socket:
             try:
@@ -412,7 +443,7 @@ class PredictionServer:
             except OSError:
                 pass
             self._server_socket = None
-        
+
         # Wake sender thread and wait for it
         try:
             self._send_queue.put_nowait(None)
@@ -437,7 +468,7 @@ class PredictionServer:
         for thread in self._reader_threads:
             thread.join(timeout=1.0)
         self._reader_threads.clear()
-        
+
         print("[PredictionServer] Stopped")
 
     def on_emg_data(self, data: np.ndarray):
@@ -520,19 +551,19 @@ class PredictionServer:
             # Get class name
             class_names = self._model.metadata.class_names
             gesture_name = class_names.get(int(pred), class_names.get(str(pred), f"class_{pred}"))
-            
+
             # Get confidence
             try:
                 confidence = float(proba[int(pred)])
             except (IndexError, KeyError):
                 confidence = float(np.max(proba))
-            
+
             # Build probabilities dict
             probabilities = {}
             for idx, p in enumerate(proba):
                 name = class_names.get(idx, class_names.get(str(idx), f"class_{idx}"))
                 probabilities[name] = round(float(p), 4)
-            
+
             # Apply smoothing if enabled
             if self._smoothing_enabled:
                 gesture_name, pred_id, confidence, probabilities = self._smoother.smooth(
@@ -540,20 +571,20 @@ class PredictionServer:
                 )
             else:
                 pred_id = int(pred)
-            
+
             # Update state
             self._latest_gesture = gesture_name
             self._latest_gesture_id = pred_id
             self._latest_confidence = confidence
             self._latest_probabilities = probabilities
-            
+
             # Notify prediction callbacks (e.g., GameRecorder)
             for cb in self._prediction_callbacks:
                 try:
                     cb(gesture_name, pred_id, confidence, probabilities)
                 except Exception as e:
                     print(f"[PredictionServer] Prediction callback error: {e}")
-            
+
             # Broadcast to connected clients (Unity)
             self._broadcast_prediction(
                 gesture=gesture_name,
@@ -635,12 +666,12 @@ class PredictionServer:
                 # A very short timeout here can trigger false disconnects when
                 # no Unity->Python traffic is sent for brief periods.
                 client.settimeout(None)
-                
+
                 with self._clients_lock:
                     self._clients.append(client)
-                
+
                 print(f"[PredictionServer] Client connected from {addr}")
-                
+
                 # Send a handshake message with model info
                 if self._model and self._model.metadata:
                     handshake = {
@@ -667,7 +698,7 @@ class PredictionServer:
                 )
                 reader_thread.start()
                 self._reader_threads.append(reader_thread)
-                
+
             except socket.timeout:
                 continue
             except OSError:
@@ -721,6 +752,19 @@ class PredictionServer:
                             except Exception as e:
                                 print(f"[PredictionServer] Game state callback error: {e}")
 
+                    elif msg_type == "game_level_started":
+                        # Unity has finished loading Level 1 and the child
+                        # pressed Start. Fan out to anyone waiting — the
+                        # TrainingGameCoordinator uses this to defer the
+                        # start of CSV recording until gameplay actually
+                        # begins.
+                        print("[PredictionServer] Unity reported game_level_started")
+                        for cb in self._game_level_started_callbacks:
+                            try:
+                                cb()
+                            except Exception as e:
+                                print(f"[PredictionServer] game_level_started callback error: {e}")
+
                 except socket.timeout:
                     # Non-fatal: keep waiting for game-state messages.
                     continue
@@ -755,10 +799,10 @@ def run_standalone(model_name: str, host: str = "127.0.0.1", port: int = 5555,
                    device_type: str = "muovi"):
     """
     Run the prediction server as a standalone process.
-    
+
     This connects to the EMG device, loads the model, and starts
     the TCP server - all without the GUI.
-    
+
     Args:
         model_name: Name of the trained model to load
         host: TCP host to bind to
@@ -768,21 +812,21 @@ def run_standalone(model_name: str, host: str = "127.0.0.1", port: int = 5555,
     # Setup paths
     pipeline_dir = Path(__file__).parent
     data_dir = pipeline_dir / "data"
-    
+
     # Load config
     config = get_default_config()
-    
+
     # Initialize model manager and load model
     model_manager = ModelManager(data_dir / "models")
-    
+
     print(f"[Standalone] Loading model: {model_name}")
     model = model_manager.load_model(model_name)
     print(f"[Standalone] Model loaded: {model.name} ({model.metadata.model_type})")
     print(f"[Standalone] Classes: {model.metadata.class_names}")
-    
+
     # Initialize device
     device_mgr = DeviceManager()
-    
+
     if device_type == "synthetic":
         device = SyntheticEMGDevice(
             num_channels=model.metadata.num_channels,
@@ -792,31 +836,31 @@ def run_standalone(model_name: str, host: str = "127.0.0.1", port: int = 5555,
     else:
         dt = DeviceType.MUOVI_PLUS if device_type == "muovi_plus" else DeviceType.MUOVI
         device_mgr.create_device(dt)
-    
+
     # Start prediction server
     server = PredictionServer(host=host, port=port)
     server.set_model(model)
     server.start()
-    
+
     # Connect device data to server
     def on_data(data: np.ndarray):
         server.on_emg_data(data)
-    
+
     device = device_mgr.device
     if device is None:
         print("[Standalone] ERROR: No device available")
         server.stop()
         return
-    
+
     device.data_callback = on_data
-    
+
     # Connect and start streaming
     print(f"[Standalone] Connecting to {device_type} device...")
     device.connect()
     device.start_streaming()
     print(f"[Standalone] Device streaming. Server ready on {host}:{port}")
     print(f"[Standalone] Press Ctrl+C to stop")
-    
+
     # Wait for interrupt
     try:
         while True:
@@ -849,7 +893,7 @@ def main():
         "--device", default="muovi", choices=["muovi", "muovi_plus", "synthetic"],
         help="EMG device type (default: muovi)"
     )
-    
+
     args = parser.parse_args()
     run_standalone(args.model, args.host, args.port, args.device)
 

@@ -1,0 +1,1062 @@
+"""
+training_game_coordinator.py
+────────────────────────────
+Bridges the dataset-recording protocol with the Unity PlayAgain game so
+children can collect their **first** EMG dataset by playing instead of
+by sitting through a bare "perform gesture now" prompt.
+
+Why this exists
+───────────────
+Collecting the initial dataset is the single biggest friction point in
+the pipeline: the child has no trained model yet, so the game can't
+recognise what they're doing. Without gamification they see a dry cue,
+hold a gesture, rest, repeat — and quickly disengage.
+
+This coordinator fixes that by running the game in **"easy mode"**:
+
+  1. The child opens PlayAgain. An animal walks in on cue from the
+     coordinator (``target_gesture`` message over the existing
+     Unity↔Python TCP channel).
+
+  2. The coordinator watches the EMG stream and computes RMS per
+     chunk. The moment RMS crosses a per-subject threshold while the
+     target trial is active, the coordinator broadcasts a synthetic
+     prediction — ``{"gesture": <current_target>, "confidence": 1.0}``
+     — so Unity's existing ``PipelineGestureClient`` fires
+     ``OnGestureActiveChanged(true)`` and the animal gets fed.
+
+  3. Unity signals back via its normal ``game_state`` callback when
+     the animal walks away. The coordinator closes the current trial
+     in the ``RecordingSession``, queues the next gesture, and repeats.
+
+  4. When every trial is done the coordinator emits ``all_complete``
+     and the GUI tears everything down.
+
+Because the "fake prediction" path uses the same JSON schema Unity
+already parses, no Unity-side change is required to make easy mode
+work. A small optional patch to ``PipelineGestureClient.cs`` lets
+Python drive *which* animal spawns next; without that patch the game
+still plays — animals just come in their Unity-configured order.
+
+Threading model
+───────────────
+  • ``on_emg_data(samples)`` is called from the device thread. It is
+    lock-free and thread-safe by design: a single atomic write to a
+    shared float and a cheap RMS computation.
+  • Trial state (which gesture is active, when to broadcast) lives on
+    a single QTimer tick driven by the GUI thread.
+  • Signals cross threads via Qt's queued connections.
+
+The coordinator never touches the UI directly — it emits Qt signals
+and lets the GUI route them to labels / buttons / the session object.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from dataclasses import dataclass, field
+from typing import List, Optional
+
+import numpy as np
+from PySide6.QtCore import QObject, QTimer, Signal, Slot
+
+from playagain_pipeline.core.session import RecordingSession
+from playagain_pipeline.prediction_server import PredictionServer
+
+log = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Trial schedule
+# ---------------------------------------------------------------------------
+
+@dataclass
+class TrialSpec:
+    """
+    One trial in the easy-mode training schedule.
+
+    Attributes
+    ----------
+    gesture_name : str
+        Name used across the pipeline — must match a gesture in the
+        session's ``GestureSet`` (e.g. ``"fist"``, ``"pinch"``).
+    hold_seconds : float
+        How long the child is expected to hold the gesture. The
+        coordinator doesn't enforce this — Unity's feeding duration
+        does — it's carried through only so the protocol can tell
+        the user what to expect.
+    rest_seconds : float
+        Rest between this trial and the next. Primarily informational.
+    """
+    gesture_name: str
+    hold_seconds: float = 3.0
+    rest_seconds: float = 2.0
+
+
+@dataclass
+class _TrialRuntime:
+    """Runtime bookkeeping for an in-flight trial — not user-facing."""
+    spec: TrialSpec
+    index: int
+    broadcast_sent: bool = False
+    unity_gt_active: bool = False       # Last ground_truth state from Unity
+    started_at_ms: float = field(default_factory=lambda: time.time() * 1000)
+
+
+# ---------------------------------------------------------------------------
+# RMS detector — deliberately tiny
+# ---------------------------------------------------------------------------
+
+class _RmsDetector:
+    """
+    Per-chunk RMS detector with a **frozen** rest baseline.
+
+    Lifecycle
+    ─────────
+    The detector goes through three phases per session:
+
+      ``IDLE``         — no calibration data yet, ``observe()`` is a no-op.
+      ``CALIBRATING``  — Each ``observe()`` call appends the chunk to a
+                          calibration buffer and returns False unconditionally.
+                          The coordinator stays here for ``_BASELINE_SETTLE_MS``
+                          while showing the child a "REST" cue.
+      ``READY``        — ``finalize_calibration()`` has computed the rest RMS
+                          and frozen it. From this point ``observe()`` triggers
+                          when ``rms > frozen_baseline * trigger_ratio`` and
+                          the caller has set ``armed=True``.
+
+    Why frozen
+    ──────────
+    The previous EMA design constantly retrained the baseline during rest
+    intervals, so when a synthetic recording started mid-gesture the baseline
+    settled on gesture-level RMS and the next gesture could not exceed
+    ``baseline × ratio``. With a frozen baseline learned from a dedicated
+    rest cue, the threshold is stable and predictable for the entire
+    session — much closer to how clinical EMG triggers work.
+
+    The threshold ratio defaults to a forgiving 1.3 because the goal here
+    is *motivation*, not precision: we just need to confirm the child
+    *attempted* the gesture so the animal can be fed. Real classification
+    happens later from the recorded data, where the protocol's ground-truth
+    label tells the model what gesture was being performed.
+    """
+
+    PHASE_IDLE        = "idle"
+    PHASE_CALIBRATING = "calibrating"
+    PHASE_READY       = "ready"
+
+    def __init__(self, trigger_ratio: float = 1.3):
+        self._phase: str = self.PHASE_IDLE
+        self._baseline: float = 0.0
+        self._trigger_ratio: float = trigger_ratio
+        self._last_rms: float = 0.0
+        # Per-chunk RMS values collected during CALIBRATING. Median of
+        # these becomes the baseline — robust against the occasional
+        # twitchy chunk a child can't help producing during "rest".
+        self._calibration_rms: list[float] = []
+
+    # ------------------------------------------------------------------
+    # Read-only state
+    # ------------------------------------------------------------------
+
+    @property
+    def last_rms(self) -> float:
+        return self._last_rms
+
+    @property
+    def baseline(self) -> float:
+        return self._baseline
+
+    @property
+    def phase(self) -> str:
+        return self._phase
+
+    @property
+    def is_ready(self) -> bool:
+        return self._phase == self.PHASE_READY
+
+    @property
+    def threshold(self) -> float:
+        """The fixed RMS threshold a chunk must exceed to fire."""
+        return self._baseline * self._trigger_ratio
+
+    # ------------------------------------------------------------------
+    # Phase transitions
+    # ------------------------------------------------------------------
+
+    def begin_calibration(self) -> None:
+        """Switch to CALIBRATING and clear any previous calibration data."""
+        self._phase = self.PHASE_CALIBRATING
+        self._calibration_rms = []
+
+    def finalize_calibration(self) -> bool:
+        """
+        Compute the frozen baseline from the collected rest RMS values
+        and switch to READY.
+
+        Returns
+        -------
+        bool
+            True on success. False if no calibration data was ever
+            observed (e.g. device was disconnected the whole time);
+            in that case the detector stays in CALIBRATING and the
+            coordinator should re-enter calibration or fall back.
+        """
+        if not self._calibration_rms:
+            return False
+        # Median is robust against the occasional gesture twitch a
+        # child sneaks in during a "rest" cue. Mean would let one
+        # bad chunk inflate the threshold.
+        sorted_rms = sorted(self._calibration_rms)
+        n = len(sorted_rms)
+        if n % 2 == 1:
+            self._baseline = sorted_rms[n // 2]
+        else:
+            self._baseline = 0.5 * (sorted_rms[n // 2 - 1] + sorted_rms[n // 2])
+        self._phase = self.PHASE_READY
+        return True
+
+    def reset(self) -> None:
+        """Return to IDLE, dropping the baseline and calibration buffer."""
+        self._phase = self.PHASE_IDLE
+        self._baseline = 0.0
+        self._calibration_rms = []
+
+    # ------------------------------------------------------------------
+    # Sample ingestion
+    # ------------------------------------------------------------------
+
+    def observe(self, samples: np.ndarray, armed: bool) -> bool:
+        """
+        Ingest a chunk and return True iff an armed trigger fired.
+
+        Parameters
+        ----------
+        samples : np.ndarray
+            Shape ``(n_samples, n_channels)``.
+        armed : bool
+            Whether the coordinator currently considers a trigger
+            useful (i.e. there is an active trial that has not yet
+            broadcast). Triggers only fire when the detector is READY
+            *and* armed.
+        """
+        if samples.ndim == 1:
+            samples = samples.reshape(-1, 1)
+
+        rms = float(np.sqrt(np.mean(np.square(samples, dtype=np.float64))))
+        self._last_rms = rms
+
+        if self._phase == self.PHASE_IDLE:
+            return False
+
+        if self._phase == self.PHASE_CALIBRATING:
+            self._calibration_rms.append(rms)
+            return False
+
+        # READY
+        if not armed:
+            return False
+        return rms > self.threshold and rms > 1e-8
+
+
+# ---------------------------------------------------------------------------
+# Public coordinator
+# ---------------------------------------------------------------------------
+
+class TrainingGameCoordinator(QObject):
+    """
+    Runs an easy-mode training session against the Unity game.
+
+    Lifecycle
+    ─────────
+        coord = TrainingGameCoordinator(prediction_server=server, parent=main_win)
+        coord.trial_started.connect(lambda spec, idx: ...)
+        coord.trial_completed.connect(lambda spec, idx: ...)
+        coord.all_complete.connect(lambda: ...)
+
+        coord.set_schedule([TrialSpec("fist"), TrialSpec("pinch"), ...])
+        coord.bind_session(session)                # optional — marks trials
+        coord.start()
+        # feed device samples via coord.on_emg_data(samples) from wherever
+        # they already arrive (main window's _on_data_received does this).
+        coord.stop()    # or wait for all_complete
+
+    Integration points
+    ──────────────────
+      • ``on_emg_data(samples)`` — call from the existing device
+        data handler. Does the RMS work + broadcast decision.
+      • ``on_game_state_from_unity(ground_truth, requested, camera_blocking)``
+        — registered as a callback on the PredictionServer. Detects
+        Unity-side "animal fed" events to advance trials.
+    """
+
+    # ── Signals ────────────────────────────────────────────────────
+    # Arguments use plain Python types / objects to sidestep any
+    # QMetaType registration drama in older PySide builds.
+    trial_started    = Signal(object, int)        # (TrialSpec, index)
+    trial_completed  = Signal(object, int)        # (TrialSpec, index)
+    trigger_fired    = Signal(str, float)         # (gesture, rms) — for UI feedback
+    all_complete     = Signal()
+    rms_updated      = Signal(float, float)       # (rms, baseline) — for a debug meter
+    state_changed    = Signal(str)                # "idle" | "waiting_for_unity" | "running" | "stopped"
+    game_level_started = Signal()                 # Unity reached Level 1 — session begins now
+
+    # Cooldown between triggers for the *same* trial so a single long
+    # contraction doesn't fire twice and Unity has time to transition
+    # the animal to feeding mode.
+    _TRIGGER_COOLDOWN_MS = 1200
+
+    # After the child releases (Unity sets ground_truth=False) we give
+    # a short quiet period before arming the next trial. Keeps the
+    # baseline clean of tail-end contraction energy.
+    _INTER_TRIAL_REST_MS = 800
+
+    # Safety fallback: if Unity never reports game_level_started (older
+    # build without the notifier, or a crash before Level 1), start
+    # anyway after this long so the GUI doesn't wedge. 60 s comfortably
+    # covers a slow Unity boot plus the main-menu click.
+    _GAME_START_TIMEOUT_MS = 60_000
+
+    # Length of the rest-calibration window. The detector spends this
+    # long collecting RMS values from the resting hand; the popup
+    # shows a big "REST — calibrating baseline" cue throughout.
+    # 2 s is long enough for a stable median across ~20 device chunks
+    # at typical chunk rates and short enough not to bore a child.
+    _BASELINE_SETTLE_MS = 2000
+
+    # ── Private signals for cross-thread marshaling ────────────────
+    # The prediction server's reader loop runs on its own network
+    # thread. When it dispatches a callback (game_state /
+    # game_level_started), our handlers cannot directly touch QTimers
+    # or Qt parented to the GUI thread — Qt prints
+    # "QObject::startTimer: Timers cannot be started from another
+    # thread" and silently drops the call.
+    #
+    # The fix: thread-thunk via signals. Emitting a signal from any
+    # thread is always safe; with the default AutoConnection, the
+    # connected slot is invoked on the slot's owning thread (here, the
+    # main GUI thread) via a queued connection. So both handlers
+    # below just emit and return — the real work runs on the right
+    # thread one event-loop hop later.
+    _level_started_main = Signal()
+    _game_state_main    = Signal(bool, str, bool)
+
+    def __init__(
+        self,
+        prediction_server: PredictionServer,
+        parent: Optional[QObject] = None,
+    ):
+        super().__init__(parent)
+        self._server = prediction_server
+        self._detector = _RmsDetector()
+
+        self._schedule: List[TrialSpec] = []
+        self._current: Optional[_TrialRuntime] = None
+        self._next_index: int = 0
+
+        self._running = False
+        # True between start() and the Unity "level started" message
+        # (or the timeout). During this window we register callbacks
+        # but refuse to ingest EMG or issue gesture cues — the
+        # recording must line up with Level 1, not with the Unity boot
+        # screen or the "Fuchs Abenteuer" main menu.
+        self._waiting_for_unity = False
+        self._session: Optional[RecordingSession] = None
+        self._last_trigger_ms: float = 0.0
+        self._arm_time_ms: float = 0.0  # when the current trial becomes eligible
+
+        # Whether session.start_recording() should be invoked by the
+        # coordinator (True) or the GUI already started it (False).
+        # Set via bind_session(..., take_ownership=True) when the GUI
+        # hands us an unstarted session that should begin with Level 1.
+        self._owns_session_lifecycle = False
+
+        # Lightweight tick — RMS meter + inter-trial gating. Runs at a
+        # modest rate because the real triggering is sample-driven in
+        # ``on_emg_data``, not timer-driven.
+        self._tick = QTimer(self)
+        self._tick.setInterval(100)
+        self._tick.timeout.connect(self._on_tick)
+
+        # Cross-thread fan-in. The network-thread callbacks emit these
+        # signals; AutoConnection delivers them on the GUI thread, so
+        # the slots below are free to touch QTimers and Qt-parented
+        # state.
+        self._level_started_main.connect(self._begin_running)
+        self._game_state_main.connect(self._handle_game_state_on_main_thread)
+
+        # Registered on the prediction server so Unity's messages
+        # route back here. Both added on start() and removed on stop()
+        # so the coordinator leaves no trace when inactive.
+        self._game_state_cb = self.on_game_state_from_unity
+        self._level_started_cb = self.on_game_level_started_from_unity
+
+        # Guards against Unity never reporting level_started. Only
+        # active during the waiting window.
+        self._game_start_timeout = QTimer(self)
+        self._game_start_timeout.setSingleShot(True)
+        self._game_start_timeout.timeout.connect(self._on_game_start_timeout)
+
+    # ------------------------------------------------------------------
+    # Configuration
+    # ------------------------------------------------------------------
+
+    def set_schedule(self, trials: List[TrialSpec]) -> None:
+        """Install the trial order. Must be called before ``start()``."""
+        if self._running:
+            raise RuntimeError(
+                "Cannot change schedule while the coordinator is running. "
+                "Call stop() first."
+            )
+        self._schedule = list(trials)
+        self._next_index = 0
+
+    def bind_session(
+        self,
+        session: Optional[RecordingSession],
+        take_ownership: bool = False,
+    ) -> None:
+        """
+        Attach a RecordingSession so the coordinator can call
+        ``start_trial`` / ``end_trial`` at each Unity-driven boundary.
+
+        Parameters
+        ----------
+        session : RecordingSession or None
+            Session to attach. Passing None detaches — useful for
+            dry-run / demo mode.
+        take_ownership : bool
+            When True, the coordinator will call
+            ``session.start_recording()`` itself at the moment Unity
+            reports Level 1 has started, rather than expecting the
+            caller to have started it already. This is the recommended
+            setting when driving the training game — it ensures the
+            first recorded sample lines up with the first frame of
+            gameplay, not with the Unity boot screen.
+        """
+        self._session = session
+        self._owns_session_lifecycle = bool(take_ownership and session is not None)
+
+    def set_trigger_ratio(self, ratio: float) -> None:
+        """
+        How many multiples of the **frozen** rest baseline count as an
+        attempt. Default 1.3 is forgiving on purpose — this is the
+        easy-mode "did the child try?" gate, and the protocol's
+        ground-truth label drives the actual dataset, so a generous
+        threshold mostly costs us a few false positives in exchange
+        for a much-better-engaged child.
+
+        Clinics may push this up to 1.5 or 1.8 once the child is
+        comfortable.
+        """
+        self._detector._trigger_ratio = max(1.05, float(ratio))
+
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    @property
+    def current_target(self) -> Optional[str]:
+        return self._current.spec.gesture_name if self._current else None
+
+    @property
+    def progress(self) -> tuple[int, int]:
+        """(completed, total) — completed counts trials already finished."""
+        total = len(self._schedule)
+        done = self._next_index - (1 if self._current is not None else 0)
+        return (max(0, done), total)
+
+    def start(self, wait_for_unity: bool = True) -> None:
+        """
+        Arm the coordinator.
+
+        When ``wait_for_unity`` is True (default), the coordinator
+        registers for Unity events but *does not* start the recording
+        session or issue gesture cues yet. It stays in the
+        ``waiting_for_unity`` state until either:
+
+          • Unity sends a ``game_level_started`` message (clean path —
+            the child clicked "Start" in the menu and Level 1 is
+            loaded), or
+          • ``_GAME_START_TIMEOUT_MS`` elapses (fallback for older
+            Unity builds without the notifier).
+
+        When ``wait_for_unity`` is False the coordinator begins
+        immediately. Useful for headless tests without Unity running
+        or for debugging the schedule logic standalone.
+        """
+        if self._running or self._waiting_for_unity:
+            return
+        if not self._schedule:
+            raise RuntimeError(
+                "Cannot start — no trials in schedule. Call set_schedule()."
+            )
+
+        self._detector.reset()
+        self._next_index = 0
+        self._current = None
+
+        # Register for Unity → Python messages. Safe to attach even
+        # while waiting; we just refuse to act on game_state until
+        # the level-started flag flips.
+        try:
+            self._server.add_game_state_callback(self._game_state_cb)
+        except Exception:
+            log.exception("Failed to register game_state callback")
+
+        # Older prediction-server builds may not expose the
+        # level-started registry. Feature-detect so one-sided upgrades
+        # don't crash — the timeout fallback covers the gap.
+        if hasattr(self._server, "add_game_level_started_callback"):
+            try:
+                self._server.add_game_level_started_callback(self._level_started_cb)
+            except Exception:
+                log.exception("Failed to register game_level_started callback")
+
+        if wait_for_unity:
+            self._waiting_for_unity = True
+            self._game_start_timeout.start(self._GAME_START_TIMEOUT_MS)
+            self.state_changed.emit("waiting_for_unity")
+            log.info(
+                "Coordinator armed — waiting for Unity to reach Level 1 "
+                "(timeout %.0fs).",
+                self._GAME_START_TIMEOUT_MS / 1000.0,
+            )
+            return
+
+        # Legacy / no-wait path: go immediately.
+        self._begin_running()
+
+    @Slot()
+    def _begin_running(self) -> None:
+        """
+        Transition from waiting / idle into the ``calibrating`` state.
+
+        Called by ``on_game_level_started_from_unity`` on the clean
+        path and by the timeout fallback. Three things happen here:
+
+          1. The recording session starts — so the first CSV sample
+             lines up with Level 1, not with the Unity boot screen.
+          2. The detector enters its CALIBRATING phase. The popup
+             observes ``state_changed("calibrating")`` and shows a
+             "REST — calibrating baseline" cue; the detector silently
+             collects rest RMS values without ever firing.
+          3. After ``_BASELINE_SETTLE_MS`` the baseline is frozen and
+             the trial schedule begins via ``_finish_calibration``.
+        """
+        if self._running:
+            return
+
+        self._game_start_timeout.stop()
+        self._waiting_for_unity = False
+
+        # Start recording now — if we own the session lifecycle — so
+        # the first CSV sample aligns with the first frame of Level 1,
+        # not with the Unity boot screen.
+        if (
+            self._owns_session_lifecycle
+            and self._session is not None
+            and not self._session.is_recording
+        ):
+            try:
+                self._session.start_recording()
+                log.info("Recording session started (Unity reached Level 1).")
+            except Exception:
+                log.exception("Failed to start recording session on Unity cue")
+
+        self._running = True
+        self._tick.start()
+
+        self._detector.begin_calibration()
+        self.state_changed.emit("calibrating")
+        self.game_level_started.emit()
+        log.info(
+            "Calibrating rest baseline for %.1fs…",
+            self._BASELINE_SETTLE_MS / 1000.0,
+        )
+        # Tell Unity to spawn a "rest" cue (no animal yet) so the
+        # child keeps still during calibration. If the Unity build
+        # ignores unknown gestures this is a harmless no-op.
+        self._send_target_gesture_cue("rest", self._BASELINE_SETTLE_MS / 1000.0)
+
+        QTimer.singleShot(self._BASELINE_SETTLE_MS, self._finish_calibration)
+
+    @Slot()
+    def _finish_calibration(self) -> None:
+        """
+        Freeze the baseline learned during calibration and start the
+        actual trial schedule.
+
+        If the device produced no data during calibration (e.g. it was
+        disconnected), fall through to the schedule anyway with the
+        detector still in CALIBRATING — manual buttons still work, the
+        auto-trigger just won't fire. That's preferable to refusing to
+        start the session.
+        """
+        if not self._running:
+            return
+
+        ok = self._detector.finalize_calibration()
+        if ok:
+            log.info(
+                "Baseline frozen at RMS %.4f → threshold %.4f (ratio %.2fx)",
+                self._detector.baseline,
+                self._detector.threshold,
+                self._detector._trigger_ratio,
+            )
+        else:
+            log.warning(
+                "No data observed during calibration — manual triggers will "
+                "still work but the auto-RMS trigger is disabled this session."
+            )
+
+        self.state_changed.emit("running")
+        self._advance()
+
+    @Slot()
+    def _on_game_start_timeout(self) -> None:
+        """
+        Fallback — Unity never reported game_level_started. Start the
+        session anyway and log loud enough that anyone investigating
+        will notice.
+        """
+        if not self._waiting_for_unity:
+            return
+        log.warning(
+            "Unity did not report game_level_started within %.0fs — "
+            "starting the session anyway. If you expected the Unity "
+            "build to send this message, check that GameLevelStartedNotifier "
+            "is present in the Level 1 scene.",
+            self._GAME_START_TIMEOUT_MS / 1000.0,
+        )
+        self._begin_running()
+
+    def on_game_level_started_from_unity(self) -> None:
+        """
+        Registered as a prediction_server ``game_level_started`` callback.
+
+        IMPORTANT: this method runs on the prediction server's network
+        reader thread, *not* the GUI thread. Doing real work here would
+        trip Qt's "Timers cannot be started from another thread" guards
+        and silently break the session. So all we do is emit a signal —
+        the connected slot ``_begin_running`` is invoked on the GUI
+        thread via Qt's auto-queued connection.
+
+        Idempotent: a duplicate emit is a harmless no-op because
+        ``_begin_running`` early-returns when already running.
+        """
+        if not self._waiting_for_unity:
+            return
+        log.info("Unity reported Level 1 loaded — marshaling to GUI thread.")
+        self._level_started_main.emit()
+
+    def stop(self) -> None:
+        """End the schedule, whether partway through or at completion."""
+        if not (self._running or self._waiting_for_unity):
+            return
+
+        was_waiting = self._waiting_for_unity
+        self._running = False
+        self._waiting_for_unity = False
+        self._tick.stop()
+        self._game_start_timeout.stop()
+
+        # Close any open trial in the session so we don't leak state.
+        if self._session is not None and self._current is not None:
+            try:
+                self._session.end_trial(is_valid=False, notes="coordinator stopped early")
+            except Exception:
+                log.exception("Failed to close in-flight trial on stop")
+
+        # If we were running the session ourselves, stop it too.
+        if (
+            self._owns_session_lifecycle
+            and self._session is not None
+            and self._session.is_recording
+        ):
+            try:
+                self._session.stop_recording()
+            except Exception:
+                log.exception("Failed to stop recording session on teardown")
+
+        self._current = None
+
+        try:
+            self._server.remove_game_state_callback(self._game_state_cb)
+        except Exception:
+            pass
+        if hasattr(self._server, "remove_game_level_started_callback"):
+            try:
+                self._server.remove_game_level_started_callback(self._level_started_cb)
+            except Exception:
+                pass
+
+        self.state_changed.emit("stopped" if not was_waiting else "idle")
+
+    # ------------------------------------------------------------------
+    # Data plane — called from the device thread
+    # ------------------------------------------------------------------
+
+    def on_emg_data(self, samples: np.ndarray) -> None:
+        """
+        Feed raw EMG samples in.
+
+        Safe to call from any thread. All state mutated here is either
+        atomic (single floats) or only read from the GUI thread via
+        timers, so no lock is needed. The RMS signal emitted to the UI
+        goes through Qt's queued connection across the thread boundary.
+        """
+        if samples is None or samples.size == 0:
+            return
+
+        # Arm only if we're in a trial *and* past the post-arm settling
+        # window. While disarmed the detector tracks the rest baseline.
+        now_ms = time.time() * 1000
+        armed = bool(
+            self._current is not None
+            and not self._current.broadcast_sent
+            and now_ms >= self._arm_time_ms
+        )
+
+        fired = self._detector.observe(samples, armed=armed)
+
+        # Push the meter update to the UI — coalesced naturally by Qt.
+        self.rms_updated.emit(self._detector.last_rms, self._detector.baseline)
+
+        if not fired:
+            return
+        if now_ms - self._last_trigger_ms < self._TRIGGER_COOLDOWN_MS:
+            return
+
+        self._last_trigger_ms = now_ms
+        cur = self._current
+        if cur is None:
+            return
+
+        # Easy-mode: broadcast a confidence-1.0 "prediction" matching
+        # the current target. Unity's PipelineGestureClient will call
+        # OnGestureActiveChanged(true) and Level 1's GameManager will
+        # feed the animal, exactly as if a real model had fired.
+        cur.broadcast_sent = True
+        self._broadcast_easy_mode_prediction(cur.spec.gesture_name)
+        self.trigger_fired.emit(cur.spec.gesture_name, self._detector.last_rms)
+
+    # ------------------------------------------------------------------
+    # Unity → Python event plane
+    # ------------------------------------------------------------------
+
+    def on_game_state_from_unity(
+        self,
+        ground_truth_active: bool,
+        requested_gesture: str,
+        camera_blocking: bool,
+    ) -> None:
+        """
+        Registered as a prediction_server ``game_state`` callback.
+
+        Runs on the network reader thread — see the docstring on
+        ``on_game_level_started_from_unity`` for the threading
+        rationale. We just emit a queued signal; the actual edge
+        detection happens in ``_handle_game_state_on_main_thread``.
+        """
+        self._game_state_main.emit(
+            bool(ground_truth_active),
+            str(requested_gesture or ""),
+            bool(camera_blocking),
+        )
+
+    @Slot(bool, str, bool)
+    def _handle_game_state_on_main_thread(
+        self,
+        ground_truth_active: bool,
+        requested_gesture: str,
+        camera_blocking: bool,
+    ) -> None:
+        """
+        Main-thread body of the game-state callback.
+
+        Unity's game_state flips ``ground_truth=true`` when the fox
+        reaches an animal (feeding starts) and ``false`` when the
+        animal has been fed and walks away. We treat the rising edge
+        as "trial actually began in the game" and the falling edge as
+        "trial done — advance".
+        """
+        if not self._running or self._current is None:
+            return
+
+        cur = self._current
+
+        # Rising edge — the game confirms the child has engaged with
+        # the animal. Good moment to (re)mark the session boundary.
+        if ground_truth_active and not cur.unity_gt_active:
+            cur.unity_gt_active = True
+            if self._session is not None:
+                # Idempotent: session.start_trial closes any previous
+                # unfinished trial, so double-firing is harmless.
+                try:
+                    self._session.start_trial(cur.spec.gesture_name)
+                except Exception:
+                    log.exception("start_trial failed for %s", cur.spec.gesture_name)
+
+        # Falling edge — animal was fed and has walked away. Close the
+        # trial and schedule the next one after a short rest.
+        if not ground_truth_active and cur.unity_gt_active:
+            cur.unity_gt_active = False
+            if self._session is not None:
+                try:
+                    self._session.end_trial(is_valid=True)
+                except Exception:
+                    log.exception("end_trial failed for %s", cur.spec.gesture_name)
+            self.trial_completed.emit(cur.spec, cur.index)
+            self._current = None
+            # Give the baseline a moment to settle before arming the
+            # next trial — otherwise the tail of this contraction
+            # inflates the resting floor and makes the next trigger
+            # harder.
+            self._arm_time_ms = (time.time() * 1000) + self._INTER_TRIAL_REST_MS
+            QTimer.singleShot(self._INTER_TRIAL_REST_MS, self._advance)
+
+    # ------------------------------------------------------------------
+    # Internal — trial advancement & broadcast
+    # ------------------------------------------------------------------
+
+    def _advance(self) -> None:
+        if not self._running:
+            return
+        if self._current is not None:
+            # A trial is already in flight; don't stack.
+            return
+
+        if self._next_index >= len(self._schedule):
+            # Done!
+            self._running = False
+            self._tick.stop()
+            try:
+                self._server.remove_game_state_callback(self._game_state_cb)
+            except Exception:
+                pass
+            self.state_changed.emit("idle")
+            self.all_complete.emit()
+            return
+
+        spec = self._schedule[self._next_index]
+        self._current = _TrialRuntime(spec=spec, index=self._next_index)
+        self._next_index += 1
+
+        # Tell Unity which animal/gesture to spawn next. If Unity is
+        # running an older build without the target_gesture handler
+        # the message is simply ignored — no harm done.
+        self._send_target_gesture_cue(spec.gesture_name, spec.hold_seconds)
+
+        self.trial_started.emit(spec, self._current.index)
+
+    # ------------------------------------------------------------------
+    # Manual control — used by the GameProtocolPopup buttons
+    # ------------------------------------------------------------------
+
+    # Delay between sending a target_gesture cue (animal walks in) and
+    # firing the easy-mode prediction (animal eats). This needs to be
+    # at least the time Unity's spawner needs to instantiate the animal
+    # and walk it into feeding position. 1500 ms is comfortable on the
+    # default Level 1 layout.
+    _MANUAL_GESTURE_FEED_DELAY_MS = 1500
+
+    def force_trigger(self) -> None:
+        """
+        Fire the current trial's easy-mode broadcast immediately,
+        ignoring the RMS check.
+
+        The "Force Feed Animal" button calls this. Use case: the
+        baseline is mis-calibrated, or the synthetic replay isn't
+        producing a clean threshold crossing, but the clinician can
+        see the child trying and wants to advance the game.
+        """
+        cur = self._current
+        if cur is None or cur.broadcast_sent:
+            return
+        now_ms = time.time() * 1000
+        if now_ms - self._last_trigger_ms < self._TRIGGER_COOLDOWN_MS / 2:
+            return
+        self._last_trigger_ms = now_ms
+        cur.broadcast_sent = True
+        self._broadcast_easy_mode_prediction(cur.spec.gesture_name)
+        log.info("Force-feed: broadcasting easy-mode for %s", cur.spec.gesture_name)
+        self.trigger_fired.emit(cur.spec.gesture_name, self._detector.last_rms)
+
+    def fire_manual_gesture(self, gesture_name: str) -> None:
+        """
+        Demo path: spawn the matching animal AND feed it — independent
+        of the trial schedule.
+
+        Wired to the per-gesture buttons in the popup. Two messages go
+        out, in order:
+
+          1. ``target_gesture`` — Unity's TargetGestureAnimalMapper
+             writes ``SettingsManager.SelectedAnimalType``; the spawner
+             then brings the matching animal in.
+          2. After ``_MANUAL_GESTURE_FEED_DELAY_MS`` — an easy-mode
+             prediction with the same gesture name, so the animal that
+             just arrived gets fed immediately.
+
+        The trial schedule is **not** advanced — these buttons are
+        explicitly "play this gesture for demo / debug", not "this
+        trial is complete". They also don't write any session
+        annotations, so the recorded data isn't polluted by demo fires.
+
+        The delay is safe to spam-click — each click queues another
+        animal+feed pair and Unity processes them in order.
+        """
+        if not gesture_name:
+            return
+        gesture_name = gesture_name.strip().lower()
+        log.info("Manual gesture demo: %s", gesture_name)
+
+        # 1) Spawn-the-animal cue
+        self._send_target_gesture_cue(gesture_name, hold_seconds=2.0)
+
+        # 2) Fire the prediction once the animal has had time to arrive
+        QTimer.singleShot(
+            self._MANUAL_GESTURE_FEED_DELAY_MS,
+            lambda: self._broadcast_easy_mode_prediction(gesture_name),
+        )
+
+        # -1.0 RMS sentinel marks this as a manual fire in any UI meter
+        self.trigger_fired.emit(gesture_name, -1.0)
+
+    def skip_current_trial(self, reason: str = "skipped via UI") -> None:
+        """
+        End the current trial without firing a broadcast and advance
+        to the next one. The skipped trial is marked invalid in the
+        session so it's excluded from training.
+
+        Wired to the popup's "Skip" button — handy when the child gives
+        up on a gesture or the synthetic replay produced no recognisable
+        activity.
+        """
+        cur = self._current
+        if cur is None:
+            return
+        if self._session is not None:
+            try:
+                self._session.end_trial(is_valid=False, notes=reason)
+            except Exception:
+                log.exception("Failed to end skipped trial")
+        self.trial_completed.emit(cur.spec, cur.index)
+        self._current = None
+        self._arm_time_ms = (time.time() * 1000) + self._INTER_TRIAL_REST_MS
+        QTimer.singleShot(self._INTER_TRIAL_REST_MS, self._advance)
+
+    # ------------------------------------------------------------------
+    # Internal — broadcast helpers
+    # ------------------------------------------------------------------
+
+    def _broadcast_easy_mode_prediction(self, gesture_name: str) -> None:
+        """
+        Enqueue a synthetic prediction payload onto the prediction
+        server's existing send queue. Using the server's own queue
+        means the same sender thread that normally dispatches model
+        predictions will handle ours — no second send path, no races.
+        """
+        try:
+            message = {
+                "gesture": gesture_name,
+                "gesture_id": -1,            # Sentinel — not a real class ID
+                "confidence": 1.0,
+                "probabilities": {gesture_name: 1.0},
+                "timestamp": time.time(),
+                "source": "easy_mode",        # Harmless extra field; Unity ignores.
+            }
+            data = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
+            # Reuse the server's queue so ordering with any real
+            # predictions is preserved. The server keeps only the
+            # latest payload under backpressure — that's fine for us.
+            self._server._send_queue.put_nowait(data)  # noqa: SLF001 — intentional
+        except Exception:
+            log.exception("Failed to broadcast easy-mode prediction")
+
+    def _send_target_gesture_cue(
+        self,
+        gesture_name: str,
+        hold_seconds: float,
+    ) -> None:
+        """
+        Push a ``target_gesture`` message on the same channel as the
+        predictions. Unity treats unknown message types as no-ops, so
+        old builds remain compatible. Patched builds (see the
+        PipelineGestureClient diff in the feature delivery) can read
+        this and spawn the matching animal.
+        """
+        try:
+            message = {
+                "type": "target_gesture",
+                "gesture": gesture_name,
+                "hold_seconds": float(hold_seconds),
+                "timestamp": time.time(),
+            }
+            data = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
+            self._server._send_queue.put_nowait(data)  # noqa: SLF001
+        except Exception:
+            log.exception("Failed to send target_gesture cue")
+
+    # ------------------------------------------------------------------
+    # Periodic tick — very light work
+    # ------------------------------------------------------------------
+
+    @Slot()
+    def _on_tick(self) -> None:
+        """Placeholder for future watchdog work — e.g. trial timeouts."""
+        # Intentionally minimal. The hot path is on_emg_data, and Unity
+        # drives trial advancement. The tick remains in case we want to
+        # add "no attempt in N seconds — nudge child" behaviour later.
+        pass
+
+
+# ---------------------------------------------------------------------------
+# Convenience — build a schedule from a RecordingSession's gesture set
+# ---------------------------------------------------------------------------
+
+def build_default_schedule(
+    session: RecordingSession,
+    repetitions: int = 5,
+    hold_seconds: float = 3.0,
+    rest_seconds: float = 2.0,
+    include_rest: bool = False,
+) -> List[TrialSpec]:
+    """
+    Build a balanced trial schedule from a session's gesture set.
+
+    Each non-rest gesture appears ``repetitions`` times. Ordering is
+    deterministic interleaved (g1, g2, g3, g1, g2, g3, ...) rather
+    than random — children find predictable sequences less stressful
+    during a first session, and balanced-across-time data is easier to
+    analyse later.
+
+    Parameters
+    ----------
+    include_rest : bool
+        Default False. Rest is handled implicitly as the gap between
+        animals in the game; forcing the child to "perform rest"
+        feels odd. Set True only if you really want explicit rest
+        trials in the dataset.
+    """
+    gestures = [
+        g.name for g in session.gesture_set.gestures
+        if include_rest or g.name.lower() != "rest"
+    ]
+    if not gestures:
+        return []
+
+    schedule: List[TrialSpec] = []
+    for _ in range(repetitions):
+        for name in gestures:
+            schedule.append(TrialSpec(
+                gesture_name=name,
+                hold_seconds=hold_seconds,
+                rest_seconds=rest_seconds,
+            ))
+    return schedule

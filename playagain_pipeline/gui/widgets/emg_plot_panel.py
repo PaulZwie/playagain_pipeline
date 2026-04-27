@@ -52,10 +52,7 @@ from PySide6.QtWidgets import (
 # what the user saw before. Fall back to the non-reworked module if the
 # reworked one doesn't export ``EMGPlotWidget`` (some environments only
 # expose ``EMGPlotWindow`` from the reworked module).
-try:
-    from playagain_pipeline.gui.widgets.emg_plot_reworked import EMGPlotWidget
-except Exception:  # pragma: no cover — environment-dependent fallback
-    from playagain_pipeline.gui.widgets.emg_plot import EMGPlotWidget
+from playagain_pipeline.gui.widgets.emg_plot import EMGPlotWidget
 
 
 # ---------------------------------------------------------------------------

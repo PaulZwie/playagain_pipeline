@@ -51,6 +51,11 @@ from playagain_pipeline.prediction_server import PredictionServer, PredictionSmo
 from playagain_pipeline.gui.widgets.busy_overlay import run_blocking
 from playagain_pipeline.gui.widgets.workflow_stepper import WorkflowStepper
 from playagain_pipeline.game_recorder import GameRecorder
+from playagain_pipeline.training_game_coordinator import (
+    TrainingGameCoordinator, TrialSpec, build_default_schedule,
+)
+from playagain_pipeline.unity_launcher import UnityLauncher, UnityNotFoundError
+from playagain_pipeline.gui.widgets.game_protocol_popup import GameProtocolPopup
 
 
 
@@ -725,6 +730,85 @@ class MainWindow(QMainWindow):
         control_layout.addWidget(self.stop_recording_btn)
 
         scroll_layout.addWidget(control_group)
+
+        # ── Training game (Unity integration) ─────────────────────────
+        # Recording gesture data with children is easier if they see an
+        # animal walk in and get fed each time they try a gesture. This
+        # panel launches the Unity PlayAgain build and bridges it to the
+        # current recording protocol.
+        #
+        # "Easy mode" is the critical part: the first time a child
+        # records, there is no trained model yet, so the coordinator
+        # just watches the RMS of the incoming EMG and broadcasts a
+        # confidence=1.0 "prediction" to Unity whenever the child even
+        # slightly tenses a muscle. The animal gets fed → positive
+        # feedback → more data, less frustration.
+        game_group = QGroupBox("Training Game (Unity) — easy mode")
+        game_layout = QFormLayout(game_group)
+
+        unity_row = QHBoxLayout()
+        self.unity_path_label = QLabel()
+        self.unity_path_label.setStyleSheet("color: #475569; font-size: 10px;")
+        unity_row.addWidget(self.unity_path_label, 1)
+
+        self.pick_unity_btn = QPushButton("Locate Unity…")
+        self.pick_unity_btn.clicked.connect(self._on_pick_unity_exe)
+        unity_row.addWidget(self.pick_unity_btn)
+        game_layout.addRow("Unity build:", unity_row)
+
+        self.game_easy_ratio = QDoubleSpinBox()
+        self.game_easy_ratio.setRange(1.1, 4.0)
+        self.game_easy_ratio.setSingleStep(0.1)
+        self.game_easy_ratio.setValue(1.8)
+        self.game_easy_ratio.setToolTip(
+            "How many times above the resting RMS baseline counts as 'the "
+            "child tried'. Lower = more forgiving (feeds the animal on "
+            "weaker contractions). 1.8 is a gentle default for first "
+            "sessions; raise toward 2.5 once the child is comfortable."
+        )
+        game_layout.addRow("Easy-mode sensitivity:", self.game_easy_ratio)
+
+        self.game_reps_spin = QSpinBox()
+        self.game_reps_spin.setRange(1, 30)
+        self.game_reps_spin.setValue(5)
+        self.game_reps_spin.setToolTip(
+            "How many times each gesture is requested during the game."
+        )
+        game_layout.addRow("Reps per gesture:", self.game_reps_spin)
+
+        game_btn_row = QHBoxLayout()
+        self.start_game_btn = QPushButton("▶  Launch Training Game")
+        self.start_game_btn.setFixedHeight(36)
+        self.start_game_btn.setStyleSheet(
+            "QPushButton {"
+            "  background: #16a34a; color: white; border: none;"
+            "  border-radius: 4px; font-weight: 600;"
+            "}"
+            "QPushButton:hover { background: #15803d; }"
+            "QPushButton:disabled { background: #cbd5e1; color: #64748b; }"
+        )
+        self.start_game_btn.clicked.connect(self._on_start_training_game)
+        game_btn_row.addWidget(self.start_game_btn)
+
+        self.stop_game_btn = QPushButton("■  Stop")
+        self.stop_game_btn.setFixedHeight(36)
+        self.stop_game_btn.setEnabled(False)
+        self.stop_game_btn.clicked.connect(self._on_stop_training_game)
+        game_btn_row.addWidget(self.stop_game_btn)
+        game_layout.addRow(game_btn_row)
+
+        self.game_status_label = QLabel("Idle.")
+        self.game_status_label.setStyleSheet(
+            "color: #475569; font-size: 11px; padding: 4px;"
+        )
+        self.game_status_label.setWordWrap(True)
+        game_layout.addRow(self.game_status_label)
+
+        scroll_layout.addWidget(game_group)
+
+        # Refresh the Unity-path label from whatever's saved in QSettings.
+        # Safe to call now — UnityLauncher is a cheap constructor.
+        self._refresh_unity_path_label()
 
         scroll_layout.addStretch()
 
@@ -2135,6 +2219,14 @@ class MainWindow(QMainWindow):
         if server_active:
             self._prediction_server.on_emg_data(calibrated_data)
 
+        # Feed the training-game coordinator, if one is running. Uses
+        # the *same* calibrated data the prediction server sees so the
+        # RMS trigger stays consistent with whatever the model would
+        # later see. No-op when no game session is active.
+        coord = getattr(self, "_training_coordinator", None)
+        if coord is not None and coord.is_running:
+            coord.on_emg_data(calibrated_data)
+
         # Only use the separate PredictionWorker when the server is NOT running
         # to avoid running inference twice on the same data.
         if self._is_predicting and self._current_model and not server_active:
@@ -2147,6 +2239,419 @@ class MainWindow(QMainWindow):
         # Accumulate raw data for live calibration (uses physical channel order)
         if self._live_cal_active:
             self._live_cal_buffer.append(data.copy())
+
+    # ------------------------------------------------------------------
+    # Training-game (Unity) handlers
+    # ------------------------------------------------------------------
+
+    def _unity_launcher(self) -> UnityLauncher:
+        """Lazy accessor — one launcher per MainWindow."""
+        if not hasattr(self, "_unity_launcher_inst") or self._unity_launcher_inst is None:
+            self._unity_launcher_inst = UnityLauncher()
+        return self._unity_launcher_inst
+
+    def _refresh_unity_path_label(self) -> None:
+        """Update the 'Unity build:' hint under the button group."""
+        if not hasattr(self, "unity_path_label"):
+            return
+        path = self._unity_launcher().saved_path()
+        if path is None:
+            self.unity_path_label.setText("Not set — click 'Locate Unity…'")
+            self.unity_path_label.setStyleSheet("color: #b45309; font-size: 10px;")
+        else:
+            self.unity_path_label.setText(str(path))
+            self.unity_path_label.setStyleSheet("color: #475569; font-size: 10px;")
+
+    @Slot()
+    def _on_pick_unity_exe(self) -> None:
+        """Open a file picker for the Unity build and persist the choice."""
+        launcher = self._unity_launcher()
+        start_dir = str(launcher.saved_path().parent) if launcher.saved_path() else str(Path.home())
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Locate PlayAgain Unity executable",
+            start_dir,
+            launcher.file_dialog_filter(),
+        )
+        if not path:
+            return
+        try:
+            launcher.remember_path(path)
+            self._refresh_unity_path_label()
+            self._log(f"Unity build remembered: {path}")
+        except FileNotFoundError as e:
+            QMessageBox.warning(self, "Invalid path", str(e))
+
+    @Slot()
+    def _on_start_training_game(self) -> None:
+        """
+        Wire up the training game end-to-end:
+          1. Start (or reuse) a PredictionServer so Unity has something
+             to connect to on port 5555.
+          2. Launch the Unity executable.
+          3. Build a trial schedule from the current gesture set.
+          4. Construct a TrainingGameCoordinator and start it.
+          5. Begin a RecordingSession so the data is saved.
+        """
+        # Guard: Unity exe configured?
+        launcher = self._unity_launcher()
+        if not launcher.has_saved_path():
+            QMessageBox.information(
+                self, "Unity path not set",
+                "Please click 'Locate Unity…' and select your PlayAgain "
+                "executable first.",
+            )
+            return
+
+        # Guard: device connected?
+        device = getattr(self.device_manager, "device", None)
+        if device is None or not getattr(device, "is_connected", False):
+            QMessageBox.warning(
+                self, "No device connected",
+                "Connect an EMG device (or the Synthetic device) before "
+                "launching the training game — the game needs live data "
+                "to trigger easy-mode feedings.",
+            )
+            return
+
+        # ── 1. Prediction server ─────────────────────────────────────
+        # Reuse the existing one if the user already has it running
+        # (e.g. for live prediction); otherwise spin up a fresh one.
+        server = getattr(self, "_prediction_server", None)
+        if server is None:
+            server = PredictionServer(host="127.0.0.1", port=5555)
+            self._prediction_server = server
+        if not server.is_running:
+            server.start()
+            self._log("Prediction server started on 127.0.0.1:5555 for Unity bridge.")
+
+        # ── 2. Create (but do NOT start) a recording session ───────
+        # The old flow called ``self._on_start_recording()`` here, which
+        # began writing CSV samples immediately. But Unity needs a
+        # few seconds to boot, then the child clicks through "Fuchs
+        # Abenteuer" → Start — meaning the first ~5–10 seconds of every
+        # CSV were recorded against the main menu, not gameplay.
+        #
+        # New flow: we prepare the session but leave it idle. The
+        # coordinator will call ``session.start_recording()`` itself
+        # the moment Unity sends ``game_level_started`` (see
+        # TrainingGameCoordinator._begin_running). If the Unity build
+        # is older and doesn't send that message, the coordinator's
+        # 60-second fallback kicks in and starts the session anyway.
+        if self._current_session is None:
+            try:
+                self._prepare_training_game_session()
+            except Exception as e:
+                QMessageBox.warning(self, "Could not prepare session",
+                                    f"{e}\n\nPlay the game without saving?")
+
+        session = self._current_session
+        if session is None:
+            self._log("Training game running in preview mode — no session bound.")
+            schedule = [TrialSpec("fist"), TrialSpec("pinch"), TrialSpec("tripod")] \
+                * int(self.game_reps_spin.value())
+        else:
+            schedule = build_default_schedule(
+                session,
+                repetitions=int(self.game_reps_spin.value()),
+                hold_seconds=3.0,
+                rest_seconds=2.0,
+            )
+
+        if not schedule:
+            QMessageBox.warning(self, "Empty schedule",
+                                "The current gesture set has no non-rest gestures.")
+            return
+
+        # ── 3. Coordinator ──────────────────────────────────────────
+        coord = TrainingGameCoordinator(prediction_server=server, parent=self)
+        coord.set_trigger_ratio(float(self.game_easy_ratio.value()))
+        coord.set_schedule(schedule)
+        # take_ownership=True hands the session lifecycle to the
+        # coordinator: it calls start_recording() when Unity's Level 1
+        # signal arrives and stop_recording() on teardown.
+        coord.bind_session(session, take_ownership=True)
+
+        coord.trial_started.connect(self._on_game_trial_started)
+        coord.trial_completed.connect(self._on_game_trial_completed)
+        coord.trigger_fired.connect(self._on_game_trigger_fired)
+        coord.all_complete.connect(self._on_game_all_complete)
+        coord.rms_updated.connect(self._on_game_rms_updated)
+        coord.state_changed.connect(self._on_game_state_changed)
+        coord.game_level_started.connect(self._on_game_level_started)
+
+        self._training_coordinator = coord
+
+        # ── 3b. Game Protocol Popup ────────────────────────────────
+        # Floating window that mirrors the cue currently shown in
+        # Unity AND exposes manual debug controls (Force Feed, Skip,
+        # per-gesture buttons, synthetic-replay picker). Especially
+        # important when testing without a real EMG device — the
+        # popup's Force Feed button is the escape hatch when
+        # easy-mode RMS doesn't trigger.
+        #
+        # We wrap creation in try/except so that an unexpected popup
+        # error (e.g. Qt platform plugin issue) doesn't silently
+        # swallow the rest of the training-game flow — without this
+        # guard a popup failure would also block coord.start() and
+        # the whole feature would appear broken with no log message.
+        popup = None
+        try:
+            popup = GameProtocolPopup(parent=self)
+            if session is not None:
+                popup.set_gesture_set(session.gesture_set)
+            popup.set_total_trials(len(schedule))
+
+            coord.trial_started.connect(popup.set_current_trial)
+            coord.trial_completed.connect(lambda *_a: popup.clear_current_trial())
+            coord.state_changed.connect(popup.set_state)
+            coord.rms_updated.connect(popup.set_rms)
+            coord.all_complete.connect(lambda: popup.set_state("complete"))
+
+            popup.force_feed_requested.connect(coord.force_trigger)
+            popup.skip_requested.connect(coord.skip_current_trial)
+            popup.manual_gesture_requested.connect(coord.fire_manual_gesture)
+            popup.replay_session_requested.connect(self._on_replay_session_picked)
+
+            # Optional: replay-session dropdown for synthetic devices.
+            device = getattr(self.device_manager, "device", None)
+            if device is not None and "synthetic" in (
+                getattr(device, "name", "") or ""
+            ).lower():
+                try:
+                    from playagain_pipeline.core.data_manager import DataManager
+                    dm = DataManager()
+                    if hasattr(dm, "list_session_paths"):
+                        replay_paths = dm.list_session_paths()
+                    else:
+                        sessions_dir = Path(getattr(dm, "sessions_dir",
+                                                    "data/sessions"))
+                        replay_paths = (
+                            [p.parent for p in sessions_dir.rglob("metadata.json")]
+                            if sessions_dir.exists() else []
+                        )
+                    popup.set_replay_options(list(replay_paths))
+                except Exception:
+                    self._log("Replay-picker discovery failed — proceeding without it.")
+
+            popup.show()
+            popup.raise_()
+            popup.activateWindow()
+            self._game_protocol_popup = popup
+            self._log("Game protocol popup opened.")
+        except Exception as e:
+            self._log(f"Failed to open game protocol popup: {e!r}")
+            import traceback
+            traceback.print_exc()
+            self._game_protocol_popup = None
+            # Continue anyway — the game can still be played without
+            # the popup, just with no manual controls.
+
+        # ── 4. Launch Unity ─────────────────────────────────────────
+        try:
+            proc = launcher.launch(extra_args=["-screen-fullscreen", "0"])
+            self._unity_process = proc
+            self._log(f"Unity launched (PID {proc.pid}).")
+        except UnityNotFoundError as e:
+            QMessageBox.warning(self, "Unity not found", str(e))
+            coord.stop()
+            self._training_coordinator = None
+            if popup is not None:
+                popup.hide()
+                popup.deleteLater()
+                self._game_protocol_popup = None
+            return
+
+        # ── 5. Arm the coordinator (waits for Unity Level 1) ────────
+        coord.start(wait_for_unity=True)
+        self.start_game_btn.setEnabled(False)
+        self.stop_game_btn.setEnabled(True)
+        self.game_status_label.setText(
+            f"Waiting for Unity… {len(schedule)} trials queued. "
+            f"Session starts when the child hits Start in the game."
+        )
+
+    @Slot()
+    def _on_stop_training_game(self) -> None:
+        """Tear the game down in reverse order of startup."""
+        coord = getattr(self, "_training_coordinator", None)
+        if coord is not None:
+            try:
+                coord.stop()
+            except Exception:
+                pass
+            self._training_coordinator = None
+
+        # Close the protocol popup if it's still around. Its closeEvent
+        # is overridden to just hide, so deleteLater is what actually
+        # cleans the widget up.
+        popup = getattr(self, "_game_protocol_popup", None)
+        if popup is not None:
+            try:
+                popup.hide()
+                popup.deleteLater()
+            except Exception:
+                pass
+            self._game_protocol_popup = None
+
+        # Politely ask Unity to quit — it can also be left open if the
+        # clinician wants to inspect the final animal count.
+        proc = getattr(self, "_unity_process", None)
+        if proc is not None:
+            try:
+                self._unity_launcher().terminate(proc)
+            except Exception:
+                pass
+            self._unity_process = None
+
+        # If we auto-started a session for the game, stop it too so the
+        # data is actually written to disk.
+        if self._current_session is not None and self._current_session.is_recording:
+            self._on_stop_recording()
+
+        self.start_game_btn.setEnabled(True)
+        self.stop_game_btn.setEnabled(False)
+        self.game_status_label.setText("Stopped.")
+        self._log("Training game stopped.")
+
+    @Slot(str)
+    def _on_replay_session_picked(self, path: str) -> None:
+        """
+        Forward a synthetic-replay-session pick from the popup to the
+        active device. The popup just emits the chosen path; we try a
+        few common method names on the device and log which one stuck.
+        """
+        device = getattr(self.device_manager, "device", None)
+        if device is None:
+            self._log("Replay request ignored — no device.")
+            return
+        for method_name in ("load_session", "set_replay_path",
+                            "set_session_path", "set_source"):
+            fn = getattr(device, method_name, None)
+            if callable(fn):
+                try:
+                    fn(path)
+                    self._log(f"Replay loaded ({method_name}): {path}")
+                    return
+                except Exception as e:
+                    self._log(f"Replay load failed via {method_name}: {e}")
+                    return
+        self._log(
+            f"Replay request: {path} — but the synthetic device exposes "
+            "no recognised replay-loading method. Add load_session / "
+            "set_replay_path / set_session_path / set_source."
+        )
+
+    # ── Coordinator callbacks — UI feedback ──────────────────────────
+
+    @Slot(object, int)
+    def _on_game_trial_started(self, spec: TrialSpec, index: int) -> None:
+        total = len(getattr(self._training_coordinator, "_schedule", []))
+        self.game_status_label.setText(
+            f"Trial {index + 1}/{total} — target: {spec.gesture_name}"
+        )
+        self._log(f"[Game] Trial {index + 1}/{total}: {spec.gesture_name}")
+
+    @Slot(object, int)
+    def _on_game_trial_completed(self, spec: TrialSpec, index: int) -> None:
+        self._log(f"[Game] Trial {index + 1} done ({spec.gesture_name}) ✓")
+
+    @Slot(str, float)
+    def _on_game_trigger_fired(self, gesture: str, rms: float) -> None:
+        """Easy-mode trigger fired → the animal is about to be fed."""
+        self._log(f"[Game] Easy-mode trigger for {gesture} (RMS={rms:.4f})")
+
+    @Slot()
+    def _on_game_all_complete(self) -> None:
+        """Schedule finished normally — stop everything cleanly."""
+        self.game_status_label.setText("All trials complete — great job!")
+        self._log("[Game] All trials complete.")
+        # Delay the teardown slightly so the final animal animation
+        # finishes on the Unity side before the process is killed.
+        QTimer.singleShot(3000, self._on_stop_training_game)
+
+    @Slot(float, float)
+    def _on_game_rms_updated(self, rms: float, baseline: float) -> None:
+        """Optional: could drive a live meter here. Currently just a pass."""
+        pass
+
+    @Slot(str)
+    def _on_game_state_changed(self, state: str) -> None:
+        """
+        Surface coordinator state transitions in the status label.
+
+        States:
+          • waiting_for_unity — Unity launched, child is still in the menu
+          • running           — Level 1 is live, cues are firing
+          • stopped / idle    — session ended
+        """
+        if state == "waiting_for_unity":
+            self.game_status_label.setText(
+                "Waiting for Unity — the session starts when the child "
+                "clicks Start in the main menu."
+            )
+        elif state == "running":
+            total = len(getattr(self._training_coordinator, "_schedule", []))
+            self.game_status_label.setText(
+                f"Playing — {total} trials queued. "
+                f"Easy-mode sensitivity: {self.game_easy_ratio.value():.1f}x"
+            )
+
+    @Slot()
+    def _on_game_level_started(self) -> None:
+        """Unity just reached Level 1 — log the transition."""
+        self._log("[Game] Unity reached Level 1 — recording session started.")
+
+    # ── Session preparation — no recording starts here! ─────────────
+
+    def _prepare_training_game_session(self) -> None:
+        """
+        Build a RecordingSession in the 'ready but not recording' state.
+
+        The coordinator will call ``start_recording()`` on it later,
+        once Unity signals that Level 1 has begun. Until then the
+        session just sits there with its gesture set configured and
+        its metadata stamped — no samples are written to disk.
+
+        This is a trimmed-down clone of the relevant parts of
+        ``_on_start_recording`` — we deliberately skip the protocol /
+        manual-mode branches because the training game is its own
+        protocol source (the coordinator's schedule).
+        """
+        device = getattr(self.device_manager, "device", None)
+        if device is None or not getattr(device, "is_connected", False):
+            raise RuntimeError(
+                "Device must be connected before preparing a training-game session."
+            )
+
+        subject_id = (self.subject_id_edit.text() or "VP_01").strip()
+        session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+        # Use the project's default gesture set — same as normal
+        # recordings, so the dataset pipeline treats training-game
+        # sessions identically to manually-recorded ones.
+        gesture_set = create_default_gesture_set()
+
+        self._current_session = RecordingSession(
+            session_id=session_id,
+            subject_id=subject_id,
+            device_name=getattr(device, "name", self.device_combo.currentText()),
+            num_channels=int(self.channels_spin.value()),
+            sampling_rate=int(self.sampling_rate_spin.value()),
+            gesture_set=gesture_set,
+            protocol_name="training_game",
+        )
+        # Stamp some useful metadata so post-hoc analysis knows this
+        # session came from the Unity training game.
+        self._current_session.metadata.custom_metadata["source"] = "training_game"
+        self._current_session.metadata.custom_metadata["easy_mode_sensitivity"] = \
+            float(self.game_easy_ratio.value())
+        self._log(
+            f"Training-game session prepared ({subject_id}/{session_id}) — "
+            "waiting for Unity Level 1 before recording starts."
+        )
+
+    # ------------------------------------------------------------------
 
     # Recording handlers
     @Slot()

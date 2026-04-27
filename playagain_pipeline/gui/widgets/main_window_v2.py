@@ -48,7 +48,7 @@ from pathlib import Path
 from typing import Optional
 
 from PySide6.QtCore import Qt, Slot, QSettings, QTimer
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QKeySequence
 from PySide6.QtWidgets import (
     QMainWindow, QMenu, QMessageBox, QSplitter, QTabWidget, QToolButton,
     QVBoxLayout, QWidget,
@@ -340,10 +340,8 @@ class MainWindowV2(MainWindow):
             self.workflow_stepper.reset()
 
         # Re-scan Home tab's recent activity when user comes back to it
-        # and refresh status strip to show current state
         if tab_idx == TAB_HOME:
             self._v2_home.refresh()
-            self._v2_refresh_status_strip()
 
     # ------------------------------------------------------------------
     # Tools handlers
@@ -363,35 +361,30 @@ class MainWindowV2(MainWindow):
 
     def _v2_open_calibration(self) -> None:
         """
-        Open the full calibration interface in a modeless window.
-        
-        Features:
-        - Live calibration from device stream
-        - Calibration from recorded sessions
-        - Manual rotation override
-        - Load/save calibration files
-        - Bracelet orientation visualization
+        Open the calibration workflow. If the parent MainWindow has a
+        dedicated handler (e.g. `_on_start_live_calibration`), use it;
+        otherwise fall back to popping up the existing CalibrationDialog.
         """
-        if not hasattr(self, "_v2_calibration_window") or self._v2_calibration_window is None:
-            self._v2_calibration_window = QMainWindow(self)
-            self._v2_calibration_window.setWindowTitle("Calibrate bracelet")
-            self._v2_calibration_window.resize(1000, 900)
-            
-            # Use the parent's _create_calibration_tab method to get the full UI
+        if hasattr(self, "_on_start_live_calibration"):
             try:
-                cal_tab = self._create_calibration_tab()
-                self._v2_calibration_window.setCentralWidget(cal_tab)
-            except Exception as e:  # noqa: BLE001
-                log.error("Failed to create calibration tab: %s", e)
-                QMessageBox.warning(
-                    self, "Calibration unavailable",
-                    f"Could not open calibration interface: {e}",
-                )
+                self._on_start_live_calibration()
                 return
-        
-        self._v2_calibration_window.show()
-        self._v2_calibration_window.raise_()
-        self._v2_calibration_window.activateWindow()
+            except Exception as e:  # noqa: BLE001
+                log.warning("Inline calibration failed, trying dialog: %s", e)
+        # Dialog fallback — construct with whatever the parent exposes.
+        try:
+            from playagain_pipeline.gui.widgets.calibration_dialog import CalibrationDialog
+            dlg = CalibrationDialog(
+                calibrator=getattr(self, "_calibrator", None),
+                device=getattr(self, "_device", None),
+                parent=self,
+            )
+            dlg.exec()
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(
+                self, "Calibration unavailable",
+                f"Could not open the calibration dialog: {e}",
+            )
 
     # ------------------------------------------------------------------
     # Status strip population
@@ -400,11 +393,7 @@ class MainWindowV2(MainWindow):
     def _v2_refresh_status_strip(self) -> None:
         """Pull current device/subject/model state into the strip."""
         # Device
-        device_manager = getattr(self, "device_manager", None)
-        device = None
-        if device_manager is not None:
-            device = getattr(device_manager, "device", None)
-        
+        device = getattr(self, "_device", None)
         if device is not None and getattr(device, "is_connected", False):
             self._v2_status.set_device_status(
                 "connected", getattr(device, "name", "Device"),
@@ -415,9 +404,8 @@ class MainWindowV2(MainWindow):
         # Subject — parent class typically tracks this on a combo or attr
         subject = getattr(self, "_current_subject", None)
         if not subject:
-            # Fallback: look for a widget with a subject selection
-            for attr_name in ("subject_combo", "subject_input", "_subject_id", 
-                             "rec_subject_edit", "rec_subject_combo"):
+            # Fallback: look for a widget named subject_combo / input
+            for attr_name in ("subject_combo", "subject_input", "_subject_id"):
                 w = getattr(self, attr_name, None)
                 if w is None:
                     continue
@@ -430,27 +418,17 @@ class MainWindowV2(MainWindow):
                         subject = str(w)
                 except Exception:
                     subject = None
-                if subject and subject.strip():
+                if subject:
                     break
         self._v2_status.set_subject(subject)
 
-        # Active model — check both _current_model and the combo box
-        model_name = None
-        
-        # First check if we have a loaded model with a name
+        # Active model
         model = getattr(self, "_current_model", None)
         if model is not None:
-            model_name = getattr(model, "name", None) or getattr(model, "_name", None)
-        
-        # Fallback: check the prediction model combo
-        if not model_name:
-            pred_combo = getattr(self, "pred_model_combo", None)
-            if pred_combo is not None:
-                current_text = pred_combo.currentText()
-                if current_text and current_text.strip() and current_text != "— No models —":
-                    model_name = current_text
-        
-        self._v2_status.set_active_model(model_name, ready=bool(model))
+            name = getattr(model, "name", None) or getattr(model, "_name", None)
+            self._v2_status.set_active_model(name, ready=True)
+        else:
+            self._v2_status.set_active_model(None)
 
     # Hooks the parent class can call to keep status strip in sync.
     # These are safe to call even if the strip doesn't exist yet.
@@ -552,15 +530,3 @@ class MainWindowV2(MainWindow):
         state = "connected" if connected else "disconnected"
         device_name = getattr(getattr(self, "_device", None), "name", None)
         self.notify_device_state(state, device_name)
-
-    def _on_load_model(self):  # type: ignore[override]
-        """Load model and refresh status strip."""
-        super_fn = getattr(super(), "_on_load_model", None)
-        if callable(super_fn):
-            try:
-                super_fn()
-            except Exception as e:
-                log.warning("parent _on_load_model raised: %s", e)
-        # Refresh status strip to show newly loaded model
-        if hasattr(self, "_v2_status"):
-            self._v2_refresh_status_strip()
