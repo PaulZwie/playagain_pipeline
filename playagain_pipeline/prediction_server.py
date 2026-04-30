@@ -216,6 +216,11 @@ class PredictionServer:
         # Callbacks for external consumers (e.g., GameRecorder, GUI updates)
         self._prediction_callbacks: List[Callable] = []
         self._game_state_callbacks: List[Callable] = []
+        # Surfaced from the prediction loop so the GUI can show "your
+        # model can't predict on this stream" instead of leaving the
+        # user staring at a frozen "rest" label. Throttled inside the
+        # loop so a flood of identical errors doesn't spam the log.
+        self._error_callbacks: List[Callable] = []
         # Fired once per Unity session when Level 1 finishes loading and the
         # child has pressed Start. TrainingGameCoordinator uses this to defer
         # recording until the child is actually playing, not looking at the
@@ -345,6 +350,29 @@ class PredictionServer:
         """Remove a previously registered game state callback."""
         try:
             self._game_state_callbacks.remove(callback)
+        except ValueError:
+            pass
+
+    def add_error_callback(self, callback: Callable):
+        """
+        Register a callback for prediction-loop errors.
+
+        Callback signature: ``callback(message: str) -> None``
+
+        Fired the FIRST time a unique error message is raised inside
+        the prediction thread, then throttled — identical repeats are
+        suppressed so the GUI log isn't flooded by, e.g., a persistent
+        channel-mismatch raising once per chunk.
+
+        The GUI registers this so the user actually sees why their
+        loaded model is producing no output.
+        """
+        self._error_callbacks.append(callback)
+
+    def remove_error_callback(self, callback: Callable):
+        """Remove a previously registered error callback."""
+        try:
+            self._error_callbacks.remove(callback)
         except ValueError:
             pass
 
@@ -541,6 +569,15 @@ class PredictionServer:
                 if not hasattr(self, '_last_pred_error') or str(e) != self._last_pred_error:
                     self._last_pred_error = str(e)
                     print(f"[PredictionServer] Prediction error: {e}")
+                    # Notify the GUI so the user sees this without
+                    # having to find a console. Errors from individual
+                    # callbacks are isolated so a buggy subscriber
+                    # can't crash the prediction loop.
+                    for cb in list(self._error_callbacks):
+                        try:
+                            cb(str(e))
+                        except Exception:
+                            pass
 
     def _process_prediction(self, pred, proba):
         """
@@ -609,20 +646,42 @@ class PredictionServer:
             "timestamp": time.time()
         }
 
-        data = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
+        self.enqueue_json_message(message)
 
+    def enqueue_json_message(self, message: Dict) -> bool:
+        """
+        Serialize a JSON message and enqueue it for sender-thread delivery.
+
+        Returns True if the message is queued, False if serialization or
+        queueing failed.
+        """
         try:
-            self._send_queue.put_nowait(data)
+            payload = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
+        except Exception:
+            return False
+        return self.enqueue_raw_payload(payload)
+
+    def enqueue_raw_payload(self, payload: bytes) -> bool:
+        """
+        Enqueue an already-encoded payload for sender-thread delivery.
+
+        Backpressure policy: drop one oldest queued payload and keep the
+        newest. This mirrors prediction behavior and is suitable for both
+        real-time predictions and training-game control messages.
+        """
+        try:
+            self._send_queue.put_nowait(payload)
+            return True
         except queue.Full:
-            # Keep the newest payload; stale predictions are less useful.
             try:
                 self._send_queue.get_nowait()
             except queue.Empty:
                 pass
             try:
-                self._send_queue.put_nowait(data)
+                self._send_queue.put_nowait(payload)
+                return True
             except queue.Full:
-                pass
+                return False
 
     def _sender_loop(self):
         """Background thread: sends queued prediction payloads to all clients."""

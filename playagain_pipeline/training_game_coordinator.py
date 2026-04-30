@@ -100,8 +100,21 @@ class _TrialRuntime:
     spec: TrialSpec
     index: int
     broadcast_sent: bool = False
+    # Wall-clock millis of the last easy-mode broadcast sent for this
+    # trial. Used by the watchdog tick to re-arm the detector if Unity
+    # never raised the ``ground_truth=true`` rising edge — symptom of a
+    # silently-dropped broadcast (gesture-name mismatch on Unity's
+    # side, network blip, animal still walking in, etc.). Without this
+    # one trial getting stuck froze the entire run.
+    broadcast_sent_ms: float = 0.0
     unity_gt_active: bool = False       # Last ground_truth state from Unity
+    # Last gesture requested by Unity for this trial (if provided via game_state).
+    requested_gesture: str = ""
+    # Last time we sent a target_gesture cue for this trial.
+    last_cue_sent_ms: float = 0.0
     started_at_ms: float = field(default_factory=lambda: time.time() * 1000)
+    # Whether we've emitted trial_started to the GUI / popup yet.
+    started_emitted: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -301,16 +314,35 @@ class TrainingGameCoordinator(QObject):
     rms_updated      = Signal(float, float)       # (rms, baseline) — for a debug meter
     state_changed    = Signal(str)                # "idle" | "waiting_for_unity" | "running" | "stopped"
     game_level_started = Signal()                 # Unity reached Level 1 — session begins now
+    # Per-gesture completion counts in balanced mode. Payload is a dict
+    # ``{gesture_name: (completed, target)}`` so the GUI can render
+    # "fist 2/3, pinch 1/3, tripod 0/3" in a status label. Emitted on
+    # every trial completion AND once at start so the popup can
+    # initialise the display to all-zeroes.
+    balance_progress = Signal(dict)
 
     # Cooldown between triggers for the *same* trial so a single long
     # contraction doesn't fire twice and Unity has time to transition
     # the animal to feeding mode.
     _TRIGGER_COOLDOWN_MS = 1200
 
+    # If we've broadcast an easy-mode prediction but Unity hasn't
+    # raised ``ground_truth=true`` within this window, assume the
+    # broadcast was lost (gesture-name mismatch, animal not yet
+    # blocking, dropped packet) and re-arm the detector for a retry.
+    # 3 s is comfortable: Unity's animation pipeline normally raises
+    # ground_truth within 200–600 ms of receiving the broadcast.
+    _BROADCAST_RETRY_MS = 3000
+
     # After the child releases (Unity sets ground_truth=False) we give
     # a short quiet period before arming the next trial. Keeps the
     # baseline clean of tail-end contraction energy.
     _INTER_TRIAL_REST_MS = 800
+
+    # While waiting for Unity to actually start feeding (ground_truth
+    # rising edge), re-send the cue periodically to survive client
+    # reconnects during scene transitions.
+    _TARGET_CUE_RESEND_MS = 1000
 
     # Safety fallback: if Unity never reports game_level_started (older
     # build without the notifier, or a crash before Level 1), start
@@ -324,6 +356,11 @@ class TrainingGameCoordinator(QObject):
     # 2 s is long enough for a stable median across ~20 device chunks
     # at typical chunk rates and short enough not to bore a child.
     _BASELINE_SETTLE_MS = 2000
+
+    # How long to wait after camera_blocking becomes True before arming the detector.
+    # This gives Unity's camera / animation a short settle time so the recording
+    # starts when the animal is visually stable in the blocking position.
+    _CAMERA_SETTLE_MS = 1000
 
     # ── Private signals for cross-thread marshaling ────────────────
     # The prediction server's reader loop runs on its own network
@@ -355,6 +392,25 @@ class TrainingGameCoordinator(QObject):
         self._current: Optional[_TrialRuntime] = None
         self._next_index: int = 0
 
+        # Balanced-completion state. When ``_balanced_mode`` is True the
+        # coordinator stops following the static schedule list and
+        # instead keeps cuing the most under-represented gesture until
+        # each gesture in ``_target_per_gesture`` has been completed
+        # ``target`` times. Why this exists: with an unpatched Unity
+        # build the game sometimes spawns animals in its own order,
+        # and the recording follows what Unity actually showed the
+        # child — not our cue. The result was an imbalanced dataset
+        # even though the schedule was balanced. Counting completions
+        # per gesture and reissuing cues for missing ones guarantees
+        # equal sample counts regardless of who wins the spawn fight.
+        self._balanced_mode: bool = False
+        self._target_per_gesture: dict[str, int] = {}
+        self._completed_per_gesture: dict[str, int] = {}
+        # Hard cap on total trials. Without this, a Unity build that
+        # spawns the same animal forever would loop indefinitely.
+        # Default 2× the expected total — generous but bounded.
+        self._max_total_trials: int = 0
+
         self._running = False
         # True between start() and the Unity "level started" message
         # (or the timeout). During this window we register callbacks
@@ -365,6 +421,14 @@ class TrainingGameCoordinator(QObject):
         self._session: Optional[RecordingSession] = None
         self._last_trigger_ms: float = 0.0
         self._arm_time_ms: float = 0.0  # when the current trial becomes eligible
+
+        # Spawn-sync lock: True between the moment we send a
+        # target_gesture cue and the moment Unity confirms the previous
+        # animal's ground_truth falling edge.  Prevents _advance() from
+        # queuing a second animal before the first one has walked away,
+        # which was the root cause of "number of animals inconsistent
+        # with trials".
+        self._spawn_pending: bool = False
 
         # Whether session.start_recording() should be invoked by the
         # coordinator (True) or the GUI already started it (False).
@@ -410,6 +474,95 @@ class TrainingGameCoordinator(QObject):
                 "Call stop() first."
             )
         self._schedule = list(trials)
+        self._next_index = 0
+        # Strict-schedule mode — turn off balanced advancement.
+        self._balanced_mode = False
+        self._target_per_gesture = {}
+        self._completed_per_gesture = {}
+        self._max_total_trials = 0
+
+    def set_balanced_mode(
+        self,
+        gestures: List[str],
+        reps_per_gesture: int,
+        hold_seconds: float = 3.0,
+        rest_seconds: float = 2.0,
+        max_oversample: float = 2.0,
+    ) -> None:
+        """
+        Run trials until **each** gesture in ``gestures`` has been
+        completed ``reps_per_gesture`` times.
+
+        Why a separate mode (vs. just ``set_schedule``)
+        ───────────────────────────────────────────────
+        With an unpatched Unity build the game spawns animals in its
+        own order and may ignore our ``target_gesture`` cues. The
+        recording follows what Unity actually showed the child, so
+        even a perfectly balanced static schedule can produce an
+        unbalanced dataset. Balanced mode fixes this by:
+
+          1. Counting completed trials per gesture as Unity reports
+             them (using the ``gesture_requested`` field from the
+             game_state message — what the child actually saw).
+          2. On each ``_advance``, re-cuing the most under-represented
+             gesture rather than the next slot in a static list.
+          3. Stopping when every target is met OR the safety cap of
+             ``max_oversample × total_expected`` trials is hit.
+
+        With a patched Unity that obeys our cues, balanced mode is
+        equivalent to a strict schedule — the cued gesture matches the
+        spawned one, every cue lands one completion, and we stop after
+        exactly ``len(gestures) × reps_per_gesture`` trials.
+
+        Parameters
+        ----------
+        gestures : list of str
+            Gesture names to target. ``"rest"`` is filtered out
+            automatically — rest is handled implicitly between trials.
+        reps_per_gesture : int
+            How many successful trials per gesture.
+        hold_seconds, rest_seconds : float
+            Carried into each TrialSpec.
+        max_oversample : float
+            Safety multiplier for the total trial cap. With 3 gestures
+            × 3 reps and ``max_oversample=2.0`` we'll attempt at most
+            18 trials before giving up on stragglers.
+        """
+        if self._running:
+            raise RuntimeError(
+                "Cannot change schedule while the coordinator is running. "
+                "Call stop() first."
+            )
+        clean = [g for g in gestures if g and g.lower() != "rest"]
+        if not clean:
+            self._balanced_mode = False
+            self._schedule = []
+            self._next_index = 0
+            return
+
+        self._balanced_mode = True
+        self._target_per_gesture = {g: int(reps_per_gesture) for g in clean}
+        self._completed_per_gesture = {g: 0 for g in clean}
+        total_expected = sum(self._target_per_gesture.values())
+        self._max_total_trials = max(
+            total_expected,
+            int(round(total_expected * max_oversample)),
+        )
+
+        # Build a starting schedule of length ``total_expected`` so the
+        # popup's "trial X / N" display has a meaningful denominator.
+        # This list is only consulted as a length reference once we
+        # enter ``_advance_balanced`` — the actual gesture chosen at
+        # each step is whichever one is most under-represented.
+        self._schedule = [
+            TrialSpec(
+                gesture_name=g,
+                hold_seconds=hold_seconds,
+                rest_seconds=rest_seconds,
+            )
+            for _ in range(int(reps_per_gesture))
+            for g in clean
+        ]
         self._next_index = 0
 
     def bind_session(
@@ -500,6 +653,7 @@ class TrainingGameCoordinator(QObject):
         self._detector.reset()
         self._next_index = 0
         self._current = None
+        self._spawn_pending = False
 
         # Register for Unity → Python messages. Safe to attach even
         # while waiting; we just refuse to act on game_state until
@@ -575,6 +729,10 @@ class TrainingGameCoordinator(QObject):
         self._detector.begin_calibration()
         self.state_changed.emit("calibrating")
         self.game_level_started.emit()
+        # Push the initial all-zeros progress to the GUI so the popup
+        # can show "fist 0/3, pinch 0/3, tripod 0/3" before any trial
+        # has run. No-op outside balanced mode.
+        self._emit_balance_progress()
         log.info(
             "Calibrating rest baseline for %.1fs…",
             self._BASELINE_SETTLE_MS / 1000.0,
@@ -616,6 +774,7 @@ class TrainingGameCoordinator(QObject):
             )
 
         self.state_changed.emit("running")
+        self._spawn_pending = False
         self._advance()
 
     @Slot()
@@ -663,6 +822,7 @@ class TrainingGameCoordinator(QObject):
         was_waiting = self._waiting_for_unity
         self._running = False
         self._waiting_for_unity = False
+        self._spawn_pending = False
         self._tick.stop()
         self._game_start_timeout.stop()
 
@@ -738,13 +898,21 @@ class TrainingGameCoordinator(QObject):
         if cur is None:
             return
 
+        # cur.spec was rewritten to Unity's reported gesture in the
+        # ``camera_blocking and not started_emitted`` branch (see
+        # _handle_game_state_on_main_thread). Reading from spec keeps
+        # the broadcast, the popup, the recording label, and the
+        # balance counter all pinned to the same gesture.
+        gesture_to_feed = cur.spec.gesture_name
+
         # Easy-mode: broadcast a confidence-1.0 "prediction" matching
         # the current target. Unity's PipelineGestureClient will call
         # OnGestureActiveChanged(true) and Level 1's GameManager will
         # feed the animal, exactly as if a real model had fired.
         cur.broadcast_sent = True
-        self._broadcast_easy_mode_prediction(cur.spec.gesture_name)
-        self.trigger_fired.emit(cur.spec.gesture_name, self._detector.last_rms)
+        cur.broadcast_sent_ms = now_ms
+        self._broadcast_easy_mode_prediction(gesture_to_feed)
+        self.trigger_fired.emit(gesture_to_feed, self._detector.last_rms)
 
     # ------------------------------------------------------------------
     # Unity → Python event plane
@@ -785,33 +953,103 @@ class TrainingGameCoordinator(QObject):
         animal has been fed and walks away. We treat the rising edge
         as "trial actually began in the game" and the falling edge as
         "trial done — advance".
+
+        This coordinator changes the timing so that the GUI popup and
+        the session trial start are emitted only when the animal has
+        reached its blocking position (camera_blocking == True). The
+        coordinator still sends the spawn cue earlier so Unity can walk
+        the animal in, but the visible "request gesture" cue and the
+        session trial start wait for camera_blocking to ensure the
+        dataset aligns with the in-game camera.
         """
         if not self._running or self._current is None:
             return
 
         cur = self._current
 
-        # Rising edge — the game confirms the child has engaged with
-        # the animal. Good moment to (re)mark the session boundary.
-        if ground_truth_active and not cur.unity_gt_active:
-            cur.unity_gt_active = True
+        requested_clean = str(requested_gesture or "").strip().lower()
+        if requested_clean and requested_clean != "none":
+            cur.requested_gesture = requested_clean
+
+        now_ms = time.time() * 1000
+
+        # NEW: When the animal reaches blocking position, emit trial_started
+        # and start the session trial (so recording aligns with the in-game camera).
+        if camera_blocking and not cur.started_emitted:
+            cur.started_emitted = True
+
+            # Lock the trial's identity to whatever Unity actually
+            # spawned. Without this, the popup labels the trial with
+            # our planned cue while the recording labels it with
+            # Unity's reported gesture — exactly the mismatch the user
+            # asked us to fix. After this rewrite, ``cur.spec`` is the
+            # single source of truth that everyone downstream (popup,
+            # recording label, easy-mode broadcast, balance counter)
+            # reads from. If Unity is silent (older build that doesn't
+            # send ``gesture_requested``), ``cur.requested_gesture``
+            # is empty and we keep our cued gesture as the fallback.
+            if (cur.requested_gesture
+                    and cur.requested_gesture != cur.spec.gesture_name):
+                log.info(
+                    "[coord] Unity reports '%s' but we cued '%s' — "
+                    "re-aligning trial label so popup and recording match.",
+                    cur.requested_gesture, cur.spec.gesture_name,
+                )
+                cur.spec = TrialSpec(
+                    gesture_name=cur.requested_gesture,
+                    hold_seconds=cur.spec.hold_seconds,
+                    rest_seconds=cur.spec.rest_seconds,
+                )
+
+            # Emit trial_started so the popup updates now that the animal is in place.
+            self.trial_started.emit(cur.spec, cur.index)
+            # Arm the detector after a short camera-settle window to avoid tail energy.
+            self._arm_time_ms = now_ms + self._CAMERA_SETTLE_MS
+            # Start the session trial here (idempotent if session.start_trial is called again later).
             if self._session is not None:
-                # Idempotent: session.start_trial closes any previous
-                # unfinished trial, so double-firing is harmless.
+                # cur.spec.gesture_name is now Unity-aligned (above) —
+                # the recording label will match what trial_started
+                # just told the popup to display.
                 try:
                     self._session.start_trial(cur.spec.gesture_name)
                 except Exception:
                     log.exception("start_trial failed for %s", cur.spec.gesture_name)
 
+        # Rising edge — the game confirms the child has engaged with
+        # the animal (feeding begins). We record the unity_gt_active
+        # state but we no longer start the session trial here because
+        # that now happens when camera_blocking becomes True.
+        if ground_truth_active and not cur.unity_gt_active:
+            cur.unity_gt_active = True
+            # Nothing else to do here for session start — it was handled
+            # on camera_blocking above.
+
         # Falling edge — animal was fed and has walked away. Close the
         # trial and schedule the next one after a short rest.
         if not ground_truth_active and cur.unity_gt_active:
             cur.unity_gt_active = False
+            # Release the spawn lock — Unity has confirmed this animal
+            # has departed, so _advance() may now send the next cue.
+            self._spawn_pending = False
             if self._session is not None:
                 try:
                     self._session.end_trial(is_valid=True)
                 except Exception:
                     log.exception("end_trial failed for %s", cur.spec.gesture_name)
+
+            # Track per-gesture completion. ``cur.spec.gesture_name``
+            # was already rewritten to Unity's reported gesture in
+            # the ``camera_blocking`` branch above, so it's
+            # authoritative here too — popup, recording label, and
+            # this counter all read the same value.
+            if self._balanced_mode:
+                actual = cur.spec.gesture_name.lower()
+                if actual in self._target_per_gesture:
+                    self._completed_per_gesture[actual] = (
+                        self._completed_per_gesture.get(actual, 0) + 1
+                    )
+                    self._emit_balance_progress()
+
             self.trial_completed.emit(cur.spec, cur.index)
             self._current = None
             # Give the baseline a moment to settle before arming the
@@ -831,29 +1069,131 @@ class TrainingGameCoordinator(QObject):
         if self._current is not None:
             # A trial is already in flight; don't stack.
             return
-
-        if self._next_index >= len(self._schedule):
-            # Done!
-            self._running = False
-            self._tick.stop()
-            try:
-                self._server.remove_game_state_callback(self._game_state_cb)
-            except Exception:
-                pass
-            self.state_changed.emit("idle")
-            self.all_complete.emit()
+        if self._spawn_pending:
+            # We already sent a target_gesture cue and are waiting for
+            # Unity to confirm the animal arrived (camera_blocking) and
+            # then departed (ground_truth falling edge). Sending another
+            # cue now would result in two animals for one trial slot.
+            log.debug("_advance: spawn already pending — waiting for Unity confirmation")
             return
 
-        spec = self._schedule[self._next_index]
+        # Branch on advancement strategy. Balanced mode keeps going
+        # until every gesture has been completed N times; strict mode
+        # walks the static schedule once.
+        if self._balanced_mode:
+            spec = self._pick_next_balanced()
+            if spec is None:
+                # All targets met (or safety cap hit) — finish.
+                self._finish_run()
+                return
+        else:
+            if self._next_index >= len(self._schedule):
+                # Done!
+                self._finish_run()
+                return
+            spec = self._schedule[self._next_index]
+
         self._current = _TrialRuntime(spec=spec, index=self._next_index)
         self._next_index += 1
 
-        # Tell Unity which animal/gesture to spawn next. If Unity is
-        # running an older build without the target_gesture handler
-        # the message is simply ignored — no harm done.
-        self._send_target_gesture_cue(spec.gesture_name, spec.hold_seconds)
+        # Lock spawning until Unity confirms ground_truth falling edge
+        # for this trial (see _handle_game_state_on_main_thread).
+        self._spawn_pending = True
 
-        self.trial_started.emit(spec, self._current.index)
+        # Tell Unity which animal/gesture to spawn next. We still send
+        # the cue so Unity can walk the animal in, but we intentionally
+        # do NOT emit trial_started here. The visible request and the
+        # session trial start wait until Unity reports camera_blocking=True.
+        self._send_target_gesture_cue(spec.gesture_name, spec.hold_seconds)
+        self._current.last_cue_sent_ms = time.time() * 1000
+
+        # Disarm the detector while the animal is walking in so we don't
+        # accidentally trigger on movement. The detector will be armed
+        # only after camera_blocking=True and a short settle window.
+        self._arm_time_ms = float("inf")
+
+        # Note: do not emit trial_started here. The popup will be updated
+        # when camera_blocking becomes True (see _handle_game_state_on_main_thread).
+
+    def _pick_next_balanced(self) -> Optional[TrialSpec]:
+        """
+        Choose the gesture that needs the most additional reps to hit
+        its target. Returns None when every target is met or the safety
+        cap on total trials is exhausted.
+
+        Tie-breaker: alphabetical, so consecutive ties produce a
+        deterministic round-robin rather than always preferring the
+        first dict-iteration order.
+        """
+        # 1. Done when every target is met.
+        deficits = {
+            g: self._target_per_gesture[g] - self._completed_per_gesture.get(g, 0)
+            for g in self._target_per_gesture
+        }
+        remaining = {g: d for g, d in deficits.items() if d > 0}
+        if not remaining:
+            return None
+
+        # 2. Safety cap — Unity may stubbornly spawn one gesture forever.
+        if self._next_index >= self._max_total_trials:
+            log.warning(
+                "Balanced mode safety cap reached at %d trials; "
+                "still missing: %s",
+                self._next_index, remaining,
+            )
+            return None
+
+        # 3. Pick the most-needed gesture, alphabetical tie-break.
+        max_deficit = max(remaining.values())
+        candidates = sorted(
+            g for g, d in remaining.items() if d == max_deficit
+        )
+        chosen = candidates[0]
+
+        # Re-use any matching template from the original schedule so
+        # hold_seconds/rest_seconds picked at set_balanced_mode time
+        # carry through. Falls back to defaults if the template list
+        # was empty (shouldn't happen but defensive).
+        for tpl in self._schedule:
+            if tpl.gesture_name == chosen:
+                return TrialSpec(
+                    gesture_name=chosen,
+                    hold_seconds=tpl.hold_seconds,
+                    rest_seconds=tpl.rest_seconds,
+                )
+        return TrialSpec(gesture_name=chosen)
+
+    def _emit_balance_progress(self) -> None:
+        """
+        Emit the ``balance_progress`` signal with current per-gesture
+        completion counts. No-op outside balanced mode so the strict
+        path stays exactly as it was before. Listeners receive a
+        ``{gesture_name: (completed, target)}`` dict keyed by lowercase
+        gesture name.
+        """
+        if not self._balanced_mode:
+            return
+        payload = {
+            g: (self._completed_per_gesture.get(g, 0), self._target_per_gesture[g])
+            for g in self._target_per_gesture
+        }
+        try:
+            self.balance_progress.emit(payload)
+        except RuntimeError:
+            # Coordinator parent may already be torn down — emitting
+            # on a deleted Qt object raises. Safe to drop.
+            pass
+
+    def _finish_run(self) -> None:
+        """Common cleanup path for both modes when the run ends."""
+        self._running = False
+        self._tick.stop()
+        try:
+            self._server.remove_game_state_callback(self._game_state_cb)
+        except Exception:
+            pass
+        self.state_changed.emit("idle")
+        self.all_complete.emit()
 
     # ------------------------------------------------------------------
     # Manual control — used by the GameProtocolPopup buttons
@@ -877,13 +1217,16 @@ class TrainingGameCoordinator(QObject):
         see the child trying and wants to advance the game.
         """
         cur = self._current
-        if cur is None or cur.broadcast_sent:
+        if cur is None:
             return
         now_ms = time.time() * 1000
         if now_ms - self._last_trigger_ms < self._TRIGGER_COOLDOWN_MS / 2:
             return
         self._last_trigger_ms = now_ms
         cur.broadcast_sent = True
+        # Stamp the time so the watchdog can re-arm if Unity ignored
+        # the manual broadcast (same failure mode as the auto path).
+        cur.broadcast_sent_ms = now_ms
         self._broadcast_easy_mode_prediction(cur.spec.gesture_name)
         log.info("Force-feed: broadcasting easy-mode for %s", cur.spec.gesture_name)
         self.trigger_fired.emit(cur.spec.gesture_name, self._detector.last_rms)
@@ -948,6 +1291,8 @@ class TrainingGameCoordinator(QObject):
                 log.exception("Failed to end skipped trial")
         self.trial_completed.emit(cur.spec, cur.index)
         self._current = None
+        # Release the spawn lock so the next advance() can proceed.
+        self._spawn_pending = False
         self._arm_time_ms = (time.time() * 1000) + self._INTER_TRIAL_REST_MS
         QTimer.singleShot(self._INTER_TRIAL_REST_MS, self._advance)
 
@@ -971,11 +1316,11 @@ class TrainingGameCoordinator(QObject):
                 "timestamp": time.time(),
                 "source": "easy_mode",        # Harmless extra field; Unity ignores.
             }
-            data = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
-            # Reuse the server's queue so ordering with any real
-            # predictions is preserved. The server keeps only the
-            # latest payload under backpressure — that's fine for us.
-            self._server._send_queue.put_nowait(data)  # noqa: SLF001 — intentional
+            if hasattr(self._server, "enqueue_json_message"):
+                self._server.enqueue_json_message(message)
+            else:
+                data = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
+                self._server._send_queue.put_nowait(data)  # noqa: SLF001 — compatibility fallback
         except Exception:
             log.exception("Failed to broadcast easy-mode prediction")
 
@@ -998,8 +1343,11 @@ class TrainingGameCoordinator(QObject):
                 "hold_seconds": float(hold_seconds),
                 "timestamp": time.time(),
             }
-            data = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
-            self._server._send_queue.put_nowait(data)  # noqa: SLF001
+            if hasattr(self._server, "enqueue_json_message"):
+                self._server.enqueue_json_message(message)
+            else:
+                data = (json.dumps(message, separators=(",", ":")) + "\n").encode("utf-8")
+                self._server._send_queue.put_nowait(data)  # noqa: SLF001
         except Exception:
             log.exception("Failed to send target_gesture cue")
 
@@ -1009,11 +1357,58 @@ class TrainingGameCoordinator(QObject):
 
     @Slot()
     def _on_tick(self) -> None:
-        """Placeholder for future watchdog work — e.g. trial timeouts."""
-        # Intentionally minimal. The hot path is on_emg_data, and Unity
-        # drives trial advancement. The tick remains in case we want to
-        # add "no attempt in N seconds — nudge child" behaviour later.
-        pass
+        """Periodic watchdog. Two responsibilities:
+
+          1. **Cue resend** — if Unity reconnected after we sent a
+             ``target_gesture`` cue, the original cue may have gone to
+             nobody. Re-send until Unity reaches blocking position.
+          2. **Broadcast-retry** — if we already broadcast an
+             easy-mode prediction but Unity never raised
+             ``ground_truth=true``, the broadcast was almost certainly
+             lost. Re-arm the detector so the next contraction can
+             fire again. Without this defence one stuck trial freezes
+             the entire run, which matches the "third trial didn't
+             feed" symptom you reported.
+        """
+        cur = self._current
+        if not self._running or cur is None:
+            return
+
+        now_ms = time.time() * 1000
+
+        # ── 2. Broadcast-retry watchdog ────────────────────────────
+        # Runs first because, if it fires, it puts us back into a
+        # state where the cue-resend logic below shouldn't re-trigger.
+        if (cur.broadcast_sent
+                and not cur.unity_gt_active
+                and cur.broadcast_sent_ms > 0
+                and now_ms - cur.broadcast_sent_ms > self._BROADCAST_RETRY_MS):
+            log.warning(
+                "[coord] No ground_truth rising edge for '%s' after "
+                "%.0f ms — re-arming detector. (Possible causes: "
+                "gesture-name mismatch on Unity side, animal still "
+                "walking in, or a dropped network message.)",
+                cur.spec.gesture_name, now_ms - cur.broadcast_sent_ms,
+            )
+            cur.broadcast_sent = False
+            cur.broadcast_sent_ms = 0.0
+            # Bypass the per-trial trigger cooldown so the next
+            # observed RMS spike can fire immediately.
+            self._last_trigger_ms = 0.0
+            return
+
+        # ── 1. Cue resend ─────────────────────────────────────────
+        if cur.unity_gt_active:
+            return
+        # Don't re-send once the animal has reached blocking position —
+        # a second cue at this point would queue a phantom second animal.
+        if cur.started_emitted:
+            return
+        if now_ms - cur.last_cue_sent_ms < self._TARGET_CUE_RESEND_MS:
+            return
+
+        self._send_target_gesture_cue(cur.spec.gesture_name, cur.spec.hold_seconds)
+        cur.last_cue_sent_ms = now_ms
 
 
 # ---------------------------------------------------------------------------
@@ -1026,15 +1421,21 @@ def build_default_schedule(
     hold_seconds: float = 3.0,
     rest_seconds: float = 2.0,
     include_rest: bool = False,
+    randomize_within_round: bool = True,
+    seed: Optional[int] = None,
 ) -> List[TrialSpec]:
     """
-    Build a balanced trial schedule from a session's gesture set.
+    Build a **balanced** trial schedule from a session's gesture set.
 
-    Each non-rest gesture appears ``repetitions`` times. Ordering is
-    deterministic interleaved (g1, g2, g3, g1, g2, g3, ...) rather
-    than random — children find predictable sequences less stressful
-    during a first session, and balanced-across-time data is easier to
-    analyse later.
+    Each non-rest gesture appears exactly ``repetitions`` times. Gestures
+    are divided into rounds of one repetition per gesture.  Within each
+    round the order is shuffled (default) or deterministically interleaved
+    — both strategies guarantee equal representation across the full
+    session, which matters for unbiased EMG datasets.
+
+    Shuffled rounds also break up long monotonous runs (e.g. 5 × fist in
+    a row) that a child might find frustrating, without sacrificing the
+    per-gesture count guarantee that pure random sampling can violate.
 
     Parameters
     ----------
@@ -1043,7 +1444,17 @@ def build_default_schedule(
         animals in the game; forcing the child to "perform rest"
         feels odd. Set True only if you really want explicit rest
         trials in the dataset.
+    randomize_within_round : bool
+        When True (default), shuffle the gesture order within every
+        round using ``random.shuffle``, seeded by ``seed`` if given.
+        When False, use a fixed interleaved order (g1, g2, g3, …)
+        — identical to the old behaviour.
+    seed : int or None
+        RNG seed for reproducible shuffling. Ignored when
+        ``randomize_within_round`` is False.
     """
+    import random as _random
+
     gestures = [
         g.name for g in session.gesture_set.gestures
         if include_rest or g.name.lower() != "rest"
@@ -1051,12 +1462,18 @@ def build_default_schedule(
     if not gestures:
         return []
 
+    rng = _random.Random(seed)
     schedule: List[TrialSpec] = []
+
     for _ in range(repetitions):
-        for name in gestures:
+        round_gestures = list(gestures)          # copy for this round
+        if randomize_within_round:
+            rng.shuffle(round_gestures)
+        for name in round_gestures:
             schedule.append(TrialSpec(
                 gesture_name=name,
                 hold_seconds=hold_seconds,
                 rest_seconds=rest_seconds,
             ))
+
     return schedule

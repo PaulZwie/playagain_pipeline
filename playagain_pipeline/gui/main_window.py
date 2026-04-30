@@ -113,6 +113,11 @@ def _make_step_header(title: str, subtitle: str, accent: str = "#0284c7") -> QWi
 class PredictionWorker(QThread):
     """Background worker for model prediction to avoid blocking the GUI thread."""
     prediction_ready = Signal(object, object)  # pred_class, proba_array
+    # Surfaced from the worker thread so the main window can log the FIRST
+    # error in the GUI log instead of having it disappear into stdout. If we
+    # don't do this, a channel-count mismatch (the most common cause of
+    # "Model loaded but no predictions") is completely invisible to the user.
+    error_occurred = Signal(str)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -149,10 +154,18 @@ class PredictionWorker(QThread):
                     pred = int(np.argmax(proba))
                     self.prediction_ready.emit(pred, proba)
                 except Exception as e:
-                    # Log prediction errors (throttled to avoid spam)
+                    # Log prediction errors (throttled to avoid spam) AND
+                    # forward the first occurrence to the GUI so the user
+                    # actually finds out something is wrong.
                     if not hasattr(self, '_last_error') or str(e) != self._last_error:
                         self._last_error = str(e)
                         print(f"[PredictionWorker] Prediction error: {e}")
+                        try:
+                            self.error_occurred.emit(str(e))
+                        except RuntimeError:
+                            # Worker may be tearing down — emit on a deleted
+                            # signal raises; safe to ignore.
+                            pass
 
             self.msleep(100)  # Cap at ~10 predictions/sec
 
@@ -231,6 +244,7 @@ class MainWindow(QMainWindow):
 
     # Thread-safe signal for prediction updates from the server's background thread
     _server_prediction_signal = Signal(str, float)  # display_name, confidence
+    _MUOVI_CONNECT_TIMEOUT_MS = 15_000
 
     def __init__(self):
         super().__init__()
@@ -277,6 +291,7 @@ class MainWindow(QMainWindow):
 
         # Ground truth label for session replay
         self._current_ground_truth_label: Optional[str] = None
+        self._awaiting_muovi_handshake = False
 
         # Quattrocento file-stream state (independent from DeviceManager device)
         self._q4_stream_active = False
@@ -770,9 +785,13 @@ class MainWindow(QMainWindow):
 
         self.game_reps_spin = QSpinBox()
         self.game_reps_spin.setRange(1, 30)
-        self.game_reps_spin.setValue(5)
+        self.game_reps_spin.setValue(3)
         self.game_reps_spin.setToolTip(
-            "How many times each gesture is requested during the game."
+            "Number of trials per gesture. With 3 gestures and the "
+            "default of 3 reps, the game runs 9 trials in total — "
+            "exactly 3 fist, 3 pinch, and 3 tripod. Balanced mode "
+            "guarantees this count even if Unity spawns animals in "
+            "its own order."
         )
         game_layout.addRow("Reps per gesture:", self.game_reps_spin)
 
@@ -1531,6 +1550,84 @@ class MainWindow(QMainWindow):
 
         scroll_layout.addWidget(server_group)
 
+        # ── Play Game with Model ─────────────────────────────────────────
+        # One-click "load a model and play" experience. Mirrors the
+        # Training Game panel on the Record tab (which uses RMS-based
+        # easy mode for kids who don't have a model yet) but here the
+        # game is driven by the *real* model output via the prediction
+        # server. Everything the user needs is in this single group:
+        #   • Locate Unity  — same launcher as the Record tab
+        #   • Launch Game   — starts the TCP server + spawns Unity
+        #   • Stop Game     — closes Unity, leaves the server running so
+        #                     the user can keep iterating without
+        #                     redoing every step
+        play_group = QGroupBox("Play game with model")
+        play_layout = QFormLayout(play_group)
+
+        play_info = QLabel(
+            "Launch the PlayAgain Unity game and let your trained model "
+            "control it. One click starts the TCP server and opens the "
+            "game — Unity will connect and receive live gesture "
+            "predictions over the network."
+        )
+        play_info.setStyleSheet(
+            "color: #555; font-size: 10px; background: #f5f5f5; "
+            "padding: 4px; border-radius: 3px;"
+        )
+        play_info.setWordWrap(True)
+        play_layout.addRow(play_info)
+
+        # Unity build path picker — shares state with the Record tab via
+        # the same UnityLauncher instance, so the user only ever has to
+        # locate Unity once per machine.
+        predict_unity_row = QHBoxLayout()
+        self.predict_unity_path_label = QLabel()
+        self.predict_unity_path_label.setStyleSheet("color: #475569; font-size: 10px;")
+        predict_unity_row.addWidget(self.predict_unity_path_label, 1)
+
+        self.predict_pick_unity_btn = QPushButton("Locate Unity…")
+        self.predict_pick_unity_btn.clicked.connect(self._on_pick_unity_exe)
+        predict_unity_row.addWidget(self.predict_pick_unity_btn)
+        play_layout.addRow("Unity build:", predict_unity_row)
+
+        play_btn_row = QHBoxLayout()
+        self.start_play_game_btn = QPushButton("▶  Launch Game with Model")
+        self.start_play_game_btn.setFixedHeight(36)
+        # Disabled by default — only safe to click once a model is loaded.
+        # _on_load_model() flips this on.
+        self.start_play_game_btn.setEnabled(False)
+        self.start_play_game_btn.setStyleSheet(
+            "QPushButton {"
+            "  background: #16a34a; color: white; border: none;"
+            "  border-radius: 4px; font-weight: 600;"
+            "}"
+            "QPushButton:hover { background: #15803d; }"
+            "QPushButton:disabled { background: #cbd5e1; color: #64748b; }"
+        )
+        self.start_play_game_btn.clicked.connect(self._on_launch_play_with_model)
+        play_btn_row.addWidget(self.start_play_game_btn)
+
+        self.stop_play_game_btn = QPushButton("■  Stop Game")
+        self.stop_play_game_btn.setFixedHeight(36)
+        self.stop_play_game_btn.setEnabled(False)
+        self.stop_play_game_btn.clicked.connect(self._on_stop_play_with_model)
+        play_btn_row.addWidget(self.stop_play_game_btn)
+        play_layout.addRow(play_btn_row)
+
+        self.play_game_status_label = QLabel("Not running.")
+        self.play_game_status_label.setStyleSheet(
+            "color: #475569; font-size: 11px; padding: 4px;"
+        )
+        self.play_game_status_label.setWordWrap(True)
+        play_layout.addRow(self.play_game_status_label)
+
+        scroll_layout.addWidget(play_group)
+
+        # Initialise the path label from QSettings so it shows the right
+        # state on first display (this tab is built before the user has
+        # had a chance to click "Locate Unity…" on the Record tab).
+        self._refresh_unity_path_label()
+
         # ── Game Recording ────────────────────────────────────────────────
         game_rec_group = QGroupBox("Game Recording")
         game_rec_layout = QVBoxLayout(game_rec_group)
@@ -1746,9 +1843,21 @@ class MainWindow(QMainWindow):
         self._log(f"Saved participant info for {subject_id}")
 
     def _log(self, message: str):
-        """Add message to log with color coding."""
+        """Add message to log with color coding and always mirror to stdout."""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        console_line = f"[{timestamp}] {message}"
+        print(console_line, flush=True)
+
+        # Keep a short transient cue in the status bar even in v2, where
+        # the legacy QTextEdit log panel is not always visible.
         try:
-            timestamp = datetime.now().strftime("%H:%M:%S")
+            sb = self.statusBar()
+            if sb is not None:
+                sb.showMessage(message, 5000)
+        except Exception:
+            pass
+
+        try:
             # Color-code by content keywords for quick visual scanning
             if any(k in message.lower() for k in ("error", "failed", "critical")):
                 color = "#f48771"  # red-ish
@@ -1760,10 +1869,11 @@ class MainWindow(QMainWindow):
                 color = "#d4d4d4"  # default light grey
             ts_html = f'<span style="color:#858585;">[{timestamp}]</span>'
             msg_html = f'<span style="color:{color};">{message}</span>'
-            self.log_text.append(f"{ts_html} {msg_html}")
-            self.log_text.verticalScrollBar().setValue(
-                self.log_text.verticalScrollBar().maximum()
-            )
+            if hasattr(self, "log_text") and self.log_text is not None:
+                self.log_text.append(f"{ts_html} {msg_html}")
+                self.log_text.verticalScrollBar().setValue(
+                    self.log_text.verticalScrollBar().maximum()
+                )
         except RuntimeError as e:
             if "already deleted" in str(e):
                 pass
@@ -1776,6 +1886,32 @@ class MainWindow(QMainWindow):
         if self._game_recorder and self._game_recorder.is_recording:
             self._game_recorder.stop_recording()
             self._game_recorder = None
+
+        # Stop play-with-model session if a Unity child process is still
+        # alive — orphan processes are confusing and consume the audio
+        # device.
+        play_proc = getattr(self, "_play_unity_process", None)
+        if play_proc is not None:
+            try:
+                self._unity_launcher().terminate(play_proc)
+            except Exception:
+                pass
+            self._play_unity_process = None
+        play_timer = getattr(self, "_play_status_timer", None)
+        if play_timer is not None:
+            try:
+                play_timer.stop()
+            except Exception:
+                pass
+
+        # Stop training-game Unity process the same way.
+        train_proc = getattr(self, "_unity_process", None)
+        if train_proc is not None:
+            try:
+                self._unity_launcher().terminate(train_proc)
+            except Exception:
+                pass
+            self._unity_process = None
 
         # Stop prediction server if running
         if self._prediction_server:
@@ -2097,6 +2233,7 @@ class MainWindow(QMainWindow):
             if device_type in (DeviceType.MUOVI, DeviceType.MUOVI_PLUS):
                 self._log(f"Starting {device_text} Server on port 54321...")
                 self._log("Action Required: Please turn on your Muovi device now.")
+                self._awaiting_muovi_handshake = True
 
                 # Update UI to 'Waiting' state
                 self.connect_btn.setEnabled(False)
@@ -2105,6 +2242,10 @@ class MainWindow(QMainWindow):
 
                 # Start the TCP/IP Listening Server
                 device.connect_device()
+
+                # If no handshake arrives, surface a clear diagnostic and
+                # reset the button state so the user can retry.
+                QTimer.singleShot(self._MUOVI_CONNECT_TIMEOUT_MS, self._on_muovi_connect_timeout)
 
             else:
                 # Synthetic or other local devices connect immediately
@@ -2129,6 +2270,7 @@ class MainWindow(QMainWindow):
     @Slot(bool)
     def _on_device_connected(self, connected: bool):
         if connected:
+            self._awaiting_muovi_handshake = False
             self._log("Muovi Handshake Successful!")
             self.connect_btn.setText("Connect")
             self.connect_btn.setEnabled(False)
@@ -2137,6 +2279,7 @@ class MainWindow(QMainWindow):
             # Start streaming immediately after connection signal
             self.device_manager.device.start_streaming()
         else:
+            self._awaiting_muovi_handshake = False
             self._log("Device Disconnected.")
             self.connect_btn.setEnabled(True)
             self.disconnect_btn.setEnabled(False)
@@ -2144,7 +2287,30 @@ class MainWindow(QMainWindow):
     @Slot(str)
     def _on_device_error(self, error: str):
         """Handle device errors."""
+        self._awaiting_muovi_handshake = False
         self._log(f"Device error: {error}")
+        self.connect_btn.setEnabled(True)
+        self.connect_btn.setText("Connect")
+        self.disconnect_btn.setEnabled(False)
+
+    @Slot()
+    def _on_muovi_connect_timeout(self):
+        """Warn if Muovi never completed its handshake after connect_device()."""
+        if not self._awaiting_muovi_handshake:
+            return
+        dev = self.device_manager.device
+        if dev is not None and dev.is_connected:
+            self._awaiting_muovi_handshake = False
+            return
+
+        self._awaiting_muovi_handshake = False
+        self._log(
+            "Muovi handshake timeout. Check that the bracelet is powered on, "
+            "Wi-Fi/network is reachable, and port 54321 is not already in use."
+        )
+        self.connect_btn.setEnabled(True)
+        self.connect_btn.setText("Connect")
+        self.disconnect_btn.setEnabled(False)
 
     @Slot(str)
     def _on_ground_truth_changed(self, label: str):
@@ -2159,6 +2325,7 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_disconnect_device(self):
         """Disconnect from device (Muovi/Synthetic or Quattrocento stream)."""
+        self._awaiting_muovi_handshake = False
         # Stop Quattrocento stream if active
         if hasattr(self, '_q4_worker') and self._q4_worker is not None:
             self._q4_worker.stop()
@@ -2251,16 +2418,29 @@ class MainWindow(QMainWindow):
         return self._unity_launcher_inst
 
     def _refresh_unity_path_label(self) -> None:
-        """Update the 'Unity build:' hint under the button group."""
-        if not hasattr(self, "unity_path_label"):
-            return
+        """Update the 'Unity build:' hint under the button group(s).
+
+        Both the Record tab (training-game launcher) and the Predict tab
+        (play-with-model launcher) show this path. We update every label
+        we can find so the user never sees a stale value after picking a
+        new build from either tab.
+        """
         path = self._unity_launcher().saved_path()
         if path is None:
-            self.unity_path_label.setText("Not set — click 'Locate Unity…'")
-            self.unity_path_label.setStyleSheet("color: #b45309; font-size: 10px;")
+            text = "Not set — click 'Locate Unity…'"
+            style = "color: #b45309; font-size: 10px;"
         else:
-            self.unity_path_label.setText(str(path))
-            self.unity_path_label.setStyleSheet("color: #475569; font-size: 10px;")
+            text = str(path)
+            style = "color: #475569; font-size: 10px;"
+        for attr in ("unity_path_label", "predict_unity_path_label"):
+            label = getattr(self, attr, None)
+            if label is not None:
+                try:
+                    label.setText(text)
+                    label.setStyleSheet(style)
+                except RuntimeError:
+                    # Widget was deleted (tab rebuild) — skip silently.
+                    pass
 
     @Slot()
     def _on_pick_unity_exe(self) -> None:
@@ -2346,27 +2526,42 @@ class MainWindow(QMainWindow):
                                     f"{e}\n\nPlay the game without saving?")
 
         session = self._current_session
+        reps = int(self.game_reps_spin.value())
         if session is None:
             self._log("Training game running in preview mode — no session bound.")
-            schedule = [TrialSpec("fist"), TrialSpec("pinch"), TrialSpec("tripod")] \
-                * int(self.game_reps_spin.value())
+            gestures_for_balance: list[str] = ["fist", "pinch", "tripod"]
         else:
-            schedule = build_default_schedule(
-                session,
-                repetitions=int(self.game_reps_spin.value()),
-                hold_seconds=3.0,
-                rest_seconds=2.0,
-            )
+            gestures_for_balance = [
+                g.name for g in session.gesture_set.gestures
+                if g.name and g.name.lower() != "rest"
+            ]
 
-        if not schedule:
+        if not gestures_for_balance:
             QMessageBox.warning(self, "Empty schedule",
                                 "The current gesture set has no non-rest gestures.")
             return
 
+        # Expected total = exactly N reps × M gestures. Balanced mode
+        # may run a few extra trials if Unity ignores the cued gesture
+        # for a slot, but it stops as soon as every gesture has hit N
+        # successful trials — which is the user-visible guarantee here.
+        expected_total = len(gestures_for_balance) * reps
+
         # ── 3. Coordinator ──────────────────────────────────────────
         coord = TrainingGameCoordinator(prediction_server=server, parent=self)
         coord.set_trigger_ratio(float(self.game_easy_ratio.value()))
-        coord.set_schedule(schedule)
+        # Balanced mode: the coordinator counts completions per gesture
+        # (using Unity's own ``gesture_requested`` field — the gesture
+        # the child actually saw) and keeps cuing the most under-
+        # represented one until each target is met. Replaces the
+        # static-schedule path used previously, which produced
+        # imbalanced datasets whenever Unity didn't follow our cues.
+        coord.set_balanced_mode(
+            gestures=gestures_for_balance,
+            reps_per_gesture=reps,
+            hold_seconds=3.0,
+            rest_seconds=2.0,
+        )
         # take_ownership=True hands the session lifecycle to the
         # coordinator: it calls start_recording() when Unity's Level 1
         # signal arrives and stop_recording() on teardown.
@@ -2379,6 +2574,15 @@ class MainWindow(QMainWindow):
         coord.rms_updated.connect(self._on_game_rms_updated)
         coord.state_changed.connect(self._on_game_state_changed)
         coord.game_level_started.connect(self._on_game_level_started)
+        # New: per-gesture progress feed, used by _on_game_balance_progress
+        # to render "fist 2/3, pinch 1/3, tripod 0/3" in the status label
+        # so the user can see exactly why the game is still running.
+        coord.balance_progress.connect(self._on_game_balance_progress)
+
+        # Forget any progress from a previous run so the completion
+        # summary doesn't reuse stale numbers if balance_progress hasn't
+        # had time to fire yet.
+        self._last_balance_progress = None
 
         self._training_coordinator = coord
 
@@ -2400,7 +2604,7 @@ class MainWindow(QMainWindow):
             popup = GameProtocolPopup(parent=self)
             if session is not None:
                 popup.set_gesture_set(session.gesture_set)
-            popup.set_total_trials(len(schedule))
+            popup.set_total_trials(expected_total)
 
             coord.trial_started.connect(popup.set_current_trial)
             coord.trial_completed.connect(lambda *_a: popup.clear_current_trial())
@@ -2467,8 +2671,9 @@ class MainWindow(QMainWindow):
         self.start_game_btn.setEnabled(False)
         self.stop_game_btn.setEnabled(True)
         self.game_status_label.setText(
-            f"Waiting for Unity… {len(schedule)} trials queued. "
-            f"Session starts when the child hits Start in the game."
+            f"Waiting for Unity… {expected_total} trials queued "
+            f"({reps}× per gesture, balanced). Session starts when the "
+            f"child hits Start in the game."
         )
 
     @Slot()
@@ -2504,15 +2709,242 @@ class MainWindow(QMainWindow):
                 pass
             self._unity_process = None
 
-        # If we auto-started a session for the game, stop it too so the
-        # data is actually written to disk.
+        # If the session is still recording (coordinator didn't own it,
+        # or the user hit Stop before Level 1 arrived), stop it now.
         if self._current_session is not None and self._current_session.is_recording:
             self._on_stop_recording()
+        elif self._current_session is not None and not self._current_session.is_recording:
+            # Coordinator already called stop_recording() internally —
+            # but it never saves to disk. Do that now so early exits
+            # don't silently discard collected data.
+            try:
+                if self._current_session.total_samples > 0:
+                    # Auto-detect rotation before saving (mirrors _on_stop_recording)
+                    try:
+                        cal_result = self.calibrator.detect_session_rotation(
+                            self._current_session, save_to_metadata=True
+                        )
+                        if cal_result is not None:
+                            self._log(
+                                f"Auto-detected rotation: {cal_result.rotation_offset} ch "
+                                f"(confidence: {cal_result.confidence:.0%})"
+                            )
+                            if not self.calibrator.has_reference:
+                                self.calibrator.save_as_reference(cal_result)
+                    except Exception as e:
+                        self._log(f"Rotation detection failed: {e}")
+                    path = self.data_manager.save_session(self._current_session)
+                    self._log(f"Training-game session saved to {path}")
+                    self._stepper_mark(STEP_RECORD)
+                else:
+                    self._log("Training-game session had no data — not saved.")
+            except Exception as save_err:
+                self._log(f"Error saving training-game session: {save_err}")
+            finally:
+                self._current_session = None
 
         self.start_game_btn.setEnabled(True)
         self.stop_game_btn.setEnabled(False)
         self.game_status_label.setText("Stopped.")
         self._log("Training game stopped.")
+
+    # ------------------------------------------------------------------
+    # Play-with-model (Predict tab) handlers
+    # ------------------------------------------------------------------
+    #
+    # The Record-tab "Launch Training Game" above runs Unity in
+    # **easy mode**: an RMS detector fakes confidence-1.0 predictions so
+    # children can collect their first dataset before any model exists.
+    #
+    # The handlers below are the **mirror image** for the Predict tab:
+    # the user has a trained model, the prediction server runs real
+    # inference on the live EMG, and Unity is just the playable
+    # frontend. No coordinator, no popup — the game plays freely from
+    # the model's output.
+    # ------------------------------------------------------------------
+
+    @Slot()
+    def _on_launch_play_with_model(self) -> None:
+        """One-click: start the prediction server with the loaded model
+        and launch Unity. The user does not need to touch the standalone
+        "Start Server" button — we handle it for them.
+        """
+        # 1. Model required.
+        if not self._current_model:
+            QMessageBox.warning(
+                self, "No model loaded",
+                "Please load a trained model first (use the 'Load Model' "
+                "button in the Model section above)."
+            )
+            return
+
+        # 2. Live EMG required — predictions need data flowing.
+        device = getattr(self.device_manager, "device", None)
+        stream_ready = bool(device and device.is_streaming) or bool(self._q4_stream_active)
+        if not stream_ready:
+            QMessageBox.warning(
+                self, "No data stream",
+                "Connect an EMG device (or start a Quattrocento file "
+                "stream) on the Record tab first — the model needs live "
+                "EMG to make predictions."
+            )
+            return
+
+        # 3. Unity build configured?
+        launcher = self._unity_launcher()
+        if not launcher.has_saved_path():
+            QMessageBox.information(
+                self, "Unity path not set",
+                "Please click 'Locate Unity…' and select your PlayAgain "
+                "executable first."
+            )
+            return
+
+        # 4. Smoke-test the model on the current buffer so a channel
+        #    mismatch is caught BEFORE we spawn Unity. Saves the user
+        #    from a "the game opened but nothing happens" experience.
+        if self._prediction_buffer is None:
+            # _on_load_model didn't run — guard anyway.
+            QMessageBox.warning(
+                self, "Buffer not initialised",
+                "Re-load the model so the prediction buffer is set up."
+            )
+            return
+        try:
+            X_test = self._prediction_buffer[np.newaxis, :, :]
+            _ = self._current_model.predict_proba(X_test)
+        except Exception as e:
+            md = self._current_model.metadata
+            QMessageBox.critical(
+                self, "Model cannot predict on this stream",
+                f"The loaded model failed a quick test against the "
+                f"current buffer.\n\n"
+                f"Buffer:        {self._prediction_buffer.shape}\n"
+                f"Model expects: {md.num_channels} ch @ {md.sampling_rate} Hz\n\n"
+                f"Underlying error:\n{e}\n\n"
+                f"Most common cause: the device's channel count does "
+                f"not match the channel count the model was trained on."
+            )
+            self._log(f"Play-with-model smoke-test failed: {e}")
+            return
+
+        # 5. Start (or reuse) the TCP server with the loaded model.
+        #    If the user already started it manually, don't disturb it.
+        server = self._prediction_server
+        if server is None or not server.is_running:
+            try:
+                # Delegate to the existing handler so smoothing settings,
+                # callbacks, and buttons stay consistent with the manual
+                # path. _on_start_server picks up the model + UI state
+                # and flips the Start/Stop server buttons for us.
+                self._on_start_server()
+            except Exception as e:
+                QMessageBox.warning(
+                    self, "Server failed to start",
+                    f"Could not start the TCP prediction server:\n{e}"
+                )
+                return
+            server = self._prediction_server
+            if server is None or not server.is_running:
+                QMessageBox.warning(
+                    self, "Server failed to start",
+                    "The TCP prediction server did not come up — check "
+                    "the log for details (port may already be in use)."
+                )
+                return
+        else:
+            # Server already up — make sure it isn't paused, otherwise
+            # Unity will sit there receiving nothing.
+            if getattr(server, "is_paused", False):
+                server.resume()
+
+        # 6. Launch Unity.
+        try:
+            proc = launcher.launch(extra_args=["-screen-fullscreen", "0"])
+            self._play_unity_process = proc
+            self._log(f"Unity launched (PID {proc.pid}) for play-with-model.")
+        except UnityNotFoundError as e:
+            QMessageBox.warning(self, "Unity not found", str(e))
+            return
+
+        # 7. Periodic status update — show whether Unity actually
+        #    connected to the server. Without this the user has no way
+        #    to tell the difference between "Unity is loading" and
+        #    "Unity crashed before connecting".
+        if not hasattr(self, "_play_status_timer") or self._play_status_timer is None:
+            self._play_status_timer = QTimer(self)
+            self._play_status_timer.timeout.connect(self._update_play_status_label)
+        self._play_status_timer.start(1000)
+
+        # 8. UI bookkeeping.
+        self.start_play_game_btn.setEnabled(False)
+        self.stop_play_game_btn.setEnabled(True)
+        self.play_game_status_label.setText(
+            f"Game launched. Waiting for Unity to connect to the server…"
+        )
+
+    @Slot()
+    def _on_stop_play_with_model(self) -> None:
+        """Stop the play-with-model session. Closes Unity but leaves the
+        server running so the user can iterate (load a different model,
+        click Launch again) without re-doing every step.
+        """
+        proc = getattr(self, "_play_unity_process", None)
+        if proc is not None:
+            try:
+                self._unity_launcher().terminate(proc)
+            except Exception as e:
+                self._log(f"Could not cleanly terminate Unity: {e}")
+            self._play_unity_process = None
+
+        timer = getattr(self, "_play_status_timer", None)
+        if timer is not None:
+            try:
+                timer.stop()
+            except Exception:
+                pass
+
+        self.start_play_game_btn.setEnabled(self._current_model is not None)
+        self.stop_play_game_btn.setEnabled(False)
+        self.play_game_status_label.setText("Not running.")
+        self._log("Play-with-model stopped.")
+
+    @Slot()
+    def _update_play_status_label(self) -> None:
+        """Tick: refresh 'Game launched / N clients connected' text.
+
+        Runs only while the play-with-model session is live. Stops the
+        timer if the Unity process has died externally so the user gets
+        a clear "the game crashed" indicator instead of a stuck label.
+        """
+        proc = getattr(self, "_play_unity_process", None)
+        server = self._prediction_server
+
+        # Unity died on its own (user closed the window, crashed, etc.)
+        if proc is not None and proc.poll() is not None:
+            self._play_unity_process = None
+            timer = getattr(self, "_play_status_timer", None)
+            if timer is not None:
+                timer.stop()
+            self.start_play_game_btn.setEnabled(self._current_model is not None)
+            self.stop_play_game_btn.setEnabled(False)
+            self.play_game_status_label.setText(
+                "Game closed. Click 'Launch Game with Model' to play again."
+            )
+            self._log("Unity exited (play-with-model).")
+            return
+
+        if server is not None and server.is_running:
+            n = server.client_count
+            model_name = getattr(self._current_model, "name", "model")
+            if n > 0:
+                self.play_game_status_label.setText(
+                    f"▶ Playing — {n} Unity client connected. Model: {model_name}."
+                )
+            else:
+                self.play_game_status_label.setText(
+                    "Game launched. Waiting for Unity to connect to the server…"
+                )
 
     @Slot(str)
     def _on_replay_session_picked(self, path: str) -> None:
@@ -2556,6 +2988,33 @@ class MainWindow(QMainWindow):
     def _on_game_trial_completed(self, spec: TrialSpec, index: int) -> None:
         self._log(f"[Game] Trial {index + 1} done ({spec.gesture_name}) ✓")
 
+    @Slot(dict)
+    def _on_game_balance_progress(self, progress: dict) -> None:
+        """
+        Per-gesture progress update from the coordinator's balanced
+        mode. ``progress`` is ``{gesture: (completed, target)}``. Render
+        a compact "fist 2/3 · pinch 1/3 · tripod 0/3" line beneath the
+        current trial label so the user can see exactly why the game
+        is still going (or that it's about to finish).
+        """
+        if not progress:
+            return
+        # Cache for the completion handler so we can give an honest
+        # summary even when Unity's spawn order made full balance
+        # impossible (counts will be uneven and the safety cap fires).
+        self._last_balance_progress = dict(progress)
+        # Sorted alphabetically for stable ordering across updates.
+        parts = [
+            f"{name} {done}/{target}"
+            for name, (done, target) in sorted(progress.items())
+        ]
+        # Don't overwrite the "Trial X/N — target …" line — append on
+        # the next line so both pieces of information are visible.
+        existing = self.game_status_label.text().split("\n", 1)[0]
+        self.game_status_label.setText(
+            f"{existing}\nProgress: " + " · ".join(parts)
+        )
+
     @Slot(str, float)
     def _on_game_trigger_fired(self, gesture: str, rms: float) -> None:
         """Easy-mode trigger fired → the animal is about to be fed."""
@@ -2563,9 +3022,38 @@ class MainWindow(QMainWindow):
 
     @Slot()
     def _on_game_all_complete(self) -> None:
-        """Schedule finished normally — stop everything cleanly."""
-        self.game_status_label.setText("All trials complete — great job!")
-        self._log("[Game] All trials complete.")
+        """Schedule finished — stop everything cleanly. The summary is
+        honest about whether balance was actually achieved (targets
+        may not be hit if Unity's spawn order ignored our cues)."""
+        progress = getattr(self, "_last_balance_progress", None)
+        if progress:
+            unmet = {
+                g: (done, target)
+                for g, (done, target) in progress.items()
+                if done < target
+            }
+            if not unmet:
+                self.game_status_label.setText(
+                    "All trials complete — every gesture met its target ✓"
+                )
+                self._log("[Game] Balanced run complete — all targets met.")
+            else:
+                detail = ", ".join(
+                    f"{g} {done}/{target}" for g, (done, target) in sorted(unmet.items())
+                )
+                self.game_status_label.setText(
+                    f"Stopped — Unity spawn order didn't allow full balance.\n"
+                    f"Missing: {detail}.  Consider re-running, or patch "
+                    f"Unity to follow target_gesture cues."
+                )
+                self._log(
+                    f"[Game] Balanced run ended without full balance: {detail}"
+                )
+        else:
+            # Strict-schedule path or no progress emitted — fall back
+            # to the original, simpler success line.
+            self.game_status_label.setText("All trials complete — great job!")
+            self._log("[Game] All trials complete.")
         # Delay the teardown slightly so the final animal animation
         # finishes on the Unity side before the process is killed.
         QTimer.singleShot(3000, self._on_stop_training_game)
@@ -2625,7 +3113,8 @@ class MainWindow(QMainWindow):
             )
 
         subject_id = (self.subject_id_edit.text() or "VP_01").strip()
-        session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        reps = int(self.game_reps_spin.value())
+        session_id = f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{reps}rep"
 
         # Use the project's default gesture set — same as normal
         # recordings, so the dataset pipeline treats training-game
@@ -3883,12 +4372,32 @@ class MainWindow(QMainWindow):
             window_samples = int(self._prediction_window_ms * self._current_model.metadata.sampling_rate / 1000)
             self._prediction_buffer = np.zeros((window_samples, num_ch))
 
-            # Warn if channel count differs from model's trained channel count
-            model_ch = self._current_model.metadata.num_channels
+            # Warn if channel count differs from model's trained channel count.
+            # Reuse the same wording in _on_start_prediction so the user
+            # sees the warning at load time AND right before predicting.
+            md = self._current_model.metadata
+            classes = md.class_names if isinstance(md.class_names, dict) else {}
+            self._log(
+                f"  Model expects: {md.num_channels} ch @ {md.sampling_rate} Hz, "
+                f"{len(classes)} classes ({', '.join(str(v) for v in classes.values())})"
+            )
+            self._log(
+                f"  Prediction buffer initialised: {window_samples} samples × {num_ch} channels"
+            )
+            model_ch = md.num_channels
             if model_ch > 0 and num_ch != model_ch:
                 self._log(
-                    f"  Channel mismatch: device has {num_ch} ch, model trained on {model_ch} ch."
+                    f"  ⚠ Channel mismatch: device has {num_ch} ch, model "
+                    f"trained on {model_ch} ch — predictions will likely "
+                    f"fail until channels match. Reconnect the device or "
+                    f"retrain on this device's channel count."
                 )
+
+            # Re-enable launch buttons that were greyed out before a model
+            # was available — most importantly the "Launch Game with Model"
+            # one-click flow on this tab.
+            if hasattr(self, "start_play_game_btn"):
+                self.start_play_game_btn.setEnabled(True)
 
         except Exception as e:
             self._log(f"Error loading model: {e}")
@@ -3906,6 +4415,38 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Warning", "Please connect and start device")
             return
 
+        # ── Smoke-test the model BEFORE we start the worker thread ───────
+        # The PredictionWorker swallows exceptions on its background loop
+        # (it only printed to stdout previously, which the user never
+        # sees). If the model can't predict on the current buffer shape
+        # — almost always a channel-count mismatch caused by training on
+        # one device and predicting on another — we want to fail loudly
+        # and explain WHY, not silently leave the label at "No prediction".
+        if self._prediction_buffer is None:
+            QMessageBox.warning(
+                self, "Warning",
+                "Prediction buffer is not initialised. Load the model again."
+            )
+            return
+        try:
+            X_test = self._prediction_buffer[np.newaxis, :, :]
+            _ = self._current_model.predict_proba(X_test)
+        except Exception as e:
+            md = self._current_model.metadata
+            QMessageBox.critical(
+                self, "Model cannot predict on this stream",
+                f"The loaded model failed a quick test on the current buffer.\n\n"
+                f"Buffer shape:   {self._prediction_buffer.shape} (samples × channels)\n"
+                f"Model expects:  {md.num_channels} ch @ {md.sampling_rate} Hz\n\n"
+                f"Underlying error:\n{e}\n\n"
+                f"Most common cause: the device's channel count does not "
+                f"match the channel count the model was trained on. "
+                f"Reconnect the matching device, or retrain a model on "
+                f"this device's data."
+            )
+            self._log(f"Prediction smoke-test failed: {e}")
+            return
+
         # Create GUI-side smoother for display
         if self.smoothing_enabled_cb.isChecked():
             alpha = self.smoothing_alpha_spin.value() / 100.0
@@ -3918,6 +4459,10 @@ class MainWindow(QMainWindow):
         self._prediction_worker = PredictionWorker(self)
         self._prediction_worker.set_model(self._current_model)
         self._prediction_worker.prediction_ready.connect(self._on_prediction_ready)
+        # Surface background-thread errors to the user — without this,
+        # silent failures leave the label stuck on "No prediction" with
+        # no indication why.
+        self._prediction_worker.error_occurred.connect(self._on_prediction_worker_error)
         self._prediction_worker.start()
 
         # Resume prediction server if it was paused
@@ -3928,6 +4473,17 @@ class MainWindow(QMainWindow):
         self.start_pred_btn.setEnabled(False)
         self.stop_pred_btn.setEnabled(True)
         self._log("Started prediction")
+
+    @Slot(str)
+    def _on_prediction_worker_error(self, message: str):
+        """
+        Background worker hit an exception. Show it in the log so the
+        user can see WHY predictions stopped flowing instead of staring
+        at a frozen label. Throttled by the worker itself.
+        """
+        self._log(f"Prediction error: {message}")
+        # Don't auto-stop the worker — the same exception may be a one-off
+        # caused by a transient device hiccup. The user can stop manually.
 
     @Slot()
     def _on_stop_prediction(self):
@@ -3981,6 +4537,11 @@ class MainWindow(QMainWindow):
         # The callback runs on the prediction worker thread, so we use
         # QTimer.singleShot to marshal the UI update to the main thread.
         self._prediction_server.add_prediction_callback(self._on_server_prediction)
+        # Surface server-side prediction errors to the GUI log too. The
+        # callback runs on the server's background thread, so we cannot
+        # touch widgets directly — _on_server_prediction_error reschedules
+        # onto the main thread.
+        self._prediction_server.add_error_callback(self._on_server_prediction_error)
 
         # Apply smoothing settings to server
         smoothing_on = self.smoothing_enabled_cb.isChecked()
@@ -3997,6 +4558,22 @@ class MainWindow(QMainWindow):
         self.server_status_label.setText(f"Server: Running on {host}:{port}")
         self._log(f"Unity TCP server started on {host}:{port}")
 
+    def _on_server_prediction_error(self, message: str):
+        """
+        Callback from PredictionServer (runs on its background thread)
+        for prediction-loop errors. Marshals onto the main thread so we
+        can safely touch the log widget.
+        """
+        # QTimer.singleShot(0, ...) is the standard Qt pattern for
+        # "do this on the main thread next event loop tick".
+        try:
+            QTimer.singleShot(
+                0, lambda m=message: self._log(f"Server prediction error: {m}")
+            )
+        except Exception:
+            # Last-ditch fallback if Qt is shutting down.
+            print(f"[Server] Prediction error: {message}")
+
     @Slot()
     def _on_stop_server(self):
         """Stop the Unity TCP prediction server."""
@@ -4007,6 +4584,13 @@ class MainWindow(QMainWindow):
         if self._prediction_server:
             # Remove our GUI prediction callback before stopping
             self._prediction_server.remove_prediction_callback(self._on_server_prediction)
+            # Same for the error callback added in _on_start_server.
+            try:
+                self._prediction_server.remove_error_callback(self._on_server_prediction_error)
+            except AttributeError:
+                # Older PredictionServer versions don't have the method —
+                # safe to ignore, the server is being torn down anyway.
+                pass
             self._prediction_server.stop()
             self._prediction_server = None
 
