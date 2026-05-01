@@ -375,11 +375,27 @@ class MainWindowV2(MainWindow):
         try:
             from playagain_pipeline.gui.widgets.calibration_dialog import CalibrationDialog
             dlg = CalibrationDialog(
-                calibrator=getattr(self, "_calibrator", None),
-                device=getattr(self, "_device", None),
+                calibrator=getattr(self, "_calibrator", None)
+                           or getattr(self, "calibrator", None),
+                device=getattr(self, "_device", None)
+                       or getattr(self, "device", None),
+                # Pass data_manager so the "From Session" tab is populated.
+                # Try both common attribute names.
+                data_manager=getattr(self, "data_manager", None)
+                             or getattr(self, "_data_manager", None),
                 parent=self,
             )
-            dlg.exec()
+            if dlg.exec():
+                result = dlg.get_calibration_result()
+                if result is not None:
+                    # Apply to whichever calibrator attribute the parent uses.
+                    cal = (getattr(self, "_calibrator", None)
+                           or getattr(self, "calibrator", None))
+                    if cal is not None:
+                        cal._current_calibration = result
+                    # Refresh the calibration display if the method exists.
+                    if hasattr(self, "_update_calibration_display"):
+                        self._update_calibration_display()
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(
                 self, "Calibration unavailable",

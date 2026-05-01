@@ -849,6 +849,20 @@ class TrainingProgressDialog(QDialog):
         self.available_models = available_models or ["SVM", "CatBoost", "Random Forest", "LDA", "MLP", "CNN"]
         self._worker: Optional[TrainingWorker] = None
 
+        # Flag used to short-circuit handlers when the dialog is being
+        # torn down. Qt may deliver queued signals after the C++ objects
+        # have started destruction which raises RuntimeError; using this
+        # flag makes handlers no-op in that window.
+        self._tearing_down = False
+        # Also listen for QObject.destroyed in case teardown happens
+        # from outside closeEvent; the signal is queued as a safe hook.
+        try:
+            self.destroyed.connect(self._on_destroyed)
+        except Exception:
+            # Be defensive: some PySide versions may behave oddly during
+            # shutdown; ignore if connecting fails.
+            pass
+
         # Training history for plotting
         self._train_losses: List[float] = []
         self._val_losses: List[float] = []
@@ -875,7 +889,12 @@ class TrainingProgressDialog(QDialog):
             if not self.model_type:
                 selection_layout.addWidget(QLabel("Model Type:"), 0, 0)
                 self.model_type_combo = QComboBox()
+                # Block signals while populating so currentTextChanged
+                # doesn't fire before self.tabs exists (it's created
+                # further down in _setup_ui).
+                self.model_type_combo.blockSignals(True)
                 self.model_type_combo.addItems(self.available_models)
+                self.model_type_combo.blockSignals(False)
                 self.model_type_combo.currentTextChanged.connect(self._on_model_type_changed)
                 selection_layout.addWidget(self.model_type_combo, 0, 1)
                 # Convert first available model name to internal type name
@@ -1018,25 +1037,78 @@ class TrainingProgressDialog(QDialog):
         self.log_text.append(message)
 
     def _on_model_type_changed(self, model_name: str):
-        """Handle model type change."""
+        """Handle model type change.
+
+        Defensively guard against late signals during dialog teardown.
+        Qt's destruction order can fire ``currentTextChanged`` after
+        ``self.tabs`` has already been deleted, raising
+        ``RuntimeError: wrapped C/C++ object already deleted``. That's
+        the "Internal C++ object (PySide6.QtWidgets.QTabWidget)
+        already deleted" error users were seeing 2-6 times per training
+        run. Set ``self.tabs = None`` on the first such failure so
+        subsequent late signals bail out cheaply.
+        """
+        # Bail out quickly if we're being torn down — avoids acting on
+        # queued signals that arrive after C++ children were deleted.
+        if getattr(self, "_tearing_down", False):
+            return
+
         # Convert UI display names to internal model type names
         if model_name == "AttentionNet":
             self.model_type = "attention_net"
         else:
             self.model_type = model_name.lower().replace(" ", "_")
-        # Update hyperparameter widget
-        # Find the tab index for hyperparameters
-        for i in range(self.tabs.count()):
-            if self.tabs.tabText(i) == "Hyperparameters":
-                # Remove old widget
-                old_widget = self.tabs.widget(i)
-                if old_widget:
+
+        tabs = getattr(self, "tabs", None)
+        if tabs is None:
+            return
+        try:
+            tab_count = tabs.count()
+        except RuntimeError:
+            self.tabs = None
+            return
+
+        # Update hyperparameter widget — find its tab.
+        for i in range(tab_count):
+            try:
+                if tabs.tabText(i) != "Hyperparameters":
+                    continue
+                old_widget = tabs.widget(i)
+                # Remove the tab first so insertTab doesn't add a
+                # duplicate. removeTab() re-parents the widget to None
+                # so we must also delete it explicitly; deleteLater()
+                # is safe here because we're on the main thread.
+                tabs.removeTab(i)
+                if old_widget is not None:
                     old_widget.deleteLater()
-                # Create new widget
                 self.hyperparam_widget = HyperparameterWidget(self.model_type, self.config)
-                self.tabs.insertTab(i, self.hyperparam_widget, "Hyperparameters")
-                self.tabs.setCurrentIndex(i)
-                break
+                tabs.insertTab(i, self.hyperparam_widget, "Hyperparameters")
+                tabs.setCurrentIndex(i)
+            except RuntimeError:
+                # Race during teardown — silently abandon this update.
+                self.tabs = None
+                return
+            break
+
+    # NOTE: closeEvent merged further below to ensure single definitive
+    # cleanup implementation (stops worker, blocks signals, and marks
+    # tabs as gone). The real closeEvent is defined later in this file.
+
+    def _on_destroyed(self, *a, **k):
+        """Slot for QObject.destroyed to mark teardown and attempt to
+        defensively block remaining combo signals."""
+        try:
+            self._tearing_down = True
+            for combo_attr in ("model_type_combo", "dataset_combo"):
+                combo = getattr(self, combo_attr, None)
+                if combo is not None:
+                    try:
+                        combo.blockSignals(True)
+                        combo.currentTextChanged.disconnect()
+                    except Exception:
+                        pass
+        except Exception:
+            pass
 
     def _on_dataset_selected(self, dataset_name: str):
         """Handle dataset selection to update info."""
@@ -1363,14 +1435,64 @@ class TrainingProgressDialog(QDialog):
         self._worker = None
 
     def closeEvent(self, event):
-        """Ensure worker thread is stopped before dialog destruction."""
-        if self._worker and self._worker.isRunning():
-            self._worker.stop()
-            self._worker.wait(3000)
-            if self._worker.isRunning():
-                self._worker.terminate()
-                self._worker.wait(2000)
-        self._worker = None
+        """Ensure worker thread is stopped and disconnect signals before dialog destruction.
+
+        This method performs four defensive steps:
+        1) Mark teardown so queued slots bail out early.
+        2) Disconnect ALL signals on every child combo/widget before Qt
+           starts destroying children. This is the critical step: it
+           must happen *before* super().closeEvent() so that no queued
+           currentTextChanged can fire after C++ children are gone.
+        3) Null self.tabs so any signal that races past step 2 is a
+           cheap no-op rather than a RuntimeError.
+        4) Stop any background worker thread and then call base closeEvent.
+        """
+        # 1) Mark teardown immediately — slots check this flag first.
+        self._tearing_down = True
+
+        # 2) Aggressively sever all Qt signals on interactive child widgets
+        #    BEFORE super().closeEvent() triggers C++ child destruction.
+        #    Using a broad try/except per widget so one failure doesn't
+        #    prevent the others from being disconnected.
+        for combo_attr in ("model_type_combo", "dataset_combo"):
+            combo = getattr(self, combo_attr, None)
+            if combo is None:
+                continue
+            try:
+                combo.blockSignals(True)
+            except Exception:
+                pass
+            try:
+                combo.currentTextChanged.disconnect()
+            except Exception:
+                pass
+
+        # Also block the hyperparameter widget's internal combos if present.
+        hp = getattr(self, "hyperparam_widget", None)
+        if hp is not None:
+            try:
+                hp.blockSignals(True)
+            except Exception:
+                pass
+
+        # 3) Null the tabs reference so any signal that slipped through
+        #    the blockSignals() window hits the `if tabs is None: return`
+        #    guard in _on_model_type_changed instead of crashing.
+        self.tabs = None
+
+        # 4) Stop worker thread before handing control back to Qt.
+        try:
+            if self._worker and self._worker.isRunning():
+                self._worker.stop()
+                self._worker.wait(3000)
+                if self._worker.isRunning():
+                    self._worker.terminate()
+                    self._worker.wait(2000)
+        except Exception:
+            pass
+        finally:
+            self._worker = None
+
         super().closeEvent(event)
 
     def get_trained_model(self):

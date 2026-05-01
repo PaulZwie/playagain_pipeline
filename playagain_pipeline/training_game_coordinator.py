@@ -406,6 +406,14 @@ class TrainingGameCoordinator(QObject):
         self._balanced_mode: bool = False
         self._target_per_gesture: dict[str, int] = {}
         self._completed_per_gesture: dict[str, int] = {}
+        # Unity-override-aware delivery counter. Increments on EVERY
+        # falling edge regardless of whether Unity delivered what we
+        # cued. The new picker reads from this so it stops cuing a
+        # gesture Unity has already over-delivered. Without this, the
+        # picker kept cuing 'fist' (deficit 1) while Unity kept
+        # spawning 'pinch' (already at target), which produced the
+        # 2/5/2 imbalance the user reported.
+        self._delivered_per_gesture: dict[str, int] = {}
         # Hard cap on total trials. Without this, a Unity build that
         # spawns the same animal forever would loop indefinitely.
         # Default 2× the expected total — generous but bounded.
@@ -479,6 +487,7 @@ class TrainingGameCoordinator(QObject):
         self._balanced_mode = False
         self._target_per_gesture = {}
         self._completed_per_gesture = {}
+        self._delivered_per_gesture = {}
         self._max_total_trials = 0
 
     def set_balanced_mode(
@@ -543,6 +552,7 @@ class TrainingGameCoordinator(QObject):
         self._balanced_mode = True
         self._target_per_gesture = {g: int(reps_per_gesture) for g in clean}
         self._completed_per_gesture = {g: 0 for g in clean}
+        self._delivered_per_gesture = {g: 0 for g in clean}
         total_expected = sum(self._target_per_gesture.values())
         self._max_total_trials = max(
             total_expected,
@@ -1037,18 +1047,31 @@ class TrainingGameCoordinator(QObject):
                 except Exception:
                     log.exception("end_trial failed for %s", cur.spec.gesture_name)
 
-            # Track per-gesture completion. ``cur.spec.gesture_name``
-            # was already rewritten to Unity's reported gesture in
-            # the ``camera_blocking`` branch above, so it's
-            # authoritative here too — popup, recording label, and
-            # this counter all read the same value.
+            # Track per-gesture completion AND delivery.
+            #
+            # ``completed_per_gesture`` counts trials that hit our cued
+            # target — useful diagnostically.
+            # ``delivered_per_gesture`` counts EVERY trial keyed by the
+            # gesture Unity actually showed, regardless of cue. The
+            # picker reads delivered, not completed, so it stops cuing
+            # gestures Unity has already over-delivered.
+            #
+            # ``cur.spec.gesture_name`` was rewritten to Unity's
+            # reported gesture in the camera_blocking branch above, so
+            # both counters here use the gesture the EMG was actually
+            # performed for.
             if self._balanced_mode:
                 actual = cur.spec.gesture_name.lower()
+                self._delivered_per_gesture[actual] = (
+                    self._delivered_per_gesture.get(actual, 0) + 1
+                )
                 if actual in self._target_per_gesture:
                     self._completed_per_gesture[actual] = (
                         self._completed_per_gesture.get(actual, 0) + 1
                     )
-                    self._emit_balance_progress()
+                # Emit on EVERY delivery so the popup updates even when
+                # Unity over-delivered something we already had enough of.
+                self._emit_balance_progress()
 
             self.trial_completed.emit(cur.spec, cur.index)
             self._current = None
@@ -1117,33 +1140,47 @@ class TrainingGameCoordinator(QObject):
 
     def _pick_next_balanced(self) -> Optional[TrialSpec]:
         """
-        Choose the gesture that needs the most additional reps to hit
-        its target. Returns None when every target is met or the safety
-        cap on total trials is exhausted.
+        Choose the gesture that needs the most additional deliveries
+        to hit its target.
 
-        Tie-breaker: alphabetical, so consecutive ties produce a
-        deterministic round-robin rather than always preferring the
-        first dict-iteration order.
+        Why deliveries, not on-target completions
+        ──────────────────────────────────────────
+        The previous version of this method counted only trials where
+        Unity delivered what we cued. With an unpatched Unity that
+        ignores cues, the picker would keep cuing 'fist' (deficit 1)
+        while Unity kept delivering 'pinch' (already over-delivered),
+        producing the 2/5/2 imbalance the user saw. By switching to
+        delivery counts we:
+
+          1. Suppress further cues for over-delivered gestures (their
+             deficit is now zero or negative — they're filtered out).
+          2. Stop the run as soon as every gesture is *in the dataset*
+             at least N times — which is the user-visible guarantee.
+
+        With a patched Unity that obeys cues, deliveries == completions
+        and behaviour is unchanged.
         """
-        # 1. Done when every target is met.
+        # Deficit based on what Unity has actually put into the dataset.
         deficits = {
-            g: self._target_per_gesture[g] - self._completed_per_gesture.get(g, 0)
+            g: self._target_per_gesture[g] - self._delivered_per_gesture.get(g, 0)
             for g in self._target_per_gesture
         }
         remaining = {g: d for g, d in deficits.items() if d > 0}
         if not remaining:
+            # Every gesture has been delivered at least its target count.
             return None
 
-        # 2. Safety cap — Unity may stubbornly spawn one gesture forever.
+        # Safety cap — Unity may stubbornly spawn one gesture forever.
         if self._next_index >= self._max_total_trials:
             log.warning(
                 "Balanced mode safety cap reached at %d trials; "
-                "still missing: %s",
-                self._next_index, remaining,
+                "missing: %s. Delivered so far: %s",
+                self._next_index, remaining, self._delivered_per_gesture,
             )
             return None
 
-        # 3. Pick the most-needed gesture, alphabetical tie-break.
+        # Pick the gesture with the largest delivery deficit, with
+        # alphabetical tie-break for deterministic round-robin.
         max_deficit = max(remaining.values())
         candidates = sorted(
             g for g, d in remaining.items() if d == max_deficit
@@ -1165,16 +1202,18 @@ class TrainingGameCoordinator(QObject):
 
     def _emit_balance_progress(self) -> None:
         """
-        Emit the ``balance_progress`` signal with current per-gesture
-        completion counts. No-op outside balanced mode so the strict
-        path stays exactly as it was before. Listeners receive a
-        ``{gesture_name: (completed, target)}`` dict keyed by lowercase
-        gesture name.
+        Emit the ``balance_progress`` signal with per-gesture **delivery**
+        counts. No-op outside balanced mode.
+
+        The dict reports ``(delivered, target)``. Delivered = "what's
+        actually in your dataset right now", which is what the user
+        cares about. With patched Unity, delivered == completed_on_target,
+        so this remains correct for that case too.
         """
         if not self._balanced_mode:
             return
         payload = {
-            g: (self._completed_per_gesture.get(g, 0), self._target_per_gesture[g])
+            g: (self._delivered_per_gesture.get(g, 0), self._target_per_gesture[g])
             for g in self._target_per_gesture
         }
         try:

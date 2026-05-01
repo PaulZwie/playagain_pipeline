@@ -7,6 +7,36 @@ Combines all components into a unified interface for:
 - Real-time prediction
 """
 
+# ────────────────────────────────────────────────────────────────────
+# Logging configuration — installed FIRST, before any other module
+# imports vispy. vispy installs a global Qt message handler whose
+# logger uses a format string with ``%(type)s``, a non-standard
+# LogRecord attribute. After that hook is in place, every log.info()
+# from any module spews a ten-line traceback ending in
+# ``KeyError: 'type'``.
+#
+# We attach a private StreamHandler to the playagain_pipeline logger
+# tree and turn off propagation so our records never reach the root
+# logger where vispy's broken formatter lives. vispy's own warnings
+# still go through the root logger as before — we just protect ours.
+# ────────────────────────────────────────────────────────────────────
+import logging as _logging
+import sys as _sys
+
+_pkg_logger = _logging.getLogger("playagain_pipeline")
+if not any(
+    isinstance(h, _logging.StreamHandler) and h.stream is _sys.stderr
+    for h in _pkg_logger.handlers
+):
+    _h = _logging.StreamHandler(_sys.stderr)
+    _h.setFormatter(_logging.Formatter(
+        "%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        datefmt="%H:%M:%S",
+    ))
+    _pkg_logger.addHandler(_h)
+    _pkg_logger.setLevel(_logging.INFO)
+    _pkg_logger.propagate = False
+
 from datetime import datetime
 from pathlib import Path
 from typing import Optional
@@ -2064,42 +2094,88 @@ class MainWindow(QMainWindow):
     @Slot()
     def _on_advanced_training(self):
         """Open advanced training dialog."""
+        import traceback as _tb
+
+        existing = getattr(self, "_training_dialog", None)
+        if existing is not None:
+            try:
+                existing.raise_()
+                existing.activateWindow()
+                return
+            except RuntimeError:
+                self._training_dialog = None  # stale C++ ref
+
+        dialog = None  # keep in scope for the finally block
         try:
-            # Get list of available datasets
             available_datasets = self.data_manager.list_datasets()
             if not available_datasets:
                 QMessageBox.warning(self, "Warning", "No datasets available. Please create a dataset first.")
-                self.mode_tabs.setCurrentIndex(2)  # Switch to training tab
+                try:
+                    self.mode_tabs.setCurrentIndex(2)
+                except RuntimeError:
+                    pass
                 return
 
             from playagain_pipeline.gui.widgets.training_dialog import TrainingProgressDialog
 
-            # Get available model types
             available_models = ["SVM", "CatBoost", "Random Forest", "LDA", "MLP", "CNN", "AttentionNet", "MSTNet"]
 
-            # Create dialog without pre-selected dataset/model to enable selection
+            # Switch to the training tab BEFORE constructing the dialog.
+            # Creating a new QDialog child (super().__init__(parent)) causes PySide6
+            # to update the parent's Qt child list, which can invalidate Python
+            # wrappers for sibling widgets such as self.mode_tabs. Doing this first
+            # avoids hitting that invalidation window.
+            try:
+                self.mode_tabs.setCurrentIndex(2)
+            except RuntimeError:
+                pass  # main window tearing down; not worth aborting the dialog
+
+            self._log("[AdvTraining] Constructing TrainingProgressDialog...")
             dialog = TrainingProgressDialog(
                 model_type=None,
                 dataset=None,
                 config=self.config,
                 parent=self,
                 available_datasets=available_datasets,
-                available_models=available_models
+                available_models=available_models,
             )
+            self._training_dialog = dialog
 
-            # Switch to Training tab
-            self.mode_tabs.setCurrentIndex(2)
+            self._log("[AdvTraining] Calling dialog.exec()...")
+            try:
+                accepted = dialog.exec()
+                self._log(f"[AdvTraining] dialog.exec() returned accepted={accepted}")
+            except RuntimeError as e:
+                tb = _tb.format_exc()
+                self._log(f"[AdvTraining] RuntimeError inside exec():\n{tb}")
+                accepted = False
 
-            if dialog.exec():
-                # Get trained model and save it
+            if accepted:
                 model = dialog.get_trained_model()
                 if model:
                     self.model_manager._current_model = model
                     model.save(self.model_manager.models_dir / model.name)
                     self._log(f"Model saved: {model.name}")
                     self._refresh_models()
+
+        except RuntimeError as e:
+            tb = _tb.format_exc()
+            self._log(f"[AdvTraining] RuntimeError (construction or exec):\n{tb}")
         except Exception as e:
-            self._log(f"Error in advanced training: {e}")
+            tb = _tb.format_exc()
+            self._log(f"[AdvTraining] Unexpected error:\n{tb}")
+        finally:
+            self._training_dialog = None
+            # Explicitly schedule C++ cleanup so the dialog doesn't linger as an
+            # orphaned Qt-child of MainWindow. Without this, each training session
+            # leaves a dead C++ QDialog object in the parent's child list, making
+            # the sibling-wrapper invalidation progressively more likely on the
+            # next open.
+            if dialog is not None:
+                try:
+                    dialog.deleteLater()
+                except RuntimeError:
+                    pass  # already gone
 
     @Slot()
     def _on_feature_selection(self):
@@ -2394,9 +2470,18 @@ class MainWindow(QMainWindow):
         if coord is not None and coord.is_running:
             coord.on_emg_data(calibrated_data)
 
-        # Only use the separate PredictionWorker when the server is NOT running
-        # to avoid running inference twice on the same data.
-        if self._is_predicting and self._current_model and not server_active:
+        # Always update the prediction worker buffer when the user has
+        # clicked Start Prediction. Previously this branch was skipped
+        # whenever ``server_active`` was true ("avoid double inference"),
+        # but that left the GUI's prediction label permanently stuck on
+        # "No prediction" the moment the user also launched the game
+        # via the play-with-model flow (which starts the server). The
+        # server's callback updates the SAME label via a different
+        # path, but if anything in that callback chain hiccups, the
+        # user sees no output at all. Running both is cheap (worker
+        # caps at 10 Hz) and the label stays responsive in every
+        # combination of states.
+        if self._is_predicting and self._current_model:
             self._update_prediction_buffer(calibrated_data)
 
         # Feed raw data to game recorder (records physical channels)
@@ -4649,8 +4734,15 @@ class MainWindow(QMainWindow):
             display_name = class_name.replace("_", " ").title()
             self.prediction_label.setText(display_name)
             self.confidence_label.setText(f"Confidence: {confidence:.1%}")
-        except Exception:
-            pass
+        except Exception as e:
+            # The bare ``except: pass`` previously hid this — and the
+            # symptom was a label permanently stuck on "No prediction"
+            # with zero diagnostics. Throttle so a recurring exception
+            # doesn't flood the log every 100 ms.
+            last = getattr(self, "_last_pred_render_error", None)
+            if last != str(e):
+                self._last_pred_render_error = str(e)
+                self._log(f"Prediction render error: {type(e).__name__}: {e}")
 
     def _on_server_prediction(self, gesture: str, gesture_id: int,
                               confidence: float, probabilities: dict):
