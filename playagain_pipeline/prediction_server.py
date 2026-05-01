@@ -227,6 +227,11 @@ class PredictionServer:
         # "Fuchs Abenteuer" main menu.
         self._game_level_started_callbacks: List[Callable] = []
 
+        # Fired when Unity sends a session_config message (balanced mode,
+        # repetitions, gesture list). TrainingGameCoordinator subscribes to
+        # auto-configure itself from Unity's settings panel checkboxes.
+        self._session_config_callbacks: List[Callable] = []
+
         # Pause flag: when True, EMG data is accepted but predictions are not run
         self._paused = False
 
@@ -399,6 +404,36 @@ class PredictionServer:
         """Remove a previously registered game_level_started callback."""
         try:
             self._game_level_started_callbacks.remove(callback)
+        except ValueError:
+            pass
+
+    def add_session_config_callback(self, callback: Callable):
+        """
+        Register a callback for ``session_config`` messages from Unity.
+
+        Unity sends this message immediately after ``game_level_started``
+        so that the Python coordinator can mirror the settings-panel
+        configuration (balanced/sequential mode, repetitions, gestures)
+        without any manual Python-side setup.
+
+        Callback signature::
+
+            callback(
+                balanced:     bool,
+                sequential:   bool,
+                repetitions:  int,
+                gestures:     list[str] | None,
+                hold_seconds: float,
+                pause_seconds: float,
+            ) -> None
+        """
+        if callback not in self._session_config_callbacks:
+            self._session_config_callbacks.append(callback)
+
+    def remove_session_config_callback(self, callback: Callable):
+        """Remove a previously registered session_config callback."""
+        try:
+            self._session_config_callbacks.remove(callback)
         except ValueError:
             pass
 
@@ -824,6 +859,12 @@ class PredictionServer:
                             except Exception as e:
                                 print(f"[PredictionServer] game_level_started callback error: {e}")
 
+                    elif msg_type == "session_config":
+                        # Unity's settings panel sent balanced/sequential mode,
+                        # repetition count, and gesture list so the Python
+                        # coordinator can configure itself automatically.
+                        self._on_session_config_received(msg)
+
                 except socket.timeout:
                     # Non-fatal: keep waiting for game-state messages.
                     continue
@@ -852,6 +893,54 @@ class PredictionServer:
                 pass
 
             print(f"[PredictionServer] Client {addr} reader stopped")
+
+
+    def _on_session_config_received(self, data: dict) -> None:
+        """
+        Parse a ``session_config`` message received from Unity and fire all
+        registered callbacks.
+
+        Called from the client reader thread, so callbacks must be
+        thread-safe (TrainingGameCoordinator uses Qt signal marshalling
+        to move work to the GUI thread).
+
+        Expected fields
+        ---------------
+        balanced     : bool  – BalancedGestureMode checkbox state
+        sequential   : bool  – SequentialGestureMode checkbox state
+        repetitions  : int   – Repetitions slider value
+        gestures     : list  – Lowercase gesture names (may be null/absent)
+        hold_seconds : float – FeedingDuration setting
+        pause_seconds: float – PauseDuration setting
+        """
+        try:
+            balanced      = bool(data.get("balanced", False))
+            sequential    = bool(data.get("sequential", False))
+            repetitions   = int(data.get("repetitions", 1))
+            gestures_raw  = data.get("gestures")
+            gestures: Optional[List[str]] = (
+                [str(g).lower().strip() for g in gestures_raw if g]
+                if isinstance(gestures_raw, list) else None
+            )
+            hold_seconds  = float(data.get("hold_seconds", 3.0))
+            pause_seconds = float(data.get("pause_seconds", 5.0))
+
+            print(
+                f"[PredictionServer] session_config: balanced={balanced}, "
+                f"sequential={sequential}, reps={repetitions}, "
+                f"gestures={gestures}, hold={hold_seconds:.1f}s, "
+                f"pause={pause_seconds:.1f}s"
+            )
+
+            for cb in list(self._session_config_callbacks):
+                try:
+                    cb(balanced, sequential, repetitions, gestures,
+                       hold_seconds, pause_seconds)
+                except Exception as e:
+                    print(f"[PredictionServer] session_config callback error: {e}")
+
+        except Exception as e:
+            print(f"[PredictionServer] Failed to parse session_config: {e}")
 
 
 def run_standalone(model_name: str, host: str = "127.0.0.1", port: int = 5555,

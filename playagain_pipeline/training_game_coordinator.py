@@ -463,6 +463,7 @@ class TrainingGameCoordinator(QObject):
         # so the coordinator leaves no trace when inactive.
         self._game_state_cb = self.on_game_state_from_unity
         self._level_started_cb = self.on_game_level_started_from_unity
+        self._session_config_cb = self.on_session_config_from_unity
 
         # Guards against Unity never reporting level_started. Only
         # active during the waiting window.
@@ -682,6 +683,16 @@ class TrainingGameCoordinator(QObject):
             except Exception:
                 log.exception("Failed to register game_level_started callback")
 
+        # Register for session_config messages so Unity's settings-panel
+        # checkboxes (balanced mode, repetitions, gesture list) are
+        # automatically mirrored into this coordinator without any
+        # manual Python-side configuration.
+        if hasattr(self._server, "add_session_config_callback"):
+            try:
+                self._server.add_session_config_callback(self._session_config_cb)
+            except Exception:
+                log.exception("Failed to register session_config callback")
+
         if wait_for_unity:
             self._waiting_for_unity = True
             self._game_start_timeout.start(self._GAME_START_TIMEOUT_MS)
@@ -824,6 +835,141 @@ class TrainingGameCoordinator(QObject):
         log.info("Unity reported Level 1 loaded — marshaling to GUI thread.")
         self._level_started_main.emit()
 
+    def on_session_config_from_unity(
+        self,
+        balanced: bool,
+        sequential: bool,
+        repetitions: int,
+        gestures,           # list[str] | None
+        hold_seconds: float,
+        pause_seconds: float,
+    ) -> None:
+        """
+        Registered as a prediction_server ``session_config`` callback.
+
+        Called (from the network reader thread) when Unity sends a
+        ``session_config`` message immediately after ``game_level_started``.
+        Unity emits this message with the current settings-panel state —
+        balanced/sequential checkbox, Repetitions slider, and the gesture
+        names derived from the active LevelDefinition — so the coordinator
+        can configure itself automatically without any manual Python GUI work.
+
+        The coordinator must still be in the ``waiting_for_unity`` state
+        (i.e. ``start()`` was called but ``game_level_started`` has not
+        yet arrived).  If it has already transitioned to ``running``, we
+        log a warning and ignore the message so we don't corrupt an
+        in-flight session.
+
+        Threading
+        ---------
+        ``set_balanced_mode`` and ``set_schedule`` both raise when
+        ``_running`` is True. Because ``session_config`` is sent *before*
+        ``game_level_started``, the coordinator is in ``waiting_for_unity``
+        here and not yet running — the call is safe. The defensive guard
+        below handles any edge-case race.
+
+        Example
+        -------
+        Unity settings: BalancedGestureMode=True, Repetitions=3,
+        LevelDefinition with Horse→Fist, Cow→Tripod, Pig→Pinch.
+
+        Unity sends::
+
+            {
+                "type": "session_config",
+                "balanced": true, "sequential": false,
+                "repetitions": 3,
+                "gestures": ["fist", "tripod", "pinch"],
+                "hold_seconds": 3.0, "pause_seconds": 5.0
+            }
+
+        Result: ``set_balanced_mode(["fist","tripod","pinch"], reps_per_gesture=3)``
+        → 9 trials, exactly 3 of each gesture, shuffled rounds.
+        """
+        if self._running:
+            log.warning(
+                "[coord] session_config received while already running — "
+                "ignoring. Config must arrive before game_level_started."
+            )
+            return
+
+        # If Unity sends null/empty gestures, keep whatever the GUI
+        # configured; only override when a real list arrives.
+        clean: list = (
+            [g for g in gestures if g and g.lower() != "rest"]
+            if gestures else []
+        )
+        if not clean:
+            log.info(
+                "[coord] session_config: no gesture list — keeping current "
+                "schedule (balanced=%s, sequential=%s, reps=%d).",
+                balanced, sequential, repetitions,
+            )
+            return
+
+        if balanced:
+            # ── Balanced mode ─────────────────────────────────────────────
+            # Every gesture appears exactly `repetitions` times in shuffled
+            # rounds, so the dataset stays balanced even if the session ends
+            # early on a round boundary.
+            # E.g. gestures=["fist","tripod","pinch"], reps=3 → 9 trials.
+            log.info(
+                "[coord] session_config → set_balanced_mode: "
+                "gestures=%s, reps=%d, hold=%.1fs, pause=%.1fs",
+                clean, repetitions, hold_seconds, pause_seconds,
+            )
+            try:
+                self.set_balanced_mode(
+                    gestures=clean,
+                    reps_per_gesture=repetitions,
+                    hold_seconds=hold_seconds,
+                    rest_seconds=pause_seconds,
+                )
+            except RuntimeError as exc:
+                log.error("[coord] set_balanced_mode failed: %s", exc)
+
+        elif sequential:
+            # ── Sequential (block) mode ───────────────────────────────────
+            # All `repetitions` of gesture 1, then all of gesture 2, etc.
+            # Matches the block structure of SequentialGestureMode in Unity.
+            flat = [
+                TrialSpec(
+                    gesture_name=g,
+                    hold_seconds=hold_seconds,
+                    rest_seconds=pause_seconds,
+                )
+                for g in clean
+                for _ in range(repetitions)
+            ]
+            log.info(
+                "[coord] session_config → set_schedule (sequential): "
+                "%d trials, order=%s",
+                len(flat), [t.gesture_name for t in flat],
+            )
+            try:
+                self.set_schedule(flat)
+            except RuntimeError as exc:
+                log.error("[coord] set_schedule (sequential) failed: %s", exc)
+
+        else:
+            # ── No special mode — use balanced as default ─────────────────
+            # Unity knows which gestures are active even without a checkbox;
+            # use balanced mode so the dataset stays representative.
+            log.info(
+                "[coord] session_config → set_balanced_mode (default, "
+                "no Unity flag): gestures=%s, reps=%d",
+                clean, repetitions,
+            )
+            try:
+                self.set_balanced_mode(
+                    gestures=clean,
+                    reps_per_gesture=repetitions,
+                    hold_seconds=hold_seconds,
+                    rest_seconds=pause_seconds,
+                )
+            except RuntimeError as exc:
+                log.error("[coord] set_balanced_mode (default) failed: %s", exc)
+
     def stop(self) -> None:
         """End the schedule, whether partway through or at completion."""
         if not (self._running or self._waiting_for_unity):
@@ -863,6 +1009,12 @@ class TrainingGameCoordinator(QObject):
         if hasattr(self._server, "remove_game_level_started_callback"):
             try:
                 self._server.remove_game_level_started_callback(self._level_started_cb)
+            except Exception:
+                pass
+
+        if hasattr(self._server, "remove_session_config_callback"):
+            try:
+                self._server.remove_session_config_callback(self._session_config_cb)
             except Exception:
                 pass
 
