@@ -877,6 +877,9 @@ class TrainingProgressDialog(QDialog):
             self.setWindowTitle("Advanced Model Training")
         self.setMinimumSize(1000, 700)
 
+        if hasattr(self, "dataset_combo") and self.dataset_combo is not None:
+            self._on_dataset_selected(self.dataset_combo.currentText())
+
     def _setup_ui(self):
         layout = QVBoxLayout(self)
 
@@ -952,6 +955,19 @@ class TrainingProgressDialog(QDialog):
         # Hyperparameters tab
         self.hyperparam_widget = HyperparameterWidget(self.model_type, self.config)
         self.tabs.addTab(self.hyperparam_widget, "Hyperparameters")
+
+        # Gesture Selection Tab — lets the user pick which gesture
+        # classes are kept for training. Populated from the dataset's
+        # label_names whenever a dataset is selected/loaded.
+        self.gestures_widget = QWidget()
+        self._setup_gestures_tab()
+        self.tabs.addTab(self.gestures_widget, "Gestures")
+
+        # If a dataset was passed in pre-loaded, show its gestures right
+        # away so the user can review/change the selection before
+        # clicking Start Training.
+        if self.dataset:
+            self._update_gestures_tab()
 
         # Feature Selection Tab
         self.features_widget = QWidget()
@@ -1116,6 +1132,14 @@ class TrainingProgressDialog(QDialog):
             try:
                 self.dataset = self.parent().data_manager.load_dataset(dataset_name)
                 self._update_dataset_info()
+                # Refresh the Gestures tab so the new dataset's classes
+                # appear in the checkbox list. Wrapped in try/except so
+                # a malformed dataset doesn't block the rest of the
+                # selection-changed handling.
+                try:
+                    self._update_gestures_tab()
+                except Exception as ge:
+                    self._log(f"Could not populate gestures tab: {ge}")
             except Exception as e:
                 self._log(f"Error loading dataset: {e}")
 
@@ -1134,6 +1158,254 @@ class TrainingProgressDialog(QDialog):
             self.info_layout.addWidget(QLabel(f"Samples: {metadata.get('num_samples', 0)}"), 0, 1)
             self.info_layout.addWidget(QLabel(f"Classes: {metadata.get('num_classes', 0)}"), 1, 0)
             self.info_layout.addWidget(QLabel(f"Channels: {metadata.get('num_channels', 0)}"), 1, 1)
+
+    def _setup_gestures_tab(self):
+        """
+        Build the Gestures tab — a per-class checkbox list that lets the
+        user restrict training to a subset of the gesture classes in the
+        loaded dataset.
+
+        The tab starts empty; ``_update_gestures_tab()`` populates it
+        from ``self.dataset["metadata"]["label_names"]`` once a dataset
+        is known. Selecting a subset filters X/y in ``_on_start_training``
+        and remaps labels to be contiguous (0, 1, 2, …) before training,
+        so binary-from-multiclass runs work without confusing the model.
+        """
+        layout = QVBoxLayout(self.gestures_widget)
+
+        info = QLabel(
+            "Select which gesture classes to include in training.\n"
+            "Unchecked classes are dropped from the dataset; remaining "
+            "labels are remapped to a contiguous range (0…N-1).\n"
+            "Tip: keep 'Rest' checked — it's what the model needs to learn "
+            "the absence of a gesture."
+        )
+        info.setWordWrap(True)
+        info.setStyleSheet("color: #4b5563; font-size: 11px;")
+        layout.addWidget(info)
+
+        # The list itself — each row is a checkable item. We don't use
+        # MultiSelection because checkboxes are clearer than highlighted
+        # rows for "include in training".
+        list_group = QGroupBox("Gesture Classes")
+        list_layout = QVBoxLayout(list_group)
+
+        self.gesture_list = QListWidget()
+        self.gesture_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        list_layout.addWidget(self.gesture_list)
+
+        # Quick-action buttons — same pattern as the Features tab so
+        # the UI feels consistent.
+        btn_row = QHBoxLayout()
+
+        self.gesture_select_all_btn = QPushButton("Select All")
+        self.gesture_select_all_btn.clicked.connect(self._on_select_all_gestures)
+        btn_row.addWidget(self.gesture_select_all_btn)
+
+        self.gesture_select_none_btn = QPushButton("Select None")
+        self.gesture_select_none_btn.clicked.connect(self._on_select_no_gestures)
+        btn_row.addWidget(self.gesture_select_none_btn)
+
+        list_layout.addLayout(btn_row)
+        layout.addWidget(list_group)
+
+        # Live status — tells the user how the filter will affect the
+        # dataset before they hit Start Training.
+        self.gesture_status_label = QLabel("Select a dataset to populate.")
+        self.gesture_status_label.setStyleSheet(
+            "color: #0284c7; font-size: 11px; padding: 4px;"
+        )
+        layout.addWidget(self.gesture_status_label)
+
+        layout.addStretch()
+
+    def _update_gestures_tab(self):
+        """
+        Populate the gesture list from the currently loaded dataset.
+
+        Called whenever ``self.dataset`` changes (initial construction
+        or after the user picks a different dataset from the combo).
+        Preserves prior check states for class IDs that still exist;
+        new classes default to checked.
+
+        Source of truth is ``np.unique(y)`` — what labels the data
+        actually contains — NOT ``label_names``. Older datasets and
+        legacy/Quick-train outputs sometimes ship with a partial or
+        empty ``label_names`` dict, and an earlier version of this
+        method bailed out when the dict was empty, leaving the
+        Gestures tab blank ("gestures don't get detected"). Now we
+        always show one row per unique class found in ``y``, using
+        ``label_names`` only to look up nice display names; missing
+        names fall back to "Class N".
+        """
+        if not hasattr(self, "gesture_list") or self.gesture_list is None:
+            return
+        if not self.dataset:
+            return
+
+        metadata = self.dataset.get("metadata", {}) or {}
+        label_names_raw = metadata.get("label_names", {}) or {}
+
+        # JSON serialisation flips int keys to strings — coerce back so
+        # we can look up display names by the int ids in y.
+        name_lookup: dict[int, str] = {}
+        for k, v in label_names_raw.items():
+            try:
+                name_lookup[int(k)] = str(v)
+            except (TypeError, ValueError):
+                continue
+
+        # Remember which IDs were unchecked so the selection survives a
+        # dataset reload of the same dataset.
+        previously_unchecked: set[int] = set()
+        for i in range(self.gesture_list.count()):
+            item = self.gesture_list.item(i)
+            if item is None:
+                continue
+            if item.checkState() != Qt.CheckState.Checked:
+                lid = item.data(Qt.ItemDataRole.UserRole)
+                if lid is not None:
+                    previously_unchecked.add(int(lid))
+
+        self.gesture_list.clear()
+
+        # Source of truth: the actual labels present in y. This guarantees
+        # we surface every class the user could possibly train on, even if
+        # label_names is missing or out of sync with the data.
+        import numpy as _np
+        y = self.dataset.get("y")
+        if y is None:
+            self.gesture_status_label.setText(
+                "Dataset has no 'y' array — cannot enumerate classes."
+            )
+            return
+
+        try:
+            unique_ids, unique_counts = _np.unique(y, return_counts=True)
+        except Exception as exc:
+            self.gesture_status_label.setText(f"Could not read labels: {exc}")
+            return
+
+        if len(unique_ids) == 0:
+            self.gesture_status_label.setText("Dataset is empty (0 windows).")
+            return
+
+        counts = {int(i): int(c) for i, c in zip(unique_ids, unique_counts)}
+
+        # Surface a hint when label_names is missing/partial so the user
+        # knows why some rows say "Class N" instead of a friendly name.
+        unnamed_ids = [i for i in counts if i not in name_lookup]
+        if unnamed_ids and not name_lookup:
+            self._log(
+                "Note: dataset has no label_names metadata — using "
+                "generic 'Class N' names. Filtering and training still work."
+            )
+        elif unnamed_ids:
+            self._log(
+                f"Note: label_names is missing entries for ids "
+                f"{unnamed_ids} — using 'Class N' for those. "
+                "Filtering and training still work."
+            )
+
+        for lid in sorted(counts.keys()):
+            display = name_lookup.get(lid, f"Class {lid}")
+            n = counts[lid]
+            label_text = f"{display}  (id={lid}, {n:,} windows)"
+            item = QListWidgetItem(label_text)
+            item.setFlags(item.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            item.setData(Qt.ItemDataRole.UserRole, lid)
+            checked = lid not in previously_unchecked
+            item.setCheckState(
+                Qt.CheckState.Checked if checked else Qt.CheckState.Unchecked
+            )
+            self.gesture_list.addItem(item)
+
+        # Trigger an initial status update.
+        try:
+            self.gesture_list.itemChanged.disconnect(self._on_gesture_item_changed)
+        except (TypeError, RuntimeError):
+            pass
+        self.gesture_list.itemChanged.connect(self._on_gesture_item_changed)
+        self._on_gesture_item_changed(None)
+
+    def _on_select_all_gestures(self):
+        """Check every gesture in the list."""
+        for i in range(self.gesture_list.count()):
+            self.gesture_list.item(i).setCheckState(Qt.CheckState.Checked)
+
+    def _on_select_no_gestures(self):
+        """Uncheck every gesture in the list."""
+        for i in range(self.gesture_list.count()):
+            self.gesture_list.item(i).setCheckState(Qt.CheckState.Unchecked)
+
+    def _on_gesture_item_changed(self, _item):
+        """Refresh the status label when the user toggles a gesture."""
+        if not hasattr(self, "gesture_status_label"):
+            return
+        kept = self.get_selected_gesture_labels()
+        if kept is None:
+            self.gesture_status_label.setText(
+                "All classes will be kept (filtering disabled)."
+            )
+            return
+        if not kept:
+            self.gesture_status_label.setText(
+                "⚠ No gestures selected — training will fail. "
+                "Pick at least two classes."
+            )
+            self.gesture_status_label.setStyleSheet(
+                "color: #dc2626; font-size: 11px; padding: 4px;"
+            )
+            return
+        # Estimate the resulting sample count so the user sees the impact.
+        try:
+            import numpy as _np
+            y = self.dataset.get("y") if self.dataset else None
+            if y is not None:
+                mask = _np.isin(y, list(kept))
+                kept_n = int(mask.sum())
+                total_n = int(y.shape[0])
+                self.gesture_status_label.setText(
+                    f"Keeping {len(kept)} class(es) — "
+                    f"{kept_n:,}/{total_n:,} windows. "
+                    f"Labels will be remapped to 0…{len(kept) - 1}."
+                )
+            else:
+                self.gesture_status_label.setText(
+                    f"Keeping {len(kept)} class(es)."
+                )
+        except Exception:
+            self.gesture_status_label.setText(
+                f"Keeping {len(kept)} class(es)."
+            )
+        self.gesture_status_label.setStyleSheet(
+            "color: #0284c7; font-size: 11px; padding: 4px;"
+        )
+
+    def get_selected_gesture_labels(self) -> Optional[List[int]]:
+        """
+        Return the list of label IDs the user wants to keep, or ``None``
+        if filtering is disabled (no dataset loaded, no gesture list, or
+        the dataset has no label_names metadata).
+
+        Returning ``None`` lets ``_on_start_training`` skip the filter
+        path entirely and pass X/y through unchanged — matching the
+        previous behaviour for legacy datasets.
+        """
+        if not hasattr(self, "gesture_list") or self.gesture_list is None:
+            return None
+        if self.gesture_list.count() == 0:
+            return None
+        kept: List[int] = []
+        for i in range(self.gesture_list.count()):
+            item = self.gesture_list.item(i)
+            if item is None:
+                continue
+            if item.checkState() == Qt.CheckState.Checked:
+                lid = item.data(Qt.ItemDataRole.UserRole)
+                if lid is not None:
+                    kept.append(int(lid))
+        return kept
 
     def _setup_features_tab(self):
         """Setup the features selection tab."""
@@ -1273,6 +1545,90 @@ class TrainingProgressDialog(QDialog):
             # Split data
             X = self.dataset["X"]
             y = self.dataset["y"]
+
+            # ── Gesture filter ────────────────────────────────────────
+            # If the user unchecked any classes in the Gestures tab,
+            # drop their windows here BEFORE the train/val split — that
+            # way the split's stratification only sees classes the user
+            # actually wants to keep, and the validation set isn't
+            # silently inflated by samples we'll never train on.
+            #
+            # Labels are then remapped to a contiguous range starting at
+            # 0, which most classifiers expect (e.g. sklearn's LDA, the
+            # CrossEntropyLoss in MLP/CNN). The original-id → display-name
+            # map from the dataset is rewritten to a new-id → display-name
+            # map and pushed onto the model metadata in
+            # _on_training_finished, so prediction-time class lookups
+            # show the right gesture names.
+            kept_labels = self.get_selected_gesture_labels()
+            if kept_labels is not None and len(kept_labels) > 0:
+                import numpy as _np
+                all_labels = sorted(set(int(v) for v in _np.unique(y).tolist()))
+                kept_set = set(int(v) for v in kept_labels)
+                if kept_set and not kept_set.issuperset(all_labels):
+                    mask = _np.isin(y, list(kept_set))
+                    n_before = int(y.shape[0])
+                    X = X[mask]
+                    y = y[mask]
+                    n_after = int(y.shape[0])
+
+                    # Remap to contiguous 0…N-1. Sorting by old-id keeps
+                    # the order stable across runs (rest stays rest=0 if
+                    # it was 0 before, etc.).
+                    kept_sorted = sorted(kept_set)
+                    remap = {old: new for new, old in enumerate(kept_sorted)}
+                    y = _np.array([remap[int(v)] for v in y], dtype=y.dtype)
+
+                    # Rebuild label_names so the saved model knows what
+                    # the new ids mean. Stash it on the dataset metadata
+                    # so _on_training_finished picks it up unchanged.
+                    old_names = (self.dataset.get("metadata", {}) or {}).get(
+                        "label_names", {}
+                    ) or {}
+                    new_names = {}
+                    for old, new in remap.items():
+                        # JSON keys come back as strings; try both.
+                        nm = old_names.get(old) or old_names.get(str(old))
+                        if nm is None:
+                            nm = f"class_{old}"
+                        new_names[new] = nm
+                    # Don't mutate the on-disk dataset — copy first.
+                    md_copy = dict(self.dataset.get("metadata", {}) or {})
+                    md_copy["label_names"] = new_names
+                    md_copy["num_classes"] = len(kept_sorted)
+                    md_copy["filtered_from_label_ids"] = kept_sorted
+                    self.dataset = dict(self.dataset)
+                    self.dataset["metadata"] = md_copy
+
+                    self._log(
+                        f"Gesture filter applied: kept {len(kept_sorted)} "
+                        f"of {len(all_labels)} classes "
+                        f"({n_after:,}/{n_before:,} windows). "
+                        f"Labels remapped: "
+                        + ", ".join(
+                            f"{nm}→{nid}" for nid, nm in new_names.items()
+                        )
+                    )
+
+                    if len(kept_sorted) < 2:
+                        raise ValueError(
+                            "Need at least 2 gesture classes to train. "
+                            "Pick more gestures on the Gestures tab."
+                        )
+                    if n_after == 0:
+                        raise ValueError(
+                            "No windows left after gesture filter."
+                        )
+                else:
+                    self._log("Gesture filter: keeping all classes.")
+            elif kept_labels is not None and len(kept_labels) == 0:
+                # User actively unchecked everything — fail loudly
+                # rather than feeding train_test_split an empty array
+                # and getting an opaque sklearn error.
+                raise ValueError(
+                    "No gestures selected on the Gestures tab. "
+                    "Pick at least two classes to train on."
+                )
 
             # Seed from config if present, else preserve v1 default of 42.
             # Using getattr keeps PipelineConfig definitions backward compatible

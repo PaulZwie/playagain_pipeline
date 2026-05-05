@@ -105,21 +105,99 @@ class MainWindowV2(MainWindow):
 
     def _v2_rebuild_shell(self) -> None:
         """
-        Replace the central widget with the new Home + 3-tab layout.
+        Replace the v1 central widget with the new Home + 3-tab v2 layout.
 
-        The existing tabs created by ``_create_*_tab`` from MainWindow
-        are reused verbatim — no content is copied, just re-hosted.
+        ┌─────────────────────────────────────────────────────────────┐
+        │ LIFETIME ORDERING — read this before touching this method.  │
+        │                                                             │
+        │ super().__init__() → _setup_ui() builds a v1 central widget │
+        │ that owns (as Qt children):                                 │
+        │   • self.workflow_stepper                                   │
+        │   • self._plot_widget                                       │
+        │   • self.mode_tabs  (contains the 3 content tabs)          │
+        │                                                             │
+        │ setCentralWidget(new_widget) schedules the OLD central      │
+        │ widget for deletion.  Any Qt child that has NOT been        │
+        │ re-parented BEFORE that call will be destroyed, and any     │
+        │ Python attribute still pointing at it becomes a dangling    │
+        │ wrapper — touching it causes SIGBUS.                        │
+        │                                                             │
+        │ Therefore: RESCUE before REPLACE.                           │
+        │   1. Re-parent every widget we want to keep to a temporary  │
+        │      invisible widget (rescuer) so Qt drops their ownership │
+        │      from the old central widget.                           │
+        │   2. Call setCentralWidget — old widget + orphaned children │
+        │      are safely deleted; rescued widgets survive.           │
+        │   3. Adopt rescued widgets into the new layout.             │
+        │                                                             │
+        │ Also: NEVER call _create_recording_tab() / _create_         │
+        │ training_tab() / _create_prediction_tab() here — those      │
+        │ methods have side-effects (they reassign self._plot_widget, │
+        │ self.subject_id_edit, etc.) and create duplicate widgets    │
+        │ with broken signal connections.  Instead pull the already-  │
+        │ constructed tab widgets straight out of self.mode_tabs.     │
+        └─────────────────────────────────────────────────────────────┘
         """
         self.setWindowTitle("EMG Pipeline")
 
-        # ── Central ──────────────────────────────────────────────────
+        # ── Step 1: Rescue widgets we want to keep ───────────────────
+        # Re-parent to a temporary off-screen widget so setCentralWidget
+        # cannot delete them.  The rescuer stays alive (referenced by
+        # self) long enough for the subsequent addWidget calls.
+        rescuer = QWidget()          # temporary safe harbor
+        rescuer.hide()
+
+        stepper      = getattr(self, "workflow_stepper", None)
+        plot_widget  = getattr(self, "_plot_widget",     None)
+        mode_tabs_v1 = getattr(self, "mode_tabs",        None)
+
+        # Pull the three content tabs out of the v1 QTabWidget before
+        # it gets orphaned.  removeTab() detaches the widget from the
+        # tab-bar but keeps it alive; re-parent to rescuer for safety.
+        tab_record = tab_train = tab_use = None
+        if mode_tabs_v1 is not None:
+            # v1 tab order: 0=Record, 1=Train, 2=Predict, 3=Calibration, 4=Validation
+            # We grab by position; labels are tab-bar cosmetics only.
+            try:
+                tab_record = mode_tabs_v1.widget(0)
+                if tab_record:
+                    mode_tabs_v1.removeTab(0)
+                    tab_record.setParent(rescuer)
+            except Exception:
+                tab_record = None
+            try:
+                # After removing index-0, old index-1 is now index-0
+                tab_train = mode_tabs_v1.widget(0)
+                if tab_train:
+                    mode_tabs_v1.removeTab(0)
+                    tab_train.setParent(rescuer)
+            except Exception:
+                tab_train = None
+            try:
+                tab_use = mode_tabs_v1.widget(0)
+                if tab_use:
+                    mode_tabs_v1.removeTab(0)
+                    tab_use.setParent(rescuer)
+            except Exception:
+                tab_use = None
+
+        if stepper is not None:
+            stepper.setParent(rescuer)
+        if plot_widget is not None:
+            plot_widget.setParent(rescuer)
+
+        # ── Step 2: Replace the central widget ───────────────────────
+        # The old central widget (and everything left in it) is now
+        # safely destroyable.
         central = QWidget()
-        self.setCentralWidget(central)
+        self.setCentralWidget(central)          # old central widget dies here
         root = QVBoxLayout(central)
         root.setContentsMargins(0, 0, 0, 0)
         root.setSpacing(0)
 
-        # ── Status strip ─────────────────────────────────────────────
+        # ── Step 3: Adopt rescued widgets into the new layout ─────────
+
+        # Status strip
         self._v2_status = StatusStrip(app_name="EMG Pipeline", parent=central)
         self._v2_status.device_pill_clicked.connect(self._on_connect_device)
         self._v2_status.subject_pill_clicked.connect(self._on_edit_participant_info)
@@ -129,21 +207,15 @@ class MainWindowV2(MainWindow):
         self._v2_status.help_requested.connect(self._on_about)
         root.addWidget(self._v2_status)
 
-        # ── Workflow stepper (reuse existing widget) ─────────────────
-        # The parent class already created self.workflow_stepper; we
-        # just re-parent it under the new root.
-        if hasattr(self, "workflow_stepper") and self.workflow_stepper is not None:
-            self.workflow_stepper.setParent(central)
-            root.addWidget(self.workflow_stepper)
-            # Repoint the step_clicked handler — same effect as before
-            # but routes to the new tab indices.
+        # Workflow stepper
+        if stepper is not None:
+            stepper.setParent(central)
+            root.addWidget(stepper)
             try:
-                self.workflow_stepper.step_clicked.disconnect()
+                stepper.step_clicked.disconnect()
             except Exception:
                 pass
-            self.workflow_stepper.step_clicked.connect(
-                self._v2_on_workflow_step_clicked
-            )
+            stepper.step_clicked.connect(self._v2_on_workflow_step_clicked)
 
         # ── Main tab widget ──────────────────────────────────────────
         self._v2_tabs = QTabWidget()
@@ -158,53 +230,52 @@ class MainWindowV2(MainWindow):
         self._v2_home.quickstart_requested.connect(self._v2_show_quickstart)
         self._v2_tabs.addTab(self._v2_home, "  Home  ")
 
-        # Record / Train / Use — reuse factories from the parent class
-        # (inherited from MainWindow).
-        self._v2_tabs.addTab(self._create_recording_tab(),   "  Record new data  ")
-        self._v2_tabs.addTab(self._create_training_tab(),    "  Train a model  ")
-        self._v2_tabs.addTab(self._create_prediction_tab(),  "  Use a model live  ")
+        # Reuse the already-created tab widgets from the v1 mode_tabs.
+        # Fall back to creating fresh ones only if extraction failed
+        # (e.g. running against a future MainWindow that changed the
+        # tab layout — graceful degradation beats a hard crash).
+        def _adopt(widget, factory_fn, label):
+            """Re-parent widget into v2_tabs, or rebuild via factory."""
+            if widget is not None:
+                widget.setParent(self._v2_tabs)
+                self._v2_tabs.addTab(widget, label)
+            else:
+                try:
+                    self._v2_tabs.addTab(factory_fn(), label)
+                except Exception as exc:
+                    log.error("Could not build tab %r: %s", label, exc)
 
-        # Tooltips — short, verb-first
+        _adopt(tab_record, self._create_recording_tab, "  Record new data  ")
+        _adopt(tab_train,  self._create_training_tab,  "  Train a model  ")
+        _adopt(tab_use,    self._create_prediction_tab, "  Use a model live  ")
+
         self._v2_tabs.setTabToolTip(TAB_HOME,   "Landing page — recent activity and quick actions")
         self._v2_tabs.setTabToolTip(TAB_RECORD, "Connect a device and capture gesture sessions")
         self._v2_tabs.setTabToolTip(TAB_TRAIN,  "Build a dataset and train a classifier")
         self._v2_tabs.setTabToolTip(TAB_USE,    "Run a trained model live on the EMG stream")
 
-        # Host the tabs in a splitter so the live EMG plot — inherited
-        # from MainWindow's ``_create_recording_tab`` / ``_setup_ui`` —
-        # sits fixed on the right, exactly like the v1 shell. Without
-        # this, ``setCentralWidget(central)`` above would orphan the
-        # plot panel (parent v1 splitter is discarded) and it would
-        # never appear on screen.
-        plot_widget = getattr(self, "_plot_widget", None)
-
+        # ── Plot splitter ────────────────────────────────────────────
         if plot_widget is not None:
             v2_splitter = QSplitter(Qt.Orientation.Horizontal, parent=central)
-
-            # Tab stack on the left
             v2_splitter.addWidget(self._v2_tabs)
 
-            # Plot on the right — re-parent into a thin host widget so
-            # the splitter has a clean handle to grab.
-            plot_host = QWidget()
+            plot_host = QWidget(central)
             plot_host_layout = QVBoxLayout(plot_host)
             plot_host_layout.setContentsMargins(0, 0, 0, 0)
             plot_widget.setParent(plot_host)
             plot_host_layout.addWidget(plot_widget)
             v2_splitter.addWidget(plot_host)
 
-            # Give the tabs the larger share; the plot is a telemetry
-            # sidebar, not the main surface.
             v2_splitter.setStretchFactor(0, 3)
             v2_splitter.setStretchFactor(1, 2)
             v2_splitter.setSizes([900, 540])
-
             root.addWidget(v2_splitter, 1)
         else:
-            # Fallback if the parent MainWindow ever stops creating
-            # a plot widget (e.g. a headless/minimal variant). Keep
-            # the old flat layout so the shell still renders.
             root.addWidget(self._v2_tabs, 1)
+
+        # rescuer goes out of scope here — any remaining v1 widgets it
+        # was holding are cleaned up by Python/Qt GC.  The widgets we
+        # adopted above are now owned by the new layout tree.
 
         # ── Tools menu ───────────────────────────────────────────────
         # Attached to a toolbar button in the top-right of the tab bar.
@@ -361,77 +432,95 @@ class MainWindowV2(MainWindow):
 
     def _v2_open_calibration(self) -> None:
         """
-        Open the calibration workflow. If the parent MainWindow has a
-        dedicated handler (e.g. `_on_start_live_calibration`), use it;
-        otherwise fall back to popping up the existing CalibrationDialog.
+        Open CalibrationDialog directly.
+
+        The v1 inline calibration panel (_on_start_live_calibration,
+        live_cal_gestures_edit, etc.) is a child of self.mode_tabs which
+        no longer exists in the v2 shell — calling _on_start_live_calibration
+        would SIGBUS on the first .text() access to a deleted QLineEdit.
+        CalibrationDialog provides Live / From Session / Validate / Corpus
+        Audit in a standalone window and is the correct entry point here.
         """
-        if hasattr(self, "_on_start_live_calibration"):
-            try:
-                self._on_start_live_calibration()
-                return
-            except Exception as e:  # noqa: BLE001
-                log.warning("Inline calibration failed, trying dialog: %s", e)
-        # Dialog fallback — construct with whatever the parent exposes.
         try:
             from playagain_pipeline.gui.widgets.calibration_dialog import CalibrationDialog
+
+            calibrator = getattr(self, "calibrator", None) or getattr(self, "_calibrator", None)
+            if calibrator is None:
+                QMessageBox.warning(self, "Calibration unavailable",
+                                    "No calibrator attached to this window.")
+                return
+
+            # Always resolve device from device_manager at call time.
+            dm = getattr(self, "device_manager", None)
+            device = (getattr(dm, "device", None) if dm is not None
+                      else getattr(self, "_device", None))
+
+            data_manager = (getattr(self, "data_manager", None)
+                            or getattr(self, "_data_manager", None))
+
             dlg = CalibrationDialog(
-                calibrator=getattr(self, "_calibrator", None)
-                           or getattr(self, "calibrator", None),
-                device=getattr(self, "_device", None)
-                       or getattr(self, "device", None),
-                # Pass data_manager so the "From Session" tab is populated.
-                # Try both common attribute names.
-                data_manager=getattr(self, "data_manager", None)
-                             or getattr(self, "_data_manager", None),
+                calibrator=calibrator,
+                device=device,
+                data_manager=data_manager,
                 parent=self,
             )
-            if dlg.exec():
-                result = dlg.get_calibration_result()
-                if result is not None:
-                    # Apply to whichever calibrator attribute the parent uses.
-                    cal = (getattr(self, "_calibrator", None)
-                           or getattr(self, "calibrator", None))
-                    if cal is not None:
-                        cal._current_calibration = result
-                    # Refresh the calibration display if the method exists.
-                    if hasattr(self, "_update_calibration_display"):
-                        self._update_calibration_display()
-        except Exception as e:  # noqa: BLE001
-            QMessageBox.warning(
-                self, "Calibration unavailable",
-                f"Could not open the calibration dialog: {e}",
-            )
+            dlg.calibration_complete.connect(self._v2_on_calibration_complete)
+            dlg.exec()
+
+        except Exception as e:
+            log.exception("Could not open calibration dialog")
+            QMessageBox.warning(self, "Calibration unavailable",
+                                f"Could not open the calibration dialog:\n{e}")
+
+    @Slot(object)
+    def _v2_on_calibration_complete(self, result) -> None:
+        """Apply a CalibrationResult emitted by CalibrationDialog."""
+        if result is None:
+            return
+        cal = getattr(self, "calibrator", None) or getattr(self, "_calibrator", None)
+        if cal is not None:
+            cal._current_calibration = result
+        if hasattr(self, "_update_calibration_display"):
+            try:
+                self._update_calibration_display()
+            except Exception:
+                pass
 
     # ------------------------------------------------------------------
     # Status strip population
     # ------------------------------------------------------------------
 
+    @staticmethod
+    def _v2_widget_alive(w) -> bool:
+        """True if w is a non-None Qt widget whose C++ object still exists."""
+        if w is None:
+            return False
+        try:
+            w.isVisible()
+            return True
+        except RuntimeError:
+            return False
+
     def _v2_refresh_status_strip(self) -> None:
         """Pull current device/subject/model state into the strip."""
-        # Device
-        device = getattr(self, "_device", None)
+        # Device — always read from device_manager for freshness
+        dm = getattr(self, "device_manager", None)
+        device = getattr(dm, "device", None) if dm is not None else getattr(self, "_device", None)
         if device is not None and getattr(device, "is_connected", False):
-            self._v2_status.set_device_status(
-                "connected", getattr(device, "name", "Device"),
-            )
+            self._v2_status.set_device_status("connected", getattr(device, "name", "Device"))
         else:
             self._v2_status.set_device_status("disconnected")
 
-        # Subject — parent class typically tracks this on a combo or attr
+        # Subject — prefer scalar attr; only fall back to widgets if they're alive
         subject = getattr(self, "_current_subject", None)
         if not subject:
-            # Fallback: look for a widget named subject_combo / input
-            for attr_name in ("subject_combo", "subject_input", "_subject_id"):
+            for attr_name in ("subject_combo", "subject_input", "_subject_id",
+                              "subject_id_edit"):
                 w = getattr(self, attr_name, None)
-                if w is None:
+                if not self._v2_widget_alive(w):
                     continue
                 try:
-                    if hasattr(w, "currentText"):
-                        subject = w.currentText()
-                    elif hasattr(w, "text"):
-                        subject = w.text()
-                    else:
-                        subject = str(w)
+                    subject = w.currentText() if hasattr(w, "currentText") else w.text()
                 except Exception:
                     subject = None
                 if subject:

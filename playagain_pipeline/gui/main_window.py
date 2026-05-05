@@ -2579,6 +2579,43 @@ class MainWindow(QMainWindow):
             )
             return
 
+        # Guard: subject ID set?
+        # The training-game flow used to silently default to "VP_01"
+        # if the Subject ID field on the Record tab was blank, which
+        # caused the bug the user reported: a session was recorded but
+        # filed under the wrong (or unexpected) participant folder.
+        # We now confirm the ID with the user up front. If the field
+        # is empty, we suggest the next free VP_NN slot from the data
+        # manager, but the user has to accept it before we proceed —
+        # so it's impossible to start a training game and not know
+        # which subject the data is going to.
+        subject_id = self.subject_id_edit.text().strip()
+        if not subject_id:
+            suggested = self.data_manager.get_next_subject_id()
+            reply = QMessageBox.question(
+                self, "Subject ID missing",
+                f"No Subject ID is set on the Record tab.\n\n"
+                f"Use '{suggested}' for this training-game session?\n\n"
+                f"Click 'No' to type a custom ID first "
+                f"(e.g. VP_07).",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                QMessageBox.StandardButton.Yes,
+            )
+            if reply != QMessageBox.StandardButton.Yes:
+                # Bring the user to the field they need to fill in.
+                try:
+                    self.subject_id_edit.setFocus()
+                    self.subject_id_edit.selectAll()
+                except Exception:
+                    pass
+                self._log(
+                    "Training game cancelled — please enter a Subject ID "
+                    "(e.g. VP_07) on the Record tab and try again."
+                )
+                return
+            self.subject_id_edit.setText(suggested)
+            subject_id = suggested
+
         # ── 1. Prediction server ─────────────────────────────────────
         # Reuse the existing one if the user already has it running
         # (e.g. for live prediction); otherwise spin up a fresh one.
@@ -2818,6 +2855,31 @@ class MainWindow(QMainWindow):
                                 self.calibrator.save_as_reference(cal_result)
                     except Exception as e:
                         self._log(f"Rotation detection failed: {e}")
+
+                    except Exception as e:
+                        self._log(f"Rotation detection failed: {e}")
+
+                        # Quick fix: training-game protocol records gesture
+                        # intervals only — the ~8 s gap between animals is
+                        # unlabelled. Insert explicit `rest` trials in those
+                        # gaps so datasets/models see a rest class. The
+                        # function is idempotent and a no-op on sessions
+                        # that already have contiguous trials.
+                    try:
+                        from playagain_pipeline.utils.rest_gap_filler import (
+                            fill_rest_gaps,
+                        )
+                        n_rest = fill_rest_gaps(self._current_session)
+                        if n_rest:
+                            self._log(
+                                f"Inserted {n_rest} rest trial(s) "
+                                "into training-game session."
+                            )
+                    except Exception as gap_err:
+                        # Filling rest is a convenience — never let it
+                        # block saving the underlying recording.
+                        self._log(f"Rest-gap fill skipped: {gap_err}")
+
                     path = self.data_manager.save_session(self._current_session)
                     self._log(f"Training-game session saved to {path}")
                     self._stepper_mark(STEP_RECORD)
@@ -3197,7 +3259,19 @@ class MainWindow(QMainWindow):
                 "Device must be connected before preparing a training-game session."
             )
 
-        subject_id = (self.subject_id_edit.text() or "VP_01").strip()
+        # Subject ID — match the regular Record flow's behaviour:
+        # if the field is empty, ask data_manager for the next free
+        # VP_NN slot and write it back into the UI so the user can
+        # SEE which subject this session is being filed under.
+        # The old code silently fell back to "VP_01" here, which is
+        # exactly what the user reported losing data to ("a dataset
+        # was not recorded due to … no VP_… set"). The visible
+        # auto-fill plus the warning in _on_start_training_game make
+        # that failure mode impossible to repeat.
+        subject_id = self.subject_id_edit.text().strip()
+        if not subject_id:
+            subject_id = self.data_manager.get_next_subject_id()
+            self.subject_id_edit.setText(subject_id)
         reps = int(self.game_reps_spin.value())
         session_id = f"{datetime.now().strftime('%Y-%m-%d_%H-%M-%S')}_{reps}rep"
 

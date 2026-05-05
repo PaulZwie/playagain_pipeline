@@ -796,6 +796,16 @@ class TrainingGameCoordinator(QObject):
 
         self.state_changed.emit("running")
         self._spawn_pending = False
+        # Open a rest trial covering the gap between baseline calibration
+        # ending and Unity walking the first animal in. Without this the
+        # 5–10 s of true rest right after calibration is unlabelled and
+        # therefore dropped from the dataset — the model then sees a
+        # disproportionate amount of *inter-trial* rest (animal walking
+        # off → animal walking on) and very little *steady* rest. The
+        # next gesture's start_trial() (from camera_blocking=True) will
+        # auto-close this trial, exactly the same way it does for the
+        # rest trials we open between gestures via _start_rest_trial().
+        self._start_rest_trial()
         self._advance()
 
     @Slot()
@@ -1198,6 +1208,11 @@ class TrainingGameCoordinator(QObject):
                     self._session.end_trial(is_valid=True)
                 except Exception:
                     log.exception("end_trial failed for %s", cur.spec.gesture_name)
+                # Open a rest trial immediately so the inter-trial
+                # downtime is labelled instead of being dropped on the
+                # floor. The next gesture's start_trial() (or
+                # stop_recording() at run-end) will close it cleanly.
+                self._start_rest_trial()
 
             # Track per-gesture completion AND delivery.
             #
@@ -1233,6 +1248,50 @@ class TrainingGameCoordinator(QObject):
             # harder.
             self._arm_time_ms = (time.time() * 1000) + self._INTER_TRIAL_REST_MS
             QTimer.singleShot(self._INTER_TRIAL_REST_MS, self._advance)
+
+    # ------------------------------------------------------------------
+    # Internal — rest-trial helper
+    # ------------------------------------------------------------------
+
+    def _start_rest_trial(self) -> None:
+        """
+        Open a synthetic ``rest`` trial in the session right after a
+        gesture trial closes.
+
+        Why
+        ───
+        The training-game flow only marks the gesture intervals; the
+        downtime between gestures (animal walks off, next animal walks
+        in — typically ~8 s) was previously left unlabelled. Datasets
+        built from such sessions therefore never saw rest examples.
+
+        How it works
+        ────────────
+        * ``RecordingSession.start_trial`` auto-closes any open trial
+          before starting a new one. So this rest trial keeps growing
+          until either:
+            • the next gesture's ``start_trial(gesture_name)`` is called
+              when Unity reports ``camera_blocking=True`` (auto-close), or
+            • ``stop_recording()`` is called for the last trial in the
+              run (also auto-close).
+        * Failure-tolerant: silent no-op if there is no session, the
+          session isn't recording, or the gesture set has no ``rest``
+          entry. None of those should ever block a recording.
+        """
+        if self._session is None:
+            return
+        if not self._session.is_recording:
+            return
+        # Custom gesture sets may not include a rest gesture; bail out
+        # quietly rather than raising mid-recording.
+        if self._session.gesture_set.get_gesture("rest") is None:
+            log.debug("_start_rest_trial: no 'rest' gesture in set; skipping")
+            return
+        try:
+            self._session.start_trial("rest")
+        except Exception:
+            # Don't let a labelling hiccup interrupt a live recording.
+            log.exception("Failed to start rest trial after gesture end")
 
     # ------------------------------------------------------------------
     # Internal — trial advancement & broadcast
@@ -1480,6 +1539,10 @@ class TrainingGameCoordinator(QObject):
                 self._session.end_trial(is_valid=False, notes=reason)
             except Exception:
                 log.exception("Failed to end skipped trial")
+            # Even after a skip the participant is resting while the
+            # next animal walks in — label that period as rest, same
+            # as the normal-completion path.
+            self._start_rest_trial()
         self.trial_completed.emit(cur.spec, cur.index)
         self._current = None
         # Release the spawn lock so the next advance() can proceed.
