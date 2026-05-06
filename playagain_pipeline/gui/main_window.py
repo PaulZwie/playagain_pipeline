@@ -64,7 +64,7 @@ from playagain_pipeline.core.gesture import GestureSet, create_default_gesture_s
 from playagain_pipeline.core.session import RecordingSession
 from playagain_pipeline.devices.emg_device import (DeviceManager, DeviceType, SyntheticEMGDevice)
 from playagain_pipeline.gui.widgets.emg_plot_panel import EMGPlotPanel
-from playagain_pipeline.gui.widgets.validation_tab import ValidationTab
+from playagain_pipeline.gui.widgets.evaluation_tab import EvaluationTab
 from playagain_pipeline.gui.widgets.protocol_popup import ProtocolPopup
 from playagain_pipeline.models.classifier import ModelManager, BaseClassifier, apply_bad_channel_strategy
 from playagain_pipeline.protocols.protocol import (
@@ -447,7 +447,7 @@ class MainWindow(QMainWindow):
             "rotated bracelet, or to set a new reference orientation."
         )
 
-        self._validation_tab = ValidationTab(self.data_manager)
+        self._validation_tab = EvaluationTab(self.data_manager)
         self.mode_tabs.addTab(self._validation_tab, "Validation")
         self.mode_tabs.setTabToolTip(
             TAB_VALIDATION,

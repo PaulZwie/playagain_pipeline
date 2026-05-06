@@ -65,7 +65,8 @@ from playagain_pipeline.gui.widgets.quickstart_wizard  import QuickstartWizard
 from playagain_pipeline.gui.main_window import MainWindow
 
 # Existing validation tab — hosted in a modeless dialog under Tools
-from playagain_pipeline.gui.widgets.validation_tab import ValidationTab
+from playagain_pipeline.gui.widgets.evaluation_tab import EvaluationTab
+
 
 log = logging.getLogger(__name__)
 
@@ -312,7 +313,7 @@ class MainWindowV2(MainWindow):
         menu = QMenu(self)
 
         act_validate = QAction("Validate models…", self)
-        act_validate.triggered.connect(self._v2_open_validation)
+        act_validate.triggered.connect(self._v2_open_evaluation)
         menu.addAction(act_validate)
 
         act_calibrate = QAction("Calibrate bracelet…", self)
@@ -418,17 +419,15 @@ class MainWindowV2(MainWindow):
     # Tools handlers
     # ------------------------------------------------------------------
 
-    def _v2_open_validation(self) -> None:
-        """Show the ValidationTab in a modeless window."""
-        if not hasattr(self, "_v2_validation_window") or self._v2_validation_window is None:
-            self._v2_validation_window = QMainWindow(self)
-            self._v2_validation_window.setWindowTitle("Validate models")
-            self._v2_validation_window.resize(1100, 780)
-            tab = ValidationTab(self.data_manager)
-            self._v2_validation_window.setCentralWidget(tab)
-        self._v2_validation_window.show()
-        self._v2_validation_window.raise_()
-        self._v2_validation_window.activateWindow()
+    def _v2_open_evaluation(self) -> None:
+        if not hasattr(self, "_v2_evaluation_window") or self._v2_evaluation_window is None:
+            self._v2_evaluation_window = QMainWindow(self)
+            self._v2_evaluation_window.setWindowTitle("Evaluation")
+            self._v2_evaluation_window.resize(1280, 880)
+            self._v2_evaluation_window.setCentralWidget(EvaluationTab(self.data_manager))
+        self._v2_evaluation_window.show()
+        self._v2_evaluation_window.raise_()
+        self._v2_evaluation_window.activateWindow()
 
     def _v2_open_calibration(self) -> None:
         """
@@ -442,7 +441,7 @@ class MainWindowV2(MainWindow):
         Audit in a standalone window and is the correct entry point here.
         """
         try:
-            from playagain_pipeline.gui.widgets.calibration_dialog import CalibrationDialog
+            from gui.widgets.calibration_dialog import CalibrationDialog
 
             calibrator = getattr(self, "calibrator", None) or getattr(self, "_calibrator", None)
             if calibrator is None:
