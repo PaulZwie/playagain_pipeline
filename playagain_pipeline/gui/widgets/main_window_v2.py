@@ -61,10 +61,8 @@ from playagain_pipeline.gui.widgets.home_tab           import (
 )
 from playagain_pipeline.gui.widgets.quickstart_wizard  import QuickstartWizard
 
-# Existing main window — we inherit its tab factories + signal handlers
 from playagain_pipeline.gui.main_window import MainWindow
 
-# Existing validation tab — hosted in a modeless dialog under Tools
 from playagain_pipeline.gui.widgets.evaluation_tab import EvaluationTab
 
 
@@ -420,10 +418,16 @@ class MainWindowV2(MainWindow):
     # ------------------------------------------------------------------
 
     def _v2_open_evaluation(self) -> None:
+        # The merged EvaluationTab covers four modes — sessions, game
+        # recordings, Unity recordings and cross-validation — so the
+        # window title and default size reflect the broader scope. The
+        # widget itself is constructed exactly the same way as before;
+        # the constructor signature is unchanged, so the only thing
+        # that moves here is the chrome around it.
         if not hasattr(self, "_v2_evaluation_window") or self._v2_evaluation_window is None:
             self._v2_evaluation_window = QMainWindow(self)
-            self._v2_evaluation_window.setWindowTitle("Evaluation")
-            self._v2_evaluation_window.resize(1280, 880)
+            self._v2_evaluation_window.setWindowTitle("Evaluation & Cross-validation")
+            self._v2_evaluation_window.resize(1400, 900)
             self._v2_evaluation_window.setCentralWidget(EvaluationTab(self.data_manager))
         self._v2_evaluation_window.show()
         self._v2_evaluation_window.raise_()
@@ -441,7 +445,7 @@ class MainWindowV2(MainWindow):
         Audit in a standalone window and is the correct entry point here.
         """
         try:
-            from gui.widgets.calibration_dialog import CalibrationDialog
+            from playagain_pipeline.gui.widgets.calibration_dialog import CalibrationDialog
 
             calibrator = getattr(self, "calibrator", None) or getattr(self, "_calibrator", None)
             if calibrator is None:

@@ -2895,6 +2895,29 @@ class MainWindow(QMainWindow):
         self.game_status_label.setText("Stopped.")
         self._log("Training game stopped.")
 
+        # The training-game flow starts a PredictionServer to bridge Unity.
+        # Stop it now so its listen socket on port 5555 is released before
+        # the user tries to start a fresh server on the Predict tab.
+        # (If the user had already started the server manually on the Predict
+        # tab before launching the training game, _on_start_training_game
+        # reused that instance — stopping it here is still correct because
+        # _on_start_server will recreate it cleanly when needed.)
+        if self._prediction_server is not None and self._prediction_server.is_running:
+            try:
+                self._prediction_server.remove_prediction_callback(self._on_server_prediction)
+            except Exception:
+                pass
+            try:
+                self._prediction_server.remove_error_callback(self._on_server_prediction_error)
+            except Exception:
+                pass
+            self._prediction_server.stop()
+            self._prediction_server = None
+            # Sync the Predict-tab server buttons so they reflect reality.
+            self.start_server_btn.setEnabled(True)
+            self.stop_server_btn.setEnabled(False)
+            self.server_status_label.setText("Server: Not running")
+
     # ------------------------------------------------------------------
     # Play-with-model (Predict tab) handlers
     # ------------------------------------------------------------------
@@ -4077,13 +4100,11 @@ class MainWindow(QMainWindow):
         if reply == QMessageBox.StandardButton.Yes:
             for model_name in names:
                 try:
-                    # If this model is currently loaded, unload it
+                    # If this model is currently loaded, unload it fully
                     if (self._current_model is not None and
                             hasattr(self._current_model, 'name') and
                             self._current_model.name == model_name):
-                        self._current_model = None
-                        self.prediction_label.setText("No prediction")
-                        self.confidence_label.setText("Confidence: -")
+                        self._unload_current_model()
                         self._log("Unloaded current model before deletion.")
 
                     if self.model_manager.delete_model(model_name):
@@ -4501,11 +4522,77 @@ class MainWindow(QMainWindow):
 
     # Prediction handlers
     @Slot()
+    def _unload_current_model(self) -> None:
+        """
+        Fully tear down everything that references ``_current_model``
+        before a new one is loaded (or when the user explicitly unloads).
+
+        Covers:
+          • standalone PredictionWorker   — stop the thread, drop the ref
+          • PredictionServer              — push the new model in if the
+                                           server is already live; don't
+                                           tear the server down so Unity
+                                           doesn't lose its TCP connection
+          • prediction display labels     — reset to neutral
+          • prediction buffer             — clear so stale data isn't fed
+                                           to the new model's smoke-test
+          • status-strip model pill       — reflect "nothing loaded"
+          • play-with-model launch btn    — disable until new model ready
+        """
+        if self._current_model is None:
+            return  # nothing to do
+
+        old_name = getattr(self._current_model, "name", "model")
+        self._log(f"Unloading model: {old_name}")
+
+        # 1. Stop the standalone prediction worker if it is running.
+        if self._prediction_worker is not None:
+            try:
+                self._prediction_worker.prediction_ready.disconnect(
+                    self._on_prediction_ready
+                )
+            except Exception:
+                pass
+            self._prediction_worker.stop()
+            self._prediction_worker = None
+            self._is_predicting = False
+            self.start_pred_btn.setEnabled(True)
+            self.stop_pred_btn.setEnabled(False)
+            self._log("Standalone prediction stopped (model being replaced).")
+
+        # 2. The TCP server keeps its socket open so Unity stays connected,
+        #    but we clear its model reference so it stops emitting predictions
+        #    for the old model.  _on_load_model will push the new model in
+        #    via set_model() once it is loaded.
+        if (self._prediction_server is not None
+                and self._prediction_server.is_running):
+            self._prediction_server.set_model(None)  # type: ignore[arg-type]
+            self._prediction_server._smoother.reset()
+
+        # 3. Wipe the prediction buffer — it was sized for the old model.
+        self._prediction_buffer = None
+
+        # 4. Reset UI to "no model" state.
+        if hasattr(self, "prediction_label"):
+            self.prediction_label.setText("No prediction")
+        if hasattr(self, "confidence_label"):
+            self.confidence_label.setText("Confidence: —")
+        if hasattr(self, "start_play_game_btn"):
+            self.start_play_game_btn.setEnabled(False)
+        if hasattr(self, "status_strip"):
+            self.status_strip.set_active_model(None)
+
+        # 5. Drop the reference — Python will GC the model object.
+        self._current_model = None
+
     def _on_load_model(self):
         """Load selected model for prediction."""
         model_name = self.pred_model_combo.currentText()
         if not model_name:
             return
+
+        # Cleanly tear down whatever was loaded before.
+        self._unload_current_model()
 
         try:
             self._current_model = self.model_manager.load_model(model_name)
@@ -4557,6 +4644,20 @@ class MainWindow(QMainWindow):
             # one-click flow on this tab.
             if hasattr(self, "start_play_game_btn"):
                 self.start_play_game_btn.setEnabled(True)
+
+            # If the TCP server is already running (e.g. Unity is connected
+            # from a previous session), swap the model in without tearing
+            # the server down — Unity keeps its TCP connection.
+            if (self._prediction_server is not None
+                    and self._prediction_server.is_running):
+                self._prediction_server.set_model(self._current_model)
+                self._log(
+                    f"  Live server updated with new model: {model_name}"
+                )
+
+            # Update the status-strip model pill.
+            if hasattr(self, "status_strip"):
+                self.status_strip.set_active_model(model_name, ready=True)
 
         except Exception as e:
             self._log(f"Error loading model: {e}")
@@ -4688,6 +4789,22 @@ class MainWindow(QMainWindow):
 
         host = self.server_host_edit.text().strip()
         port = self.server_port_spin.value()
+
+        # Stop and release any existing server instance before creating a new
+        # one.  Without this, the old server keeps its listen socket open and
+        # the new bind() fails with EADDRINUSE / [Errno 48].
+        if self._prediction_server is not None:
+            try:
+                self._prediction_server.remove_prediction_callback(self._on_server_prediction)
+            except Exception:
+                pass
+            try:
+                self._prediction_server.remove_error_callback(self._on_server_prediction_error)
+            except Exception:
+                pass
+            if self._prediction_server.is_running:
+                self._prediction_server.stop()
+            self._prediction_server = None
 
         self._prediction_server = PredictionServer(host=host, port=port)
         self._prediction_server.set_model(self._current_model)

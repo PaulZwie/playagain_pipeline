@@ -1,25 +1,49 @@
 """
-gui/widgets/evaluation_tab.py  (v2)
-───────────────────────────────────
-Unified evaluation tab. Replaces both Performance Review and Validation.
+gui/widgets/evaluation_tab.py  (v3 — merged)
+═══════════════════════════════════════════
+The unified evaluation tab.
 
-What changed in v2
-──────────────────
-* Subject-grouped **tree picker** with expandable VP_xx headers, tristate
-  parent checkboxes, and live "selected" counts. Replaces the v1 flat
-  93-row scroll list.
-* Settings panels now use **separate group-boxes per concern** (Model /
-  Windowing / Preprocessing / Feature ranking) so nothing feels cramped.
-  Real spacing between rows; real margins between groups.
-* **Plot & data export** from any result: confusion matrix PNG, per-class
-  F1 box plot across recordings, raw CSV/JSON dumps. One "Save…" button
-  picks a directory and writes everything atomically.
-* Game-recording discovery now walks ``<root>/<subject>/<dir>/recording.csv``
-  (the actual GameRecorder layout) — v1 only walked one level so the
-  Games tab came up empty.
-* Confusion-matrix labels are de-duplicated with a `(id N)` suffix so a
-  bad gesture_set with two ``Tripod`` entries no longer renders as
-  "Tripod, Tripod" with one column silently dropped.
+This file folds the previous ``CrossValidationTab`` (cross_validation_tab.py)
+into ``EvaluationTab`` and exposes a single class. Instead of two top-level
+sibling tabs, the user picks an *evaluation type* from a dropdown at the
+top, and the relevant settings groups, picker, and results panel
+appear/hide.
+
+The evaluation types are:
+
+  • Sessions          — run a saved model over training-session recordings
+  • Game recordings   — evaluate logged game predictions or replay a model
+  • Unity recordings  — RMS-threshold binary evaluation
+  • Cross-validation  — multi-run sweep (over models, features or named
+                        data subsets), driven by the existing
+                        ``playagain_pipeline.validation`` runner
+
+What changed in v3 (vs the previous evaluation_tab.py + cross_validation_tab.py)
+─────────────────────────────────────────────────────────────────────────────
+* Two files merged into one. Single class, ``EvaluationTab``. The CV
+  tab's ``CrossValidationTab`` symbol is kept as a back-compat alias
+  pointing at the same class.
+* No more inner mode-tab strip — the type dropdown drives a
+  :class:`QStackedWidget` for the picker, a :class:`QStackedWidget` for
+  the settings, and a :class:`QStackedWidget` for the results.
+* Run button label, primary action, and which signal is emitted change
+  with the type. The constructor signature is unchanged so wiring in
+  ``main_window_v2.py`` only needs to import this class — drop-in.
+* All shared primitives (palette, ``_styled_group``, ``_ghost_button``,
+  ``_primary_button``, ``_Pill``, ``_form``) live exactly once at the
+  top of the file. Each tab used to ship its own copy.
+* The cross-validation worker, planner, axis editors, and comparison
+  table are unchanged behaviourally — they just live in this file now.
+
+Wiring
+──────
+``main_window_v2.py`` imports the same name as before::
+
+    from playagain_pipeline.gui.widgets.evaluation_tab import EvaluationTab
+
+The constructor takes a ``DataManager`` (or anything with a ``data_dir``
+attribute, or a Path / string pointing at the data directory). The
+default mode on open is *Sessions*, matching the old behaviour.
 """
 
 from __future__ import annotations
@@ -27,21 +51,25 @@ from __future__ import annotations
 import csv
 import json
 import logging
-import os
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
-from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QBrush, QColor, QFont, QIcon
+
+from PySide6.QtCore import (
+    Qt, Signal, Slot, QObject, QThread,
+)
+from PySide6.QtGui import QBrush, QColor, QFont
 from PySide6.QtWidgets import (
-    QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog,
-    QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView,
-    QLabel, QLineEdit, QMenu, QMessageBox, QPushButton, QScrollArea,
+    QCheckBox, QComboBox, QDialog, QDialogButtonBox, QDoubleSpinBox,
+    QFileDialog, QFormLayout, QFrame, QGroupBox, QHBoxLayout, QHeaderView,
+    QLabel, QLineEdit, QListWidget, QListWidgetItem,
+    QMenu, QMessageBox, QProgressBar, QPushButton, QScrollArea,
     QSizePolicy, QSpinBox, QSplitter, QStackedWidget, QTabWidget,
-    QTableWidget, QTableWidgetItem, QTextEdit, QToolButton, QTreeWidget,
-    QTreeWidgetItem, QVBoxLayout, QWidget,
+    QTableWidget, QTableWidgetItem, QTextEdit, QToolButton,
+    QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
 try:
@@ -55,6 +83,7 @@ except Exception:                                            # pragma: no cover
 # lazily inside _ResultsView._on_export so the GUI starts fast even on
 # systems without it.
 
+# ── Evaluation backend (Qt-free) — drives modes 1 to 3 ────────────────────
 from playagain_pipeline.evaluation import (
     EvaluationResult, RecordingDescriptor, RecordingKind,
     SessionEvalSettings, GameEvalSettings, UnityEvalSettings,
@@ -63,13 +92,27 @@ from playagain_pipeline.evaluation import (
     evaluate_features_lda,
     TRUTH_RAW, TRUTH_REQUESTED, TRUTH_ACTIVE,
 )
+
+# ── Validation runner (CLI-shared) — drives the CV mode ───────────────────
+from playagain_pipeline.validation import (
+    SessionCorpus, ExperimentConfig, ValidationRunner, RunResult,
+)
+from playagain_pipeline.validation.runner import FoldResult
+from playagain_pipeline.validation.config import (
+    DataSelection, WindowingConfig, FeatureConfig, ModelConfig, CVConfig,
+)
+
+# ── App style + busy overlay ──────────────────────────────────────────────
 from playagain_pipeline.gui.gui_style import apply_app_style
 from playagain_pipeline.gui.widgets.busy_overlay import run_blocking
 
 log = logging.getLogger(__name__)
 
 
-# ── Bright palette (kept in sync with gui_style.py "bright") ───────────────
+# ═══════════════════════════════════════════════════════════════════════════
+# Bright palette  (kept in sync with gui_style.py "bright")
+# ═══════════════════════════════════════════════════════════════════════════
+
 C_BG       = "#f6f8fc"
 C_PANEL    = "#ffffff"
 C_CARD     = "#eef2ff"
@@ -86,7 +129,90 @@ C_BAD      = "#dc2626"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Small primitives
+# Evaluation-type identifiers
+# ═══════════════════════════════════════════════════════════════════════════
+# A small, hand-rolled enum-ish set of strings is plenty here — the set is
+# closed, consumed only by this file, and using strings keeps the QComboBox
+# itemData() round-trip frictionless.
+
+EVAL_TYPE_SESSIONS = "sessions"
+EVAL_TYPE_GAMES    = "games"
+EVAL_TYPE_UNITY    = "unity"
+EVAL_TYPE_CV       = "cross_validation"
+
+_EVAL_TYPE_LABELS: List[Tuple[str, str]] = [
+    (EVAL_TYPE_SESSIONS, "Sessions  (run a saved model over training recordings)"),
+    (EVAL_TYPE_GAMES,    "Game recordings  (logged predictions or replay)"),
+    (EVAL_TYPE_UNITY,    "Unity recordings  (RMS threshold)"),
+    (EVAL_TYPE_CV,       "Cross-validation  (multi-run sweep)"),
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CV-mode catalog  (models / features / strategies)
+# ═══════════════════════════════════════════════════════════════════════════
+# These lists are the SOURCE OF TRUTH for what shows up in the CV combo
+# boxes. They are intentionally separate from any defaults the runner
+# itself ships with: those defaults are a runner concern, not a UI one,
+# and the UI's job is to be honest about *exactly* what the user picked.
+
+_AVAILABLE_FEATURES: List[Tuple[str, str]] = [
+    ("mav",  "Mean Absolute Value"),
+    ("rms",  "Root Mean Square"),
+    ("wl",   "Waveform Length"),
+    ("zc",   "Zero Crossings"),
+    ("ssc",  "Slope Sign Changes"),
+    ("var",  "Variance"),
+    ("iemg", "Integrated EMG"),
+]
+
+_AVAILABLE_MODELS: List[Tuple[str, str]] = [
+    ("lda",           "Very fast linear discriminant — strong EMG baseline"),
+    ("random_forest", "Robust, handles noise well, no scaling needed"),
+    ("catboost",      "Gradient boosting — often best on tabular features"),
+    ("svm",           "Linear / RBF support vector machine"),
+    ("mlp",           "Small neural net — needs ≳10 k windows"),
+    ("attention_net", "Transformer attention — strongest temporal model"),
+]
+
+_CV_STRATEGIES: List[Tuple[str, str, str]] = [
+    # (key, short label, longer tooltip)
+    ("loso_subject",    "Leave-One-Subject-Out",
+        "Train on every subject but one, test on the held-out subject. "
+        "Repeats once per subject. The honest single number for a paper."),
+    ("loso_session",    "Leave-One-Session-Out",
+        "Train on every session but one, test on the held-out session. "
+        "Useful for measuring session-to-session drift within the same person."),
+    ("k_fold_subjects", "k-Fold over subjects",
+        "Shuffle subjects, split into k roughly-equal groups, train on k-1 "
+        "and test on the remaining one. Useful when LOSO has too many "
+        "subjects to run quickly."),
+    ("within_session",  "Within-Session",
+        "Train on the first 80% of each session's windows, test on the last "
+        "20%. Optimistic — windows from the same session share hardware "
+        "placement and user state — but useful as a ceiling."),
+    ("cross_domain",    "Cross-Domain",
+        "Train only on one domain (pipeline / unity / game) and test on "
+        "another. Measures transfer between recorder types."),
+    ("holdout_split",   "Holdout (train / val / test)",
+        "One fold with explicit Train / Val / Test ratios. Best for tuning "
+        "a single model with early stopping; the test split stays untouched "
+        "until the final number."),
+]
+
+_DEFAULT_FEATURE_SET: List[str] = ["mav", "rms", "wl"]
+_DEFAULT_MODEL: str             = "random_forest"
+_DEFAULT_FEATURE_PRESETS: List[Tuple[str, List[str]]] = [
+    ("Time-domain trio  (mav, rms, wl)",       ["mav", "rms", "wl"]),
+    ("Hudgins five  (mav, wl, zc, ssc, var)",  ["mav", "wl", "zc", "ssc", "var"]),
+    ("Full battery  (all 7)",
+        ["mav", "rms", "wl", "zc", "ssc", "var", "iemg"]),
+    ("Energy only  (rms, iemg, var)",          ["rms", "iemg", "var"]),
+]
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Shared UI primitives (single copy; reused across all four modes)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _styled_group(title: str) -> QGroupBox:
@@ -110,7 +236,7 @@ def _styled_group(title: str) -> QGroupBox:
 def _ghost_button(text: str, *, accent: bool = False) -> QToolButton:
     """A small flat button matching the bright-theme pillbar look."""
     b = QToolButton(); b.setText(text)
-    color, border = ((C_ACCENT, C_ACCENT)  if accent else (C_TEXT, C_BORDER))
+    color, border = ((C_ACCENT, C_ACCENT) if accent else (C_TEXT, C_BORDER))
     b.setStyleSheet(
         f"QToolButton {{ background:{C_PANEL}; color:{color};"
         f"  border:1px solid {border}; border-radius:6px; padding:5px 11px;"
@@ -133,6 +259,28 @@ def _primary_button(text: str) -> QPushButton:
     )
     b.setMinimumHeight(40)
     return b
+
+
+def _form() -> QFormLayout:
+    """A consistent form layout used inside every settings group-box."""
+    f = QFormLayout()
+    f.setHorizontalSpacing(12); f.setVerticalSpacing(8)
+    f.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+    f.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+    return f
+
+
+class _Pill(QLabel):
+    """Compact status chip used in headers."""
+
+    def __init__(self, text: str = "", parent: Optional[QWidget] = None):
+        super().__init__(text, parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.setStyleSheet(
+            f"QLabel {{ background:{C_CARD}; color:{C_ACCENT2};"
+            f"  border:1px solid {C_BORDER}; border-radius:9px;"
+            f"  padding:2px 9px; font-size:10px; font-weight:600; }}"
+        )
 
 
 class _MetricCard(QFrame):
@@ -176,21 +324,68 @@ class _MetricCard(QFrame):
         self._caption.setText(caption)
 
 
-class _Pill(QLabel):
-    """Compact status chip used in headers."""
+def _model_dirs(data_dir: Path) -> List[str]:
+    """Return saved model names from <data_dir>/models, newest first."""
+    md = Path(data_dir) / "models"
+    if not md.exists():
+        return []
+    children = [c for c in md.iterdir() if c.is_dir() and not c.name.startswith("_")]
+    children.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    return [c.name for c in children]
 
-    def __init__(self, text: str = "", parent: Optional[QWidget] = None):
-        super().__init__(text, parent)
-        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.setStyleSheet(
-            f"QLabel {{ background:{C_CARD}; color:{C_ACCENT2};"
-            f"  border:1px solid {C_BORDER}; border-radius:9px;"
-            f"  padding:2px 9px; font-size:10px; font-weight:600; }}"
-        )
+
+def _settings_scroll_host(group_widgets: List[QWidget],
+                           run_row_widget: QWidget) -> QWidget:
+    """
+    Build a settings column: a scroll area holding a stack of
+    group-boxes, plus a button row pinned to the bottom outside the
+    scroll area so it stays visible even when the settings overflow.
+    """
+    column = QWidget()
+    col_lay = QVBoxLayout(column)
+    col_lay.setContentsMargins(0, 0, 0, 0)
+    col_lay.setSpacing(10)
+
+    scroll = QScrollArea()
+    scroll.setFrameShape(QFrame.Shape.NoFrame)
+    scroll.setWidgetResizable(True)
+    inner = QWidget()
+    inner_lay = QVBoxLayout(inner)
+    inner_lay.setContentsMargins(2, 2, 2, 2)
+    inner_lay.setSpacing(12)
+    for g in group_widgets:
+        inner_lay.addWidget(g)
+    inner_lay.addStretch(1)
+    scroll.setWidget(inner)
+    col_lay.addWidget(scroll, 1)
+
+    col_lay.addWidget(run_row_widget)
+    return column
+
+
+def _score_colour(score: float) -> str:
+    """Map a 0-1 score to a green/amber/red foreground colour."""
+    if score >= 0.8:  return C_GOOD
+    if score >= 0.6:  return C_WARN
+    return C_BAD
+
+
+def _fmt_dur(seconds: float) -> str:
+    """1.2 s · 4.7 m · 1 h 02 m — the same format the legacy validation tab used."""
+    if seconds is None or seconds != seconds:  # NaN check
+        return "—"
+    if seconds < 60:
+        return f"{seconds:.1f} s"
+    minutes = seconds / 60.0
+    if minutes < 60:
+        return f"{minutes:.1f} m"
+    hours = int(minutes // 60)
+    mins  = int(minutes % 60)
+    return f"{hours} h {mins:02d} m"
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Subject-grouped tree picker
+# Subject-grouped tree picker  (used by the three evaluation modes)
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Marker stored in the tree-item user-role data so we can tell
@@ -379,7 +574,7 @@ class _TreePicker(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Concrete pickers (one per mode)
+# Concrete pickers (one per evaluation mode)
 # ═══════════════════════════════════════════════════════════════════════════
 
 # Subdirectories of data/sessions/ that aren't real subjects but contain
@@ -471,7 +666,7 @@ class _UnityPicker(_TreePicker):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Result detail widgets
+# Per-result detail widgets  (used by the eval-result panel)
 # ═══════════════════════════════════════════════════════════════════════════
 
 class _ConfusionView(QWidget):
@@ -709,10 +904,10 @@ class _BoxPlotView(QWidget):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Shared results panel
+# Per-result results view  (used for evaluation modes 1-3)
 # ═══════════════════════════════════════════════════════════════════════════
 
-class _ResultsView(QWidget):
+class _EvaluationResultView(QWidget):
     """Renders any :class:`EvaluationResult` regardless of source kind."""
 
     def __init__(self, parent: Optional[QWidget] = None):
@@ -744,16 +939,28 @@ class _ResultsView(QWidget):
         self._btn_export = _ghost_button("⤓  Export…", accent=True)
         self._btn_export.setEnabled(False)
         self._export_menu = QMenu(self._btn_export)
-        a_pkg  = self._export_menu.addAction("Save full bundle (folder)…")
-        a_cm   = self._export_menu.addAction("Confusion matrix PNG…")
-        a_box  = self._export_menu.addAction("Per-class F1 box plot PNG…")
-        a_csv  = self._export_menu.addAction("Per-class metrics CSV…")
-        a_json = self._export_menu.addAction("Result JSON…")
-        a_pkg .triggered.connect(self._on_export_bundle)
-        a_cm  .triggered.connect(lambda: self._on_export_one("confusion_png"))
-        a_box .triggered.connect(lambda: self._on_export_one("boxplot_png"))
-        a_csv .triggered.connect(lambda: self._on_export_one("metrics_csv"))
-        a_json.triggered.connect(lambda: self._on_export_one("result_json"))
+        a_pkg   = self._export_menu.addAction("Save full bundle (folder)…")
+        self._export_menu.addSeparator()
+        a_cm    = self._export_menu.addAction("Confusion matrix PNG…")
+        a_box   = self._export_menu.addAction("Per-class F1 box plot PNG…")
+        a_sweep = self._export_menu.addAction("Threshold sweep PNG…")
+        a_feat  = self._export_menu.addAction("Per-feature accuracy PNG…")
+        a_roc   = self._export_menu.addAction("ROC curve PNG…")
+        a_calib = self._export_menu.addAction("Calibration plot PNG…")
+        a_scatter = self._export_menu.addAction("Per-recording scatter PNG…")
+        self._export_menu.addSeparator()
+        a_csv   = self._export_menu.addAction("Per-class metrics CSV…")
+        a_json  = self._export_menu.addAction("Result JSON…")
+        a_pkg   .triggered.connect(self._on_export_bundle)
+        a_cm    .triggered.connect(lambda: self._on_export_one("confusion_png"))
+        a_box   .triggered.connect(lambda: self._on_export_one("boxplot_png"))
+        a_sweep .triggered.connect(lambda: self._on_export_one("threshold_png"))
+        a_feat  .triggered.connect(lambda: self._on_export_one("feature_bar_png"))
+        a_roc   .triggered.connect(lambda: self._on_export_one("roc_png"))
+        a_calib .triggered.connect(lambda: self._on_export_one("calibration_png"))
+        a_scatter.triggered.connect(lambda: self._on_export_one("scatter_png"))
+        a_csv   .triggered.connect(lambda: self._on_export_one("metrics_csv"))
+        a_json  .triggered.connect(lambda: self._on_export_one("result_json"))
         self._btn_export.setMenu(self._export_menu)
         self._btn_export.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         hlay.addWidget(self._btn_export, 0, Qt.AlignmentFlag.AlignTop)
@@ -977,6 +1184,31 @@ class _ResultsView(QWidget):
                 self, "Save per-class F1 box plot PNG", "per_class_f1_box.png", "PNG (*.png)")
             if path:
                 self._save_boxplot_png(Path(path))
+        elif kind == "threshold_png":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save threshold sweep PNG", "threshold_sweep.png", "PNG (*.png)")
+            if path:
+                self._save_threshold_sweep_png(Path(path))
+        elif kind == "feature_bar_png":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save per-feature accuracy PNG", "per_feature_accuracy.png", "PNG (*.png)")
+            if path:
+                self._save_feature_bar_png(Path(path))
+        elif kind == "roc_png":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save ROC curve PNG", "roc_curve.png", "PNG (*.png)")
+            if path:
+                self._save_roc_png(Path(path))
+        elif kind == "calibration_png":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save calibration plot PNG", "calibration.png", "PNG (*.png)")
+            if path:
+                self._save_calibration_png(Path(path))
+        elif kind == "scatter_png":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save per-recording scatter PNG", "per_recording_scatter.png", "PNG (*.png)")
+            if path:
+                self._save_per_recording_scatter_png(Path(path))
         elif kind == "metrics_csv":
             path, _ = QFileDialog.getSaveFileName(
                 self, "Save per-class metrics CSV", "per_class_metrics.csv", "CSV (*.csv)")
@@ -1001,7 +1233,12 @@ class _ResultsView(QWidget):
         self._save_confusion_png(target / "confusion_matrix.png")
         self._save_boxplot_png(target / "per_class_f1_box.png")
         self._save_threshold_sweep_csv(target / "threshold_sweep.csv")
+        self._save_threshold_sweep_png(target / "threshold_sweep.png")
         self._save_feature_csv(target / "per_feature_accuracy.csv")
+        self._save_feature_bar_png(target / "per_feature_accuracy.png")
+        self._save_roc_png(target / "roc_curve.png")
+        self._save_calibration_png(target / "calibration.png")
+        self._save_per_recording_scatter_png(target / "per_recording_scatter.png")
 
     # ── individual export operations (each is a no-op if the result
     # doesn't have data of that kind) ─────────────────────────────────
@@ -1157,125 +1394,1624 @@ class _ResultsView(QWidget):
             for k in sorted(r.per_feature, key=lambda k: -r.per_feature[k]):
                 w.writerow([k, f"{r.per_feature[k]:.6f}"])
 
+    def _save_threshold_sweep_png(self, path: Path) -> None:
+        """Line chart of F1 / precision / recall / specificity vs threshold."""
+        r = self._current
+        if r is None or not r.threshold_sweep:
+            return
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            log.warning("matplotlib unavailable — threshold sweep PNG skipped: %s", exc)
+            return
+        sweep = r.threshold_sweep
+        x  = np.asarray([p.threshold   for p in sweep])
+        f1 = np.asarray([p.f1          for p in sweep])
+        pr = np.asarray([p.precision   for p in sweep])
+        rc = np.asarray([p.recall      for p in sweep])
+        sp = np.asarray([p.specificity for p in sweep])
+
+        fig, ax = plt.subplots(figsize=(8, 4.5), dpi=140)
+        ax.plot(x, f1, label="F1",          color="#6d28d9", linewidth=2.5)
+        ax.plot(x, pr, label="Precision",   color="#0284c7", linewidth=1.8)
+        ax.plot(x, rc, label="Recall",      color="#16a34a", linewidth=1.8)
+        ax.plot(x, sp, label="Specificity", color="#d97706", linewidth=1.8)
+
+        chosen = r.chosen_threshold
+        if chosen is not None and not np.isnan(chosen):
+            ax.axvline(chosen, color="#dc2626", linewidth=1.5, linestyle="--",
+                       label=f"chosen = {chosen:.4g}")
+
+        # Mark the best-F1 threshold
+        best_idx = int(np.argmax(f1))
+        ax.scatter([x[best_idx]], [f1[best_idx]], color="#6d28d9", s=60, zorder=5)
+
+        ax.set_xlim(x[0], x[-1])
+        ax.set_ylim(0, 1)
+        ax.set_xlabel("RMS threshold")
+        ax.set_ylabel("Metric value")
+        ax.set_title(f"Threshold sweep — {r.title}", fontsize=11, pad=12)
+        ax.legend(loc="lower right", fontsize=9)
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+    def _save_feature_bar_png(self, path: Path) -> None:
+        """Horizontal bar chart: per-feature validation accuracy, sorted best-first."""
+        r = self._current
+        if r is None or not r.per_feature:
+            return
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            log.warning("matplotlib unavailable — feature bar PNG skipped: %s", exc)
+            return
+
+        items = sorted(r.per_feature.items(), key=lambda kv: kv[1])
+        names = [k for k, _ in items]
+        vals  = [float(v) if v == v else 0.0 for _, v in items]
+
+        fig, ax = plt.subplots(figsize=(7, max(3, 0.55 * len(names) + 1.5)), dpi=140)
+        colors = ["#16a34a" if v >= 0.8 else "#d97706" if v >= 0.6 else "#dc2626"
+                  for v in vals]
+        bars = ax.barh(names, vals, color=colors, edgecolor="#6d28d9", linewidth=0.8, height=0.65)
+        for bar, val in zip(bars, vals):
+            ax.text(val + 0.01, bar.get_y() + bar.get_height() / 2,
+                    f"{val * 100:.1f}%", va="center", fontsize=9, color="#1f2937")
+
+        ax.set_xlim(0, 1.12)
+        ax.axvline(0.8, color="#16a34a", linewidth=1, linestyle=":", alpha=0.6)
+        ax.axvline(0.6, color="#d97706", linewidth=1, linestyle=":", alpha=0.6)
+        ax.set_xlabel("Validation accuracy (LDA, single feature)")
+        ax.set_title(f"Per-feature accuracy — {r.title}", fontsize=11, pad=12)
+        ax.grid(axis="x", alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+    def _save_roc_png(self, path: Path) -> None:
+        """ROC curve for binary / threshold-sweep results (Unity mode).
+
+        For multi-class results we draw one micro-averaged curve using the
+        per-class confusion counts reconstructed from the threshold sweep or,
+        if no sweep is available, we fall back to a note that the data is
+        insufficient.
+        """
+        r = self._current
+        if r is None:
+            return
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            log.warning("matplotlib unavailable — ROC PNG skipped: %s", exc)
+            return
+
+        if r.threshold_sweep:
+            # Unity / binary: derive FPR & TPR from the sweep
+            sweep = r.threshold_sweep
+            fpr = np.asarray([1.0 - p.specificity for p in sweep])
+            tpr = np.asarray([p.recall           for p in sweep])
+            # Sort by ascending FPR so the curve draws left-to-right
+            order = np.argsort(fpr)
+            fpr, tpr = fpr[order], tpr[order]
+
+            # AUC via trapezoidal rule
+            auc = float(np.trapz(tpr, fpr))
+
+            fig, ax = plt.subplots(figsize=(5.5, 5), dpi=140)
+            ax.plot(fpr, tpr, color="#6d28d9", linewidth=2.5,
+                    label=f"ROC (AUC = {auc:.3f})")
+            # Mark the chosen threshold
+            chosen = r.chosen_threshold
+            if chosen is not None and not np.isnan(chosen):
+                thresholds = np.asarray([p.threshold for p in sweep])
+                idx = int(np.argmin(np.abs(thresholds - chosen)))
+                ci = order.tolist().index(idx) if idx in order else -1
+                if 0 <= ci < len(fpr):
+                    ax.scatter([fpr[ci]], [tpr[ci]], color="#dc2626", s=80, zorder=5,
+                               label=f"chosen thr = {chosen:.4g}")
+        elif r.auroc is not None and not np.isnan(r.auroc):
+            # We have a pre-computed AUROC but no sweep — draw a placeholder
+            auc = float(r.auroc)
+            fig, ax = plt.subplots(figsize=(5.5, 5), dpi=140)
+            ax.text(0.5, 0.5, f"AUROC = {auc:.3f}\n(no per-point sweep data)",
+                    ha="center", va="center", fontsize=13, color="#6d28d9",
+                    transform=ax.transAxes)
+        else:
+            return  # nothing to draw
+
+        ax.plot([0, 1], [0, 1], "k--", linewidth=1, alpha=0.4, label="random")
+        ax.set_xlim(0, 1); ax.set_ylim(0, 1)
+        ax.set_xlabel("False positive rate  (1 − specificity)")
+        ax.set_ylabel("True positive rate  (recall / sensitivity)")
+        ax.set_title(f"ROC curve — {r.title}", fontsize=11, pad=12)
+        ax.legend(loc="lower right", fontsize=9)
+        ax.grid(alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+    def _save_calibration_png(self, path: Path) -> None:
+        """Reliability / calibration diagram.
+
+        We use ``mean_confidence_correct`` and ``mean_confidence_incorrect``
+        if available, together with overall accuracy, to draw a two-point
+        calibration sketch.  Full calibration curves (binned confidence
+        histograms) require raw prediction probabilities that aren't stored
+        in ``EvaluationResult``; this lightweight version is still informative.
+        """
+        r = self._current
+        if r is None:
+            return
+        mcc = r.mean_confidence_correct
+        mci = r.mean_confidence_incorrect
+        if mcc is None or mci is None:
+            return  # no confidence data in this result
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            log.warning("matplotlib unavailable — calibration PNG skipped: %s", exc)
+            return
+
+        fig, axes = plt.subplots(1, 2, figsize=(9, 4), dpi=140)
+
+        # Left: bar chart of mean confidence on correct vs incorrect predictions
+        ax = axes[0]
+        bars = ax.bar(["Correct", "Incorrect"], [mcc, mci],
+                      color=["#16a34a", "#dc2626"], edgecolor="#1f2937",
+                      linewidth=0.8, width=0.5)
+        for bar, val in zip(bars, [mcc, mci]):
+            ax.text(bar.get_x() + bar.get_width() / 2, val + 0.01,
+                    f"{val * 100:.1f}%", ha="center", va="bottom",
+                    fontsize=10, fontweight="bold")
+        ax.set_ylim(0, 1.12)
+        ax.axhline(1.0, color="gray", linewidth=0.8, linestyle="--", alpha=0.5)
+        ax.set_ylabel("Mean predicted confidence")
+        ax.set_title("Confidence: correct vs incorrect", fontsize=10)
+        ax.grid(axis="y", alpha=0.3)
+
+        # Right: expected calibration sketch
+        # Ideal calibration: confidence ≈ accuracy.
+        ax2 = axes[1]
+        acc = r.accuracy if not np.isnan(r.accuracy) else None
+
+        points_x = [mci, mcc]
+        points_y = [1.0 - (acc or 0.5), acc or 0.5]
+        ax2.scatter(points_x, points_y, s=100, zorder=5,
+                    color=["#dc2626", "#16a34a"],
+                    label=["incorrect", "correct"])
+        ax2.plot([0, 1], [0, 1], "k--", linewidth=1, alpha=0.4, label="perfect calibration")
+        ax2.set_xlim(0, 1); ax2.set_ylim(0, 1)
+        ax2.set_xlabel("Mean predicted confidence")
+        ax2.set_ylabel("Observed fraction correct")
+        ax2.set_title("Calibration sketch", fontsize=10)
+        ax2.legend(fontsize=8, loc="upper left")
+        ax2.grid(alpha=0.3)
+        # Annotate ECE if available
+        ece = r.expected_calibration_error
+        if ece is not None and not np.isnan(ece):
+            ax2.text(0.98, 0.04, f"ECE = {ece:.4f}",
+                     ha="right", va="bottom", fontsize=9, color="#6d28d9",
+                     transform=ax2.transAxes)
+
+        fig.suptitle(f"Calibration — {r.title}", fontsize=11, y=1.02)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+    def _save_per_recording_scatter_png(self, path: Path) -> None:
+        """Scatter plot: accuracy per recording, one dot per session/subject.
+
+        X-axis  = recording index (sorted by subject then session).
+        Y-axis  = accuracy on that recording.
+        Coloured by subject.  Useful to spot subject-level clusters,
+        drift over the course of a session series, or outlier recordings.
+        """
+        r = self._current
+        if r is None:
+            return
+        rows = self._per_recording_rows(r)
+        if len(rows) < 2:
+            return
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+            from matplotlib.cm import get_cmap
+        except Exception as exc:
+            log.warning("matplotlib unavailable — scatter PNG skipped: %s", exc)
+            return
+
+        subjects = sorted({row.get("subject_id", "?") for row in rows})
+        cmap     = get_cmap("tab10")
+        subj_color = {s: cmap(i % 10) for i, s in enumerate(subjects)}
+
+        accs   = [float(row.get("accuracy", 0.0)) for row in rows]
+        colors = [subj_color[row.get("subject_id", "?")] for row in rows]
+        labels = [
+            f"{row.get('subject_id', '')} · {row.get('session_id', '')}"
+            for row in rows
+        ]
+
+        fig, ax = plt.subplots(figsize=(max(7, 0.35 * len(rows) + 3), 4.5), dpi=140)
+        xs = list(range(len(rows)))
+        ax.scatter(xs, accs, c=colors, s=55, zorder=4, edgecolors="white", linewidth=0.5)
+        ax.plot(xs, accs, color="#cbd5e1", linewidth=1, zorder=3)  # thin connecting line
+
+        # Mean line
+        mean_acc = float(np.mean(accs))
+        ax.axhline(mean_acc, color="#6d28d9", linewidth=1.5, linestyle="--",
+                   label=f"mean = {mean_acc * 100:.1f}%")
+
+        # Legend: one entry per subject
+        from matplotlib.lines import Line2D
+        handles = [
+            Line2D([0], [0], marker="o", color="w", markerfacecolor=subj_color[s],
+                   markersize=8, label=s)
+            for s in subjects
+        ]
+        handles.append(
+            Line2D([0], [0], color="#6d28d9", linewidth=1.5, linestyle="--",
+                   label=f"mean = {mean_acc * 100:.1f}%")
+        )
+        ax.legend(handles=handles, fontsize=8, loc="lower right",
+                  ncol=max(1, len(subjects) // 6))
+
+        ax.set_xticks(xs)
+        ax.set_xticklabels(
+            [row.get("session_id", str(i)) for i, row in enumerate(rows)],
+            rotation=55, ha="right", fontsize=7
+        )
+        ax.set_ylim(0, 1.05)
+        ax.set_ylabel("Accuracy")
+        ax.set_title(f"Per-recording accuracy — {r.title}", fontsize=11, pad=12)
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
 
 # ═══════════════════════════════════════════════════════════════════════════
-# Mode panels — picker on the left, grouped settings on the right
+# CV mode — data subsets  (named groups the user can compare across)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def _model_dirs(data_dir: Path) -> List[str]:
-    """Return saved model names from <data_dir>/models, newest first."""
-    md = Path(data_dir) / "models"
-    if not md.exists():
-        return []
-    children = [c for c in md.iterdir() if c.is_dir() and not c.name.startswith("_")]
-    children.sort(key=lambda p: p.stat().st_mtime, reverse=True)
-    return [c.name for c in children]
-
-
-def _form_layout() -> QFormLayout:
-    """A consistent form layout used inside every settings group-box."""
-    f = QFormLayout()
-    f.setHorizontalSpacing(12)
-    f.setVerticalSpacing(8)
-    f.setLabelAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
-    f.setFieldGrowthPolicy(QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
-    return f
-
-
-def _settings_scroll_host(group_widgets: List[QWidget],
-                           run_button: QWidget) -> QWidget:
+@dataclass
+class DataSubset:
     """
-    Build the right-hand settings column: a scroll area holding a stack
-    of group-boxes, plus the Run button pinned to the bottom outside
-    the scroll area.
+    A named subset of the available training data.
 
-    This decoupling matters: when the window is short, the scroll keeps
-    the Run button visible at the bottom even when the settings overflow.
+    The validation runner consumes this as a :class:`DataSelection` —
+    see :meth:`to_data_selection`. We keep our own dataclass instead of
+    using :class:`DataSelection` directly because we want richer metadata
+    (a human label, optional notes) without polluting the runner's
+    config schema.
     """
-    column = QWidget()
-    col_lay = QVBoxLayout(column)
-    col_lay.setContentsMargins(0, 0, 0, 0)
-    col_lay.setSpacing(10)
+    name: str
+    subjects: List[str] = field(default_factory=list)   # explicit list; empty ⇒ "all"
+    domains:  List[str] = field(default_factory=list)   # ["pipeline"] / ["unity"] / [] for both
+    notes:    str       = ""
 
-    scroll = QScrollArea()
-    scroll.setFrameShape(QFrame.Shape.NoFrame)
-    scroll.setWidgetResizable(True)
-    inner = QWidget()
-    inner_lay = QVBoxLayout(inner)
-    inner_lay.setContentsMargins(2, 2, 2, 2)
-    inner_lay.setSpacing(12)
-    for g in group_widgets:
-        inner_lay.addWidget(g)
-    inner_lay.addStretch(1)
-    scroll.setWidget(inner)
-    col_lay.addWidget(scroll, 1)
+    def to_data_selection(self) -> DataSelection:
+        return DataSelection(
+            subjects=list(self.subjects) if self.subjects else None,
+            domains=list(self.domains)   if self.domains  else None,
+        )
 
-    col_lay.addWidget(run_button)
-    return column
+    def describe(self) -> str:
+        bits: List[str] = []
+        bits.append(f"{len(self.subjects)} subjects" if self.subjects else "all subjects")
+        bits.append(" + ".join(self.domains) if self.domains else "all domains")
+        return "  ·  ".join(bits)
 
 
-# ── Sessions panel ─────────────────────────────────────────────────────────
+class _SubsetEditorDialog(QDialog):
+    """Modal dialog editing one :class:`DataSubset`. Returns it via accept()."""
 
-class _SessionsPanel(QWidget):
-    """Source picker + grouped settings + Run button for the Sessions mode."""
+    def __init__(self, available_subjects: List[str],
+                 subset: Optional[DataSubset] = None,
+                 parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self.setWindowTitle("Edit data subset")
+        self.setMinimumWidth(420)
+        self._subset = subset or DataSubset(name="new subset")
 
-    run_clicked      = Signal(SessionEvalSettings, list)
-    features_clicked = Signal(list, list)
+        outer = QVBoxLayout(self); outer.setSpacing(10)
 
-    def __init__(self, data_dir: Path, parent: Optional[QWidget] = None):
+        # Name + notes
+        form = _form()
+        self._name_edit = QLineEdit(self._subset.name)
+        form.addRow("Name:", self._name_edit)
+        self._notes_edit = QLineEdit(self._subset.notes)
+        self._notes_edit.setPlaceholderText("Optional one-line description")
+        form.addRow("Notes:", self._notes_edit)
+        outer.addLayout(form)
+
+        # Domains
+        dom_group = _styled_group("Domains")
+        dl = QVBoxLayout()
+        self._dom_pipeline = QCheckBox("Training sessions  (pipeline)")
+        self._dom_unity    = QCheckBox("Unity sessions  (unity)")
+        self._dom_pipeline.setChecked("pipeline" in self._subset.domains
+                                       or not self._subset.domains)
+        self._dom_unity   .setChecked("unity" in self._subset.domains
+                                       or not self._subset.domains)
+        dl.addWidget(self._dom_pipeline); dl.addWidget(self._dom_unity)
+        hint = QLabel("Both checked  ⇒  use everything available.")
+        hint.setStyleSheet(f"color:{C_MUTED}; font-size:10px;")
+        dl.addWidget(hint)
+        dom_group.setLayout(dl)
+        outer.addWidget(dom_group)
+
+        # Subjects (multi-select list)
+        sg = _styled_group("Subjects  (none checked  ⇒  use all)")
+        sl = QVBoxLayout()
+        self._subj_list = QListWidget()
+        self._subj_list.setSelectionMode(QListWidget.SelectionMode.NoSelection)
+        for s in available_subjects:
+            it = QListWidgetItem(s)
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Checked
+                             if s in self._subset.subjects
+                             else Qt.CheckState.Unchecked)
+            self._subj_list.addItem(it)
+        sl.addWidget(self._subj_list)
+        # Quick toggles
+        toggles = QHBoxLayout()
+        b_all  = _ghost_button("Check all")
+        b_none = _ghost_button("Uncheck all")
+        b_all .clicked.connect(lambda: self._toggle_all(True))
+        b_none.clicked.connect(lambda: self._toggle_all(False))
+        toggles.addWidget(b_all); toggles.addWidget(b_none); toggles.addStretch(1)
+        sl.addLayout(toggles)
+        sg.setLayout(sl)
+        outer.addWidget(sg, 1)
+
+        # OK / Cancel
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self._accept_if_valid)
+        bb.rejected.connect(self.reject)
+        outer.addWidget(bb)
+
+    def _toggle_all(self, on: bool) -> None:
+        state = Qt.CheckState.Checked if on else Qt.CheckState.Unchecked
+        for i in range(self._subj_list.count()):
+            self._subj_list.item(i).setCheckState(state)
+
+    def _accept_if_valid(self) -> None:
+        if not self._name_edit.text().strip():
+            QMessageBox.warning(self, "Name required",
+                                "Each subset needs a name so it can be told apart "
+                                "in the result table.")
+            return
+        self.accept()
+
+    def result_subset(self) -> DataSubset:
+        # Read back into a fresh DataSubset so the caller doesn't share
+        # references with the dialog's internal state.
+        subjects = [
+            self._subj_list.item(i).text()
+            for i in range(self._subj_list.count())
+            if self._subj_list.item(i).checkState() == Qt.CheckState.Checked
+        ]
+        domains: List[str] = []
+        if self._dom_pipeline.isChecked(): domains.append("pipeline")
+        if self._dom_unity   .isChecked(): domains.append("unity")
+        # A subset with both domains and no subject filter is just "all data" —
+        # storing an empty domains list in that case keeps to_data_selection()
+        # happy (it emits None, which the runner treats as "no filter").
+        if len(domains) == 2:
+            domains = []
+        return DataSubset(
+            name=self._name_edit.text().strip(),
+            subjects=subjects,
+            domains=domains,
+            notes=self._notes_edit.text().strip(),
+        )
+
+
+class _DataSubsetListWidget(QWidget):
+    """
+    Editable list of named :class:`DataSubset` rows.
+
+    Used in two places:
+      - as the "default subset" when the comparison axis is NOT data,
+      - as the list of values when the comparison axis IS data.
+    """
+
+    changed = Signal()
+
+    def __init__(self, available_subjects: List[str],
+                 parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._available_subjects = list(available_subjects)
+        self._subsets: List[DataSubset] = []
+
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(6)
+
+        self._list = QListWidget()
+        self._list.setStyleSheet(
+            f"QListWidget {{ background:{C_PANEL}; border:1px solid {C_BORDER2};"
+            f"  border-radius:6px; padding:4px; }}"
+            f"QListWidget::item {{ padding:6px 8px; border-radius:4px; }}"
+            f"QListWidget::item:selected {{ background:{C_CARD}; color:{C_TEXT}; }}"
+        )
+        outer.addWidget(self._list, 1)
+
+        bar = QHBoxLayout(); bar.setSpacing(6)
+        self._btn_add  = _ghost_button("+ Add…")
+        self._btn_edit = _ghost_button("Edit…")
+        self._btn_dup  = _ghost_button("Duplicate")
+        self._btn_del  = _ghost_button("Delete")
+        for b in (self._btn_add, self._btn_edit, self._btn_dup, self._btn_del):
+            bar.addWidget(b)
+        bar.addStretch(1)
+        outer.addLayout(bar)
+
+        self._btn_add .clicked.connect(self._on_add)
+        self._btn_edit.clicked.connect(self._on_edit)
+        self._btn_dup .clicked.connect(self._on_duplicate)
+        self._btn_del .clicked.connect(self._on_delete)
+        self._list.itemDoubleClicked.connect(lambda _it: self._on_edit())
+
+    # ── public API ────────────────────────────────────────────────────
+
+    def set_available_subjects(self, subjects: List[str]) -> None:
+        self._available_subjects = list(subjects)
+
+    def subsets(self) -> List[DataSubset]:
+        return list(self._subsets)
+
+    def set_subsets(self, subsets: List[DataSubset]) -> None:
+        self._subsets = [
+            DataSubset(s.name, list(s.subjects), list(s.domains), s.notes)
+            for s in subsets
+        ]
+        self._refresh()
+
+    def add_subset(self, subset: DataSubset) -> None:
+        self._subsets.append(subset)
+        self._refresh()
+        self.changed.emit()
+
+    # ── internal slots ────────────────────────────────────────────────
+
+    def _on_add(self) -> None:
+        dlg = _SubsetEditorDialog(self._available_subjects, parent=self)
+        if dlg.exec():
+            self.add_subset(dlg.result_subset())
+
+    def _on_edit(self) -> None:
+        idx = self._list.currentRow()
+        if idx < 0 or idx >= len(self._subsets):
+            return
+        dlg = _SubsetEditorDialog(self._available_subjects,
+                                   subset=self._subsets[idx], parent=self)
+        if dlg.exec():
+            self._subsets[idx] = dlg.result_subset()
+            self._refresh()
+            self.changed.emit()
+
+    def _on_duplicate(self) -> None:
+        idx = self._list.currentRow()
+        if idx < 0 or idx >= len(self._subsets):
+            return
+        s = self._subsets[idx]
+        clone = DataSubset(name=f"{s.name} (copy)",
+                           subjects=list(s.subjects),
+                           domains=list(s.domains), notes=s.notes)
+        self._subsets.insert(idx + 1, clone)
+        self._refresh(); self.changed.emit()
+
+    def _on_delete(self) -> None:
+        idx = self._list.currentRow()
+        if idx < 0 or idx >= len(self._subsets):
+            return
+        del self._subsets[idx]
+        self._refresh(); self.changed.emit()
+
+    def _refresh(self) -> None:
+        self._list.clear()
+        for s in self._subsets:
+            text = f"{s.name}\n  {s.describe()}"
+            if s.notes:
+                text += f"  ·  {s.notes}"
+            it = QListWidgetItem(text)
+            self._list.addItem(it)
+
+
+class _CheckList(QWidget):
+    """A vertical list of checkboxes plus Select-all / Clear quick toggles."""
+
+    selection_changed = Signal()
+
+    def __init__(self,
+                 entries: List[Tuple[str, str]],
+                 *,
+                 initial_checked: Optional[List[str]] = None,
+                 parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._boxes: Dict[str, QCheckBox] = {}
+        initial_checked = initial_checked or []
+
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(6)
+
+        # Quick toggles
+        bar = QHBoxLayout(); bar.setSpacing(6)
+        b_all  = _ghost_button("Select all")
+        b_none = _ghost_button("Clear")
+        b_all .clicked.connect(self.select_all)
+        b_none.clicked.connect(self.select_none)
+        bar.addWidget(b_all); bar.addWidget(b_none); bar.addStretch(1)
+        outer.addLayout(bar)
+
+        # The boxes themselves
+        for key, label in entries:
+            row = QHBoxLayout(); row.setContentsMargins(0, 0, 0, 0); row.setSpacing(6)
+            cb = QCheckBox(key); cb.setChecked(key in initial_checked)
+            cb.toggled.connect(self._on_toggled)
+            self._boxes[key] = cb
+            row.addWidget(cb)
+            desc = QLabel(label)
+            desc.setStyleSheet(f"color:{C_MUTED}; font-size:10px;")
+            row.addWidget(desc, 1)
+            outer.addLayout(row)
+        outer.addStretch(1)
+
+    def selected(self) -> List[str]:
+        return [k for k, cb in self._boxes.items() if cb.isChecked()]
+
+    def set_selected(self, keys: List[str]) -> None:
+        for k, cb in self._boxes.items():
+            cb.setChecked(k in keys)
+
+    def select_all(self) -> None:
+        for cb in self._boxes.values():
+            cb.setChecked(True)
+
+    def select_none(self) -> None:
+        for cb in self._boxes.values():
+            cb.setChecked(False)
+
+    def _on_toggled(self, _checked: bool) -> None:
+        self.selection_changed.emit()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CV mode — sweep planner  (translates UI state into a list of ExperimentConfigs)
+# ═══════════════════════════════════════════════════════════════════════════
+
+@dataclass
+class SweepPlan:
+    """One planned validation run, plus a human label for the result table."""
+    label: str               # e.g. "model=catboost", "subset=early VPs"
+    cfg:   ExperimentConfig
+
+    def short_axis_value(self) -> str:
+        """The varied-axis value alone, e.g. 'catboost' (without 'model=')."""
+        if "=" in self.label:
+            return self.label.split("=", 1)[1]
+        return self.label
+
+
+@dataclass
+class SweepDefaults:
+    """Per-axis defaults used to fill in the values that aren't being varied."""
+    name:             str
+    seed:             int
+    window_ms:        int
+    stride_ms:        int
+    drop_rest:        bool
+    cv_strategy:      str
+    cv_kwargs:        Dict[str, Any]
+    default_subset:   DataSubset
+    default_models:   List[str]
+    default_features: List[str]
+
+
+def plan_sweep(
+    *,
+    axis: str,                         # "none" | "model" | "features" | "data_subset"
+    defaults: SweepDefaults,
+    # Per-axis values (only the matching axis is consulted)
+    axis_models:   Optional[List[List[str]]]   = None,   # one list of models per run
+    axis_features: Optional[List[List[str]]]   = None,   # one feature set per run
+    axis_subsets:  Optional[List[DataSubset]]  = None,
+    axis_labels:   Optional[List[str]]         = None,
+) -> List[SweepPlan]:
+    """
+    Build the list of :class:`SweepPlan` to execute.
+
+    The CV runner takes a list of models and a list of features per
+    config, but we run **one varied value at a time** (separate runs
+    per dimension). So when ``axis == "model"``, every entry in
+    ``axis_models`` becomes its own ExperimentConfig that uses the
+    default features and the default subset.
+    """
+    plans: List[SweepPlan] = []
+
+    def _make(label: str, models: List[str], features: List[str],
+              subset: DataSubset) -> SweepPlan:
+        cfg = ExperimentConfig(
+            name=f"{defaults.name}__{label.replace(' ', '_').replace('=', '_')}",
+            description=f"CV sweep: {label}",
+            seed=defaults.seed,
+            data=subset.to_data_selection(),
+            windowing=WindowingConfig(
+                window_ms=defaults.window_ms,
+                stride_ms=defaults.stride_ms,
+                drop_rest=defaults.drop_rest,
+            ),
+            features=[FeatureConfig(name=n) for n in features],
+            models=[ModelConfig(type=m) for m in models],
+            cv=CVConfig(strategy=defaults.cv_strategy,
+                        kwargs=dict(defaults.cv_kwargs)),
+        )
+        return SweepPlan(label=label, cfg=cfg)
+
+    if axis == "none":
+        plans.append(_make(
+            label="single run",
+            models=defaults.default_models,
+            features=defaults.default_features,
+            subset=defaults.default_subset,
+        ))
+        return plans
+
+    if axis == "model":
+        if not axis_models:
+            return []
+        labels = axis_labels or [
+            ", ".join(m) if len(m) > 1 else (m[0] if m else "(empty)")
+            for m in axis_models
+        ]
+        for label, models in zip(labels, axis_models):
+            plans.append(_make(
+                label=f"model={label}",
+                models=models,
+                features=defaults.default_features,
+                subset=defaults.default_subset,
+            ))
+        return plans
+
+    if axis == "features":
+        if not axis_features:
+            return []
+        labels = axis_labels or [
+            "+".join(fs) if fs else "(empty)" for fs in axis_features
+        ]
+        for label, fs in zip(labels, axis_features):
+            plans.append(_make(
+                label=f"features={label}",
+                models=defaults.default_models,
+                features=fs,
+                subset=defaults.default_subset,
+            ))
+        return plans
+
+    if axis == "data_subset":
+        if not axis_subsets:
+            return []
+        for sub in axis_subsets:
+            plans.append(_make(
+                label=f"subset={sub.name}",
+                models=defaults.default_models,
+                features=defaults.default_features,
+                subset=sub,
+            ))
+        return plans
+
+    raise ValueError(f"Unknown sweep axis: {axis!r}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CV mode — threaded sweep runner
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _SweepProgressBridge(QObject):
+    """
+    Adapts the runner's ProgressReporter API onto Qt signals.
+
+    The runner calls these methods from its worker thread; the signals
+    are connected with QueuedConnection so the GUI updates land on the
+    UI thread. The "sweep" semantics layer (run_index / total_runs) is
+    set by the worker before each individual ValidationRunner.run call.
+    """
+
+    sweep_started   = Signal(int)                 # total_runs
+    sweep_finished  = Signal(object)              # List[(label, RunResult)]
+    sweep_failed    = Signal(str)                 # traceback string
+
+    run_started     = Signal(int, int, str)       # run_idx, total_runs, label
+    run_finished    = Signal(int, int, str, object)  # run_idx, total_runs, label, RunResult
+
+    fold_started    = Signal(int, int, str, str)  # fold idx, total_folds, fold_id, model
+    fold_finished   = Signal(int, int, object)    # fold idx, total_folds, FoldResult
+    log_line        = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cancel = False
+        self._current_run_idx = 0
+        self._current_total   = 0
+        self._current_label   = ""
+
+    # ── used by the worker between runs ──────────────────────────────
+
+    def begin_run(self, idx: int, total: int, label: str) -> None:
+        self._current_run_idx = idx
+        self._current_total   = total
+        self._current_label   = label
+        self.run_started.emit(idx, total, label)
+
+    def request_cancel(self) -> None:
+        self._cancel = True
+
+    # ── ProgressReporter API (called from worker thread) ─────────────
+
+    def on_run_start(self, total_folds, total_models, _records):
+        self.log_line.emit(
+            f"[{self._current_run_idx}/{self._current_total}] "
+            f"{self._current_label}: {total_folds} folds × {total_models} models"
+        )
+
+    def on_fold_start(self, idx, total, fold_id, model_type):
+        self.fold_started.emit(idx, total, fold_id, model_type)
+
+    def on_fold_done(self, idx, total, fold_result):
+        self.fold_finished.emit(idx, total, fold_result)
+
+    def on_run_done(self, result):
+        # The worker emits run_finished itself so it can attach the label,
+        # but the runner does still call on_run_done — we just log it.
+        self.log_line.emit(
+            f"[{self._current_run_idx}/{self._current_total}] "
+            f"{self._current_label}: done"
+        )
+
+    def log(self, message: str):
+        self.log_line.emit(message)
+
+    def should_cancel(self) -> bool:
+        return self._cancel
+
+
+class _SweepWorker(QThread):
+    """
+    Runs N ValidationRunner.run(cfg) calls sequentially on a worker
+    thread. Cancellation between runs is honoured (we check before
+    starting each new ExperimentConfig); cancellation mid-run is
+    handled by the runner itself via ``progress.should_cancel()``.
+    """
+
+    def __init__(self, data_dir: Path, plans: List[SweepPlan],
+                 bridge: _SweepProgressBridge, parent=None):
         super().__init__(parent)
         self._data_dir = Path(data_dir)
+        self._plans    = list(plans)
+        self._bridge   = bridge
 
-        outer = QHBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(14)
+    def run(self) -> None:
+        results: List[Tuple[str, Any]] = []
+        try:
+            self._bridge.sweep_started.emit(len(self._plans))
+            runner = ValidationRunner(self._data_dir)
+            for i, plan in enumerate(self._plans, start=1):
+                if self._bridge.should_cancel():
+                    self._bridge.log_line.emit(
+                        f"Sweep cancelled before run {i}/{len(self._plans)}.")
+                    break
+                self._bridge.begin_run(i, len(self._plans), plan.label)
+                try:
+                    rr = runner.run(plan.cfg, progress=self._bridge)
+                except Exception as exc:
+                    # Don't kill the entire sweep when one run blows up — log
+                    # and continue. This matters when the user is comparing 6
+                    # models and one of them fails to import (e.g. xgboost).
+                    self._bridge.log_line.emit(
+                        f"⚠ run {i}/{len(self._plans)} ({plan.label}) FAILED: {exc}"
+                    )
+                    log.exception("sweep run failed: %s", plan.label)
+                    rr = None
+                results.append((plan.label, rr))
+                self._bridge.run_finished.emit(i, len(self._plans), plan.label, rr)
+            self._bridge.sweep_finished.emit(results)
+        except Exception:
+            import traceback
+            self._bridge.sweep_failed.emit(traceback.format_exc())
 
-        # Left: picker
-        self._picker = _SessionPicker(self._data_dir)
-        outer.addWidget(self._picker, 5)
 
-        # ── Right: groups
-        # Group: Model
-        g_model = _styled_group("Model")
-        gm_lay = _form_layout()
-        self._model_combo = QComboBox(); self._model_combo.setMinimumWidth(280)
-        self._refresh_models()
+# ═══════════════════════════════════════════════════════════════════════════
+# CV mode — axis-specific value pickers
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _ModelAxisPanel(QWidget):
+    """
+    Editor for the "vary by model" axis.
+
+    Lets the user pick which models to compare. Each checked model
+    becomes one ExperimentConfig with the default features and subset.
+    """
+
+    changed = Signal()
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(8)
+
+        info = QLabel("Each checked model becomes one validation run, using the "
+                      "default features and data subset configured on the left.")
+        info.setStyleSheet(f"color:{C_MUTED}; font-size:11px;")
+        info.setWordWrap(True)
+        outer.addWidget(info)
+
+        self._list = _CheckList(_AVAILABLE_MODELS,
+                                 initial_checked=[m for m, _ in _AVAILABLE_MODELS[:3]])
+        self._list.selection_changed.connect(self.changed.emit)
+        outer.addWidget(self._list, 1)
+
+    def axis_values(self) -> Tuple[List[List[str]], List[str]]:
+        """Returns (models_per_run, labels) — one entry per run."""
+        keys = self._list.selected()
+        return [[k] for k in keys], list(keys)
+
+
+class _FeaturesAxisPanel(QWidget):
+    """Editor for the "vary by features" axis — manages a list of feature presets."""
+
+    changed = Signal()
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        # Each row: (label, [feature keys])
+        self._presets: List[Tuple[str, List[str]]] = list(_DEFAULT_FEATURE_PRESETS)
+
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(8)
+
+        info = QLabel("Each row below becomes one validation run with that feature "
+                      "set, using the default model and data subset configured "
+                      "on the left.")
+        info.setStyleSheet(f"color:{C_MUTED}; font-size:11px;")
+        info.setWordWrap(True)
+        outer.addWidget(info)
+
+        self._list = QListWidget()
+        self._list.setStyleSheet(
+            f"QListWidget {{ background:{C_PANEL}; border:1px solid {C_BORDER2};"
+            f"  border-radius:6px; padding:4px; }}"
+            f"QListWidget::item {{ padding:6px 8px; border-radius:4px; }}"
+            f"QListWidget::item:selected {{ background:{C_CARD}; color:{C_TEXT}; }}"
+        )
+        outer.addWidget(self._list, 1)
+
+        bar = QHBoxLayout(); bar.setSpacing(6)
+        b_add  = _ghost_button("+ Add…")
+        b_edit = _ghost_button("Edit…")
+        b_del  = _ghost_button("Delete")
+        b_reset = _ghost_button("Reset presets")
+        for b in (b_add, b_edit, b_del, b_reset):
+            bar.addWidget(b)
+        bar.addStretch(1)
+        outer.addLayout(bar)
+
+        b_add  .clicked.connect(self._on_add)
+        b_edit .clicked.connect(self._on_edit)
+        b_del  .clicked.connect(self._on_delete)
+        b_reset.clicked.connect(self._on_reset)
+        self._list.itemDoubleClicked.connect(lambda _it: self._on_edit())
+
+        self._refresh()
+
+    # ── public API ───────────────────────────────────────────────────
+
+    def axis_values(self) -> Tuple[List[List[str]], List[str]]:
+        feats = [list(p[1]) for p in self._presets]
+        labels = [p[0] for p in self._presets]
+        return feats, labels
+
+    # ── internal slots ───────────────────────────────────────────────
+
+    def _on_add(self) -> None:
+        preset = self._prompt_for_preset()
+        if preset is not None:
+            self._presets.append(preset)
+            self._refresh(); self.changed.emit()
+
+    def _on_edit(self) -> None:
+        idx = self._list.currentRow()
+        if idx < 0 or idx >= len(self._presets):
+            return
+        preset = self._prompt_for_preset(initial=self._presets[idx])
+        if preset is not None:
+            self._presets[idx] = preset
+            self._refresh(); self.changed.emit()
+
+    def _on_delete(self) -> None:
+        idx = self._list.currentRow()
+        if idx < 0 or idx >= len(self._presets):
+            return
+        del self._presets[idx]
+        self._refresh(); self.changed.emit()
+
+    def _on_reset(self) -> None:
+        if QMessageBox.question(
+            self, "Reset feature presets",
+            "Replace the current preset list with the default four?",
+        ) == QMessageBox.StandardButton.Yes:
+            self._presets = list(_DEFAULT_FEATURE_PRESETS)
+            self._refresh(); self.changed.emit()
+
+    def _refresh(self) -> None:
+        self._list.clear()
+        for label, feats in self._presets:
+            text = f"{label}\n  {'+'.join(feats)}"
+            self._list.addItem(QListWidgetItem(text))
+
+    def _prompt_for_preset(
+        self,
+        initial: Optional[Tuple[str, List[str]]] = None,
+    ) -> Optional[Tuple[str, List[str]]]:
+        dlg = QDialog(self); dlg.setWindowTitle("Feature preset")
+        dlg.setMinimumWidth(380)
+        dl = QVBoxLayout(dlg)
+        form = _form()
+        name_edit = QLineEdit(initial[0] if initial else "")
+        name_edit.setPlaceholderText("e.g. 'time-domain trio'")
+        form.addRow("Preset name:", name_edit)
+        dl.addLayout(form)
+
+        feat_group = _styled_group("Features in this preset")
+        fl = QVBoxLayout()
+        check = _CheckList(_AVAILABLE_FEATURES,
+                           initial_checked=initial[1] if initial else _DEFAULT_FEATURE_SET)
+        fl.addWidget(check)
+        feat_group.setLayout(fl)
+        dl.addWidget(feat_group, 1)
+
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok |
+                              QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(dlg.accept)
+        bb.rejected.connect(dlg.reject)
+        dl.addWidget(bb)
+
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        name = name_edit.text().strip() or "(unnamed)"
+        feats = check.selected()
+        if not feats:
+            QMessageBox.warning(self, "No features",
+                                "Select at least one feature for this preset.")
+            return None
+        return (name, feats)
+
+
+class _DataSubsetAxisPanel(QWidget):
+    """Editor for the "vary by data subset" axis — wraps a _DataSubsetListWidget."""
+
+    changed = Signal()
+
+    def __init__(self, available_subjects: List[str],
+                 parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(8)
+
+        info = QLabel("Each named subset below becomes one validation run, "
+                      "comparing how the same model + features perform on "
+                      "different slices of your data.")
+        info.setStyleSheet(f"color:{C_MUTED}; font-size:11px;")
+        info.setWordWrap(True)
+        outer.addWidget(info)
+
+        self._list = _DataSubsetListWidget(available_subjects)
+        self._list.changed.connect(self.changed.emit)
+        outer.addWidget(self._list, 1)
+
+    def set_available_subjects(self, subjects: List[str]) -> None:
+        self._list.set_available_subjects(subjects)
+
+    def axis_values(self) -> List[DataSubset]:
+        return self._list.subsets()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CV mode — comparison + per-model tables
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _ComparisonTable(QWidget):
+    """
+    One row per sweep run, columns: label, n folds, accuracy, F1, train time.
+
+    When there are multiple models per run (the user picked a list under
+    "vary by model") each row is collapsed to the best model. The full
+    per-model breakdown lives in :class:`_PerModelTable`.
+    """
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0)
+        self._table = QTableWidget(0, 0)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self._table.setAlternatingRowColors(True)
+        self._table.setStyleSheet(
+            f"QTableWidget {{ background:{C_PANEL}; border:1px solid {C_BORDER2};"
+            f"  border-radius:6px; alternate-background-color:{C_BG};"
+            f"  gridline-color:{C_BORDER2}; }}"
+            f"QTableWidget::item {{ padding:6px 9px; }}"
+            f"QHeaderView::section {{ background:{C_BG}; border:none;"
+            f"  padding:6px 8px; font-weight:600; color:{C_MUTED}; }}"
+        )
+        self._table.verticalHeader().setVisible(False)
+        outer.addWidget(self._table)
+
+    def set_rows(self, rows: List[Tuple[str, Dict[str, Any]]]) -> None:
+        """
+        Each ``rows`` entry is ``(axis_value, aggregate_dict)``, where
+        ``aggregate_dict`` is the per-model summary returned by
+        ``RunResult.aggregate()``. We pick the best model per row.
+        """
+        headers = ["Run", "Best model", "Folds",
+                    "Accuracy", "Macro-F1", "Mean train time"]
+        self._table.setColumnCount(len(headers))
+        self._table.setHorizontalHeaderLabels(headers)
+        self._table.setRowCount(len(rows))
+
+        for i, (label, agg) in enumerate(rows):
+            if not agg:
+                self._table.setItem(i, 0, QTableWidgetItem(label))
+                self._table.setItem(i, 1, QTableWidgetItem("(no result)"))
+                for c in range(2, len(headers)):
+                    self._table.setItem(i, c, QTableWidgetItem("—"))
+                continue
+            best_model, m = max(agg.items(),
+                                 key=lambda kv: kv[1].get("accuracy_mean", 0.0))
+            self._table.setItem(i, 0, QTableWidgetItem(label))
+            self._table.setItem(i, 1, QTableWidgetItem(best_model))
+            self._table.setItem(i, 2, QTableWidgetItem(str(int(m.get("n_folds", 0)))))
+            acc_item = QTableWidgetItem(
+                f"{m.get('accuracy_mean', 0.0):.3f} ± {m.get('accuracy_std', 0.0):.3f}"
+            )
+            acc_item.setForeground(QBrush(QColor(_score_colour(m.get("accuracy_mean", 0.0)))))
+            self._table.setItem(i, 3, acc_item)
+            self._table.setItem(i, 4, QTableWidgetItem(
+                f"{m.get('macro_f1_mean', 0.0):.3f} ± {m.get('macro_f1_std', 0.0):.3f}"
+            ))
+            self._table.setItem(i, 5, QTableWidgetItem(_fmt_dur(m.get("train_seconds_mean", 0.0))))
+
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+
+
+class _PerModelTable(QWidget):
+    """Per-model breakdown of every sweep run, so multi-model runs are visible."""
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0)
+        self._table = QTableWidget(0, 0)
+        self._table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self._table.setAlternatingRowColors(True)
+        self._table.setStyleSheet(
+            f"QTableWidget {{ background:{C_PANEL}; border:1px solid {C_BORDER2};"
+            f"  border-radius:6px; alternate-background-color:{C_BG};"
+            f"  gridline-color:{C_BORDER2}; }}"
+            f"QTableWidget::item {{ padding:6px 9px; }}"
+            f"QHeaderView::section {{ background:{C_BG}; border:none;"
+            f"  padding:6px 8px; font-weight:600; color:{C_MUTED}; }}"
+        )
+        self._table.verticalHeader().setVisible(False)
+        outer.addWidget(self._table)
+
+    def set_rows(self, rows: List[Tuple[str, Dict[str, Any]]]) -> None:
+        headers = ["Run", "Model", "Folds", "Accuracy", "Macro-F1", "Train time"]
+        self._table.setColumnCount(len(headers))
+        self._table.setHorizontalHeaderLabels(headers)
+
+        flat: List[Tuple[str, str, Dict[str, float]]] = []
+        for label, agg in rows:
+            if not agg:
+                flat.append((label, "(no result)", {}))
+                continue
+            for model, m in sorted(agg.items()):
+                flat.append((label, model, m))
+
+        self._table.setRowCount(len(flat))
+        for i, (label, model, m) in enumerate(flat):
+            self._table.setItem(i, 0, QTableWidgetItem(label))
+            self._table.setItem(i, 1, QTableWidgetItem(model))
+            if not m:
+                for c in range(2, len(headers)):
+                    self._table.setItem(i, c, QTableWidgetItem("—"))
+                continue
+            self._table.setItem(i, 2, QTableWidgetItem(str(int(m.get("n_folds", 0)))))
+            acc_item = QTableWidgetItem(
+                f"{m.get('accuracy_mean', 0.0):.3f} ± {m.get('accuracy_std', 0.0):.3f}"
+            )
+            acc_item.setForeground(QBrush(QColor(_score_colour(m.get("accuracy_mean", 0.0)))))
+            self._table.setItem(i, 3, acc_item)
+            self._table.setItem(i, 4, QTableWidgetItem(
+                f"{m.get('macro_f1_mean', 0.0):.3f} ± {m.get('macro_f1_std', 0.0):.3f}"
+            ))
+            self._table.setItem(i, 5, QTableWidgetItem(_fmt_dur(m.get("train_seconds_mean", 0.0))))
+        self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+
+
+class _CrossValidationResultsView(QWidget):
+    """
+    Bottom panel for CV mode: live progress, summary table, per-model
+    breakdown, and an export menu. Owns its own export button so the
+    CV-specific export targets (comparison CSV / per-model CSV / sweep
+    JSON / bundle) are clearly separated from the eval-result PNG/CSV
+    targets used by :class:`_EvaluationResultView`.
+    """
+
+    export_requested = Signal(str)   # kind: "comparison_csv" / "per_model_csv" / "summary_json" / "bundle"
+
+    def __init__(self, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(10)
+
+        # ── Header (title + export menu) ────────────────────────────
+        header = QHBoxLayout(); header.setSpacing(10)
+        title_col = QVBoxLayout(); title_col.setSpacing(2); title_col.setContentsMargins(0,0,0,0)
+        self._title = QLabel("No sweep run yet")
+        f = QFont(); f.setPointSize(15); f.setBold(True); self._title.setFont(f)
+        self._title.setStyleSheet(f"color:{C_TEXT};")
+        title_col.addWidget(self._title)
+        self._sub = QLabel("Configure an axis on the left, then press Run sweep.")
+        self._sub.setStyleSheet(f"color:{C_MUTED}; font-size:11px;")
+        self._sub.setWordWrap(True)
+        title_col.addWidget(self._sub)
+        self._pills = QHBoxLayout()
+        self._pills.setSpacing(6); self._pills.setContentsMargins(0, 4, 0, 0)
+        ph = QWidget(); ph.setLayout(self._pills); title_col.addWidget(ph)
+        tw = QWidget(); tw.setLayout(title_col)
+        header.addWidget(tw, 1)
+
+        self._btn_export = _ghost_button("⤓ Export…", accent=True)
+        self._btn_export.setEnabled(False)
+        menu = QMenu(self._btn_export)
+        a_csv  = menu.addAction("Comparison CSV…")
+        a_pmcsv = menu.addAction("Per-model CSV…")
+        a_json = menu.addAction("Sweep JSON…")
+        a_pkg  = menu.addAction("Save full bundle (folder)…")
+        a_csv .triggered.connect(lambda: self.export_requested.emit("comparison_csv"))
+        a_pmcsv.triggered.connect(lambda: self.export_requested.emit("per_model_csv"))
+        a_json.triggered.connect(lambda: self.export_requested.emit("summary_json"))
+        a_pkg .triggered.connect(lambda: self.export_requested.emit("bundle"))
+        self._btn_export.setMenu(menu)
+        self._btn_export.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
+        header.addWidget(self._btn_export, 0, Qt.AlignmentFlag.AlignTop)
+        outer.addLayout(header)
+
+        # ── Progress strip ───────────────────────────────────────────
+        self._progress = QProgressBar()
+        self._progress.setRange(0, 1)
+        self._progress.setValue(0)
+        self._progress.setTextVisible(True)
+        self._progress.setStyleSheet(
+            f"QProgressBar {{ border:1px solid {C_BORDER2}; border-radius:5px;"
+            f"  background:{C_PANEL}; color:{C_TEXT}; padding:1px;"
+            f"  text-align:center; font-size:11px; }}"
+            f"QProgressBar::chunk {{ background:{C_ACCENT}; border-radius:4px; }}"
+        )
+        outer.addWidget(self._progress)
+
+        # ── Tabs: Comparison / Per-model / Log ──────────────────────
+        self._tabs = QTabWidget(); self._tabs.setDocumentMode(True)
+        outer.addWidget(self._tabs, 1)
+
+        self._comparison = _ComparisonTable()
+        self._per_model  = _PerModelTable()
+        self._tabs.addTab(self._comparison, "Comparison")
+        self._tabs.addTab(self._per_model,  "Per-model")
+
+        self._log = QTextEdit(); self._log.setReadOnly(True)
+        self._log.setStyleSheet(
+            f"QTextEdit {{ background:{C_PANEL}; color:{C_TEXT};"
+            f"  border:1px solid {C_BORDER2}; border-radius:7px;"
+            f"  font-family:'Menlo','DejaVu Sans Mono',monospace;"
+            f"  font-size:11px; padding:8px; }}"
+        )
+        self._tabs.addTab(self._log, "Live log")
+
+    # ── public API ──────────────────────────────────────────────────
+
+    def reset_for_sweep(self, total_runs: int, axis_label: str) -> None:
+        self._title.setText(f"Sweep over {total_runs} run(s)")
+        self._sub.setText(f"Comparison axis: {axis_label}.")
+        self._clear_pills()
+        self._pills.addWidget(_Pill(f"axis: {axis_label}"))
+        self._pills.addWidget(_Pill(f"{total_runs} run{'s' if total_runs != 1 else ''}"))
+        self._pills.addStretch(1)
+        self._progress.setRange(0, max(total_runs, 1))
+        self._progress.setValue(0)
+        self._progress.setFormat("preparing…")
+        self._comparison.set_rows([])
+        self._per_model.set_rows([])
+        self._log.clear()
+        self._btn_export.setEnabled(False)
+
+    def on_run_started(self, idx: int, total: int, label: str) -> None:
+        self._progress.setFormat(f"run {idx} / {total}  ·  {label}")
+
+    def on_run_finished(self, idx: int, total: int, label: str, _result: Any) -> None:
+        self._progress.setValue(idx)
+
+    def append_log(self, line: str) -> None:
+        self._log.append(line)
+        bar = self._log.verticalScrollBar()
+        bar.setValue(bar.maximum())
+
+    def show_completed_sweep(self, rows: List[Tuple[str, Dict[str, Any]]]) -> None:
+        self._comparison.set_rows(rows)
+        self._per_model.set_rows(rows)
+        self._progress.setFormat(f"done — {len(rows)} run(s)")
+        self._btn_export.setEnabled(True)
+
+    # ── helpers ─────────────────────────────────────────────────────
+
+    def _clear_pills(self) -> None:
+        while self._pills.count():
+            item = self._pills.takeAt(0)
+            w = item.widget()
+            if w is not None:
+                w.deleteLater()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Top-level merged tab
+# ═══════════════════════════════════════════════════════════════════════════
+
+class EvaluationTab(QWidget):
+    """
+    Single class that hosts all four evaluation modes.
+
+    The user picks an *evaluation type* from the dropdown at the top
+    and the relevant settings groups, picker, and results panel become
+    visible. Constructor signature is unchanged from the v2
+    ``EvaluationTab`` for drop-in wiring.
+
+    Public surface:
+      • ``EvaluationTab(data_manager)`` — same as before.
+      • ``result_ready``    Signal(:class:`EvaluationResult`) — fired
+                            after a Sessions / Games / Unity run.
+      • ``sweep_finished``  Signal(``list``) — fired after the CV
+                            sweep finishes; payload is
+                            ``[(label, RunResult), ...]``.
+      • ``refresh()`` — re-scan models, recordings, and CV subjects
+                       for all four modes.
+    """
+
+    result_ready    = Signal(object)   # EvaluationResult     (modes 1-3)
+    sweep_finished  = Signal(object)   # List[(label, RunResult)]  (mode 4)
+
+    # Selection-stack and results-stack page indices
+    _PICKER_PAGE_SESSIONS = 0
+    _PICKER_PAGE_GAMES    = 1
+    _PICKER_PAGE_UNITY    = 2
+    _PICKER_PAGE_CV       = 3
+    _RESULTS_PAGE_EVAL    = 0
+    _RESULTS_PAGE_CV      = 1
+
+    # CV "vary by" sub-stack page indices
+    _CV_AXIS_PAGE_NONE    = 0
+    _CV_AXIS_PAGE_MODEL   = 1
+    _CV_AXIS_PAGE_FEATURES = 2
+    _CV_AXIS_PAGE_SUBSET  = 3
+
+    def __init__(self, data_manager: Any, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._data_dir: Path = Path(getattr(data_manager, "data_dir", data_manager))
+        if not self._data_dir.exists():
+            log.warning("Data directory does not exist: %s", self._data_dir)
+
+        apply_app_style(self, theme="bright")
+
+        # Internal state for modes 1-3 (eval) and 4 (CV)
+        self._worker: Optional[Any] = None  # busy_overlay run_blocking handle
+        self._cv_bridge: Optional[_SweepProgressBridge] = None
+        self._cv_worker: Optional[_SweepWorker] = None
+        self._cv_completed_rows: List[Tuple[str, Dict[str, Any]]] = []
+        self._cv_completed_runs: List[Tuple[str, Any]] = []
+        self._cv_axis_label: str = "(none)"
+
+        # Default subset for CV mode (used when axis ≠ data_subset)
+        self._cv_default_subset: DataSubset = DataSubset(
+            name="default", subjects=[], domains=[],
+        )
+
+        # Build UI top-down
+        outer = QVBoxLayout(self); outer.setContentsMargins(12, 12, 12, 12); outer.setSpacing(12)
+
+        outer.addWidget(self._build_header())
+        outer.addWidget(self._build_type_picker_bar())
+
+        body = QSplitter(Qt.Orientation.Vertical)
+        body.addWidget(self._build_top_pane())
+        body.addWidget(self._build_results_pane())
+        body.setStretchFactor(0, 1); body.setStretchFactor(1, 1)
+        body.setSizes([460, 600])
+        body.setHandleWidth(6)
+        outer.addWidget(body, 1)
+
+        # Default mode
+        self._on_eval_type_changed()
+        self._refresh_cv_subjects()
+
+    # ──────────────────────────────────────────────────────────────────
+    # Header + type-picker bar
+    # ──────────────────────────────────────────────────────────────────
+
+    def _build_header(self) -> QWidget:
+        header = QFrame()
+        header.setStyleSheet(
+            f"QFrame {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
+            f"  stop:0 {C_PANEL}, stop:1 {C_CARD});"
+            f"  border:1px solid {C_BORDER}; border-radius:10px; }}"
+        )
+        h_lay = QHBoxLayout(header); h_lay.setContentsMargins(18, 12, 18, 12); h_lay.setSpacing(12)
+        title = QLabel("Evaluation")
+        ft = QFont(); ft.setPointSize(16); ft.setBold(True); title.setFont(ft)
+        title.setStyleSheet(f"color:{C_ACCENT};")
+        h_lay.addWidget(title)
+        sub = QLabel("Sessions  ·  game recordings  ·  Unity threshold  ·  cross-validation")
+        sub.setStyleSheet(f"color:{C_MUTED}; font-size:11px;")
+        h_lay.addWidget(sub)
+        h_lay.addStretch(1)
+        self._data_dir_lbl = QLabel(str(self._data_dir))
+        self._data_dir_lbl.setStyleSheet(
+            f"color:{C_MUTED}; font-size:10px; "
+            f"font-family:'Menlo','DejaVu Sans Mono',monospace;")
+        self._data_dir_lbl.setToolTip("Active data directory")
+        h_lay.addWidget(self._data_dir_lbl)
+        return header
+
+    def _build_type_picker_bar(self) -> QWidget:
+        """
+        Single-row picker that drives the whole tab.
+
+        This is the *only* mode-switching control. Picking a different
+        type rotates the selection panel, the visible group boxes, the
+        Run-button label, and the results view in lock-step.
+        """
+        bar = QFrame()
+        bar.setStyleSheet(
+            f"QFrame {{ background:{C_PANEL}; border:1px solid {C_BORDER2};"
+            f"  border-radius:8px; }}"
+        )
+        lay = QHBoxLayout(bar); lay.setContentsMargins(14, 10, 14, 10); lay.setSpacing(10)
+
+        lbl = QLabel("Evaluation type:")
+        f = QFont(); f.setBold(True); lbl.setFont(f)
+        lbl.setStyleSheet(f"color:{C_ACCENT2}; letter-spacing:0.04em;"
+                          f"font-size:11px;")
+        lay.addWidget(lbl)
+
+        self._eval_type_combo = QComboBox()
+        for key, label in _EVAL_TYPE_LABELS:
+            self._eval_type_combo.addItem(label, key)
+        self._eval_type_combo.setCurrentIndex(0)
+        self._eval_type_combo.setMinimumWidth(360)
+        self._eval_type_combo.currentIndexChanged.connect(self._on_eval_type_changed)
+        lay.addWidget(self._eval_type_combo)
+
+        lay.addStretch(1)
+
+        # A small hint that updates with the chosen mode
+        self._type_hint = QLabel("")
+        self._type_hint.setStyleSheet(f"color:{C_MUTED}; font-size:10px;")
+        lay.addWidget(self._type_hint)
+
+        return bar
+
+    # ──────────────────────────────────────────────────────────────────
+    # Top pane: selection (left) | settings (right)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _build_top_pane(self) -> QWidget:
+        split = QSplitter(Qt.Orientation.Horizontal)
+        split.addWidget(self._build_selection_stack())
+        split.addWidget(self._build_settings_column())
+        split.setStretchFactor(0, 5); split.setStretchFactor(1, 6)
+        split.setSizes([520, 660])
+        return split
+
+    def _build_selection_stack(self) -> QWidget:
+        """
+        Left-side stacked picker. One page per evaluation type.
+
+        Sessions / Games / Unity get a dedicated tree picker; the CV
+        page contains an inner stack that mirrors the CV "vary by"
+        combo (None / Model / Features / DataSubset).
+        """
+        self._selection_stack = QStackedWidget()
+
+        # Pages for evaluation modes
+        self._sessions_picker = _SessionPicker(self._data_dir)
+        self._games_picker    = _GamePicker(self._data_dir)
+        self._unity_picker    = _UnityPicker(self._data_dir)
+
+        # Wrap each picker in a thin frame so they all align
+        self._selection_stack.addWidget(self._wrap_picker(
+            self._sessions_picker,
+            "Pick training sessions to evaluate."))
+        self._selection_stack.addWidget(self._wrap_picker(
+            self._games_picker,
+            "Pick game recordings to evaluate."))
+        self._selection_stack.addWidget(self._wrap_picker(
+            self._unity_picker,
+            "Pick Unity recordings to evaluate."))
+
+        # CV page — inner stack swapped by the "vary by" combo (which
+        # lives in the right-side settings column).
+        self._cv_axis_stack = QStackedWidget()
+
+        # 0: none — single run, no axis values to pick
+        none_w = QWidget(); none_l = QVBoxLayout(none_w)
+        none_l.setContentsMargins(8, 8, 8, 8)
+        none_msg = QLabel(
+            "No comparison axis selected.\n\n"
+            "The single-run mode runs one validation experiment using the "
+            "default model, features, and data subset configured on the "
+            "right. Pick a comparison axis from the «Vary by» combo to "
+            "sweep over multiple values."
+        )
+        none_msg.setWordWrap(True)
+        none_msg.setStyleSheet(f"color:{C_MUTED}; font-size:11px; padding:20px;")
+        none_l.addWidget(none_msg); none_l.addStretch(1)
+        self._cv_axis_stack.addWidget(none_w)
+
+        # 1, 2, 3: model / features / subsets
+        self._cv_model_axis    = _ModelAxisPanel()
+        self._cv_features_axis = _FeaturesAxisPanel()
+        self._cv_subset_axis   = _DataSubsetAxisPanel(available_subjects=[])
+        self._cv_axis_stack.addWidget(self._cv_model_axis)
+        self._cv_axis_stack.addWidget(self._cv_features_axis)
+        self._cv_axis_stack.addWidget(self._cv_subset_axis)
+
+        cv_wrap = QWidget()
+        cv_lay  = QVBoxLayout(cv_wrap); cv_lay.setContentsMargins(0, 0, 0, 0); cv_lay.setSpacing(8)
+        cv_title = _styled_group("Comparison values")
+        cv_title_lay = QVBoxLayout(); cv_title_lay.addWidget(self._cv_axis_stack)
+        cv_title.setLayout(cv_title_lay)
+        cv_lay.addWidget(cv_title, 1)
+
+        self._selection_stack.addWidget(cv_wrap)
+        return self._selection_stack
+
+    @staticmethod
+    def _wrap_picker(picker: QWidget, hint: str) -> QWidget:
+        """Wrap a tree picker in a labelled card so all modes look uniform."""
+        wrap = QWidget()
+        lay = QVBoxLayout(wrap); lay.setContentsMargins(0, 0, 0, 0); lay.setSpacing(6)
+        hint_lbl = QLabel(hint)
+        hint_lbl.setStyleSheet(f"color:{C_MUTED}; font-size:11px;")
+        hint_lbl.setWordWrap(True)
+        lay.addWidget(hint_lbl)
+        lay.addWidget(picker, 1)
+        return wrap
+
+    def _build_settings_column(self) -> QWidget:
+        """
+        Single flat scroll column holding ALL group-boxes for all four
+        modes. Each group-box is shown/hidden as the type combo changes.
+
+        Group-boxes are built in helper methods that store their own
+        state as instance attributes so the run handlers can read them
+        directly without delegate signals.
+        """
+        # ── Sessions-mode groups ─────────────────────────────────────
+        self._g_sessions_model     = self._build_g_sessions_model()
+        self._g_sessions_windowing = self._build_g_sessions_windowing()
+        self._g_sessions_preprocessing = self._build_g_sessions_preprocessing()
+        self._g_sessions_features  = self._build_g_sessions_features()
+
+        # ── Games-mode groups ────────────────────────────────────────
+        self._g_games_source   = self._build_g_games_source()
+        self._g_games_filter   = self._build_g_games_filter()
+        self._g_games_replay   = self._build_g_games_replay()
+
+        # ── Unity-mode groups ────────────────────────────────────────
+        self._g_unity_about    = self._build_g_unity_about()
+        self._g_unity_objective = self._build_g_unity_objective()
+        self._g_unity_rms      = self._build_g_unity_rms()
+
+        # ── CV-mode groups ───────────────────────────────────────────
+        self._g_cv_axis        = self._build_g_cv_axis()
+        self._g_cv_strategy    = self._build_g_cv_strategy()
+        self._g_cv_windowing   = self._build_g_cv_windowing()
+        self._g_cv_defaults    = self._build_g_cv_defaults()
+
+        # ── Run row (bottom of the scroll) ───────────────────────────
+        # The Run button label changes per mode. Cancel is only useful
+        # for CV (a sweep is the only thing that runs long enough to
+        # need cancellation; the eval modes block via run_blocking and
+        # finish quickly).
+        self._btn_features = _ghost_button("Rank features (LDA)", accent=True)
+        self._btn_features.clicked.connect(self._on_run_features_clicked)
+        self._btn_run    = _primary_button("▶  Run evaluation")
+        self._btn_run.clicked.connect(self._on_run_clicked)
+        self._btn_cancel = _ghost_button("Cancel")
+        self._btn_cancel.setEnabled(False)
+        self._btn_cancel.clicked.connect(self._on_cancel_clicked)
+
+        run_row = QHBoxLayout(); run_row.setSpacing(8)
+        run_row.addWidget(self._btn_features)
+        run_row.addStretch(1)
+        run_row.addWidget(self._btn_cancel)
+        run_row.addWidget(self._btn_run)
+        run_holder = QWidget(); run_holder.setLayout(run_row)
+
+        # Stack ALL groups in one scroll, hide based on mode
+        all_groups = [
+            self._g_sessions_model, self._g_sessions_windowing,
+            self._g_sessions_preprocessing, self._g_sessions_features,
+            self._g_games_source, self._g_games_filter, self._g_games_replay,
+            self._g_unity_about, self._g_unity_objective, self._g_unity_rms,
+            self._g_cv_axis, self._g_cv_strategy, self._g_cv_windowing,
+            self._g_cv_defaults,
+        ]
+        return _settings_scroll_host(all_groups, run_holder)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Settings group builders — Sessions mode
+    # ──────────────────────────────────────────────────────────────────
+
+    def _build_g_sessions_model(self) -> QGroupBox:
+        g = _styled_group("Model  (sessions)")
+        gm_lay = _form()
+        self._sessions_model_combo = QComboBox(); self._sessions_model_combo.setMinimumWidth(280)
+        self._refresh_sessions_models()
         ref_btn = _ghost_button("⟳"); ref_btn.setToolTip("Re-scan data/models")
-        ref_btn.clicked.connect(self._refresh_models)
+        ref_btn.clicked.connect(self._refresh_sessions_models)
         model_row = QHBoxLayout(); model_row.setContentsMargins(0,0,0,0); model_row.setSpacing(6)
-        model_row.addWidget(self._model_combo, 1); model_row.addWidget(ref_btn)
+        model_row.addWidget(self._sessions_model_combo, 1); model_row.addWidget(ref_btn)
         mw = QWidget(); mw.setLayout(model_row)
         gm_lay.addRow("Saved model:", mw)
-        g_model.setLayout(gm_lay)
+        g.setLayout(gm_lay)
+        return g
 
-        # Group: Windowing
-        g_win = _styled_group("Windowing")
-        gw_lay = _form_layout()
-        self._win_spin = QSpinBox(); self._win_spin.setRange(0, 5000); self._win_spin.setSingleStep(50)
-        self._win_spin.setSpecialValueText("(use model)"); self._win_spin.setSuffix(" ms")
-        gw_lay.addRow("Window length:", self._win_spin)
-        self._stride_spin = QSpinBox(); self._stride_spin.setRange(1, 5000)
-        self._stride_spin.setValue(50); self._stride_spin.setSuffix(" ms")
-        gw_lay.addRow("Window stride:", self._stride_spin)
-        g_win.setLayout(gw_lay)
+    def _build_g_sessions_windowing(self) -> QGroupBox:
+        g = _styled_group("Windowing  (sessions)")
+        gw_lay = _form()
+        self._sessions_win_spin = QSpinBox(); self._sessions_win_spin.setRange(0, 5000); self._sessions_win_spin.setSingleStep(50)
+        self._sessions_win_spin.setSpecialValueText("(use model)"); self._sessions_win_spin.setSuffix(" ms")
+        gw_lay.addRow("Window length:", self._sessions_win_spin)
+        self._sessions_stride_spin = QSpinBox(); self._sessions_stride_spin.setRange(1, 5000)
+        self._sessions_stride_spin.setValue(50); self._sessions_stride_spin.setSuffix(" ms")
+        gw_lay.addRow("Window stride:", self._sessions_stride_spin)
+        g.setLayout(gw_lay)
+        return g
 
-        # Group: Preprocessing
-        g_pre = _styled_group("Preprocessing")
-        gp_lay = _form_layout()
-        self._bad_ch_combo = QComboBox()
-        self._bad_ch_combo.addItem("Interpolate", "interpolate")
-        self._bad_ch_combo.addItem("Zero",        "zero")
-        gp_lay.addRow("Bad channels:", self._bad_ch_combo)
-        self._rotation_chk = QCheckBox("Apply per-session rotation")
-        self._rotation_chk.setChecked(True)
-        gp_lay.addRow("", self._rotation_chk)
-        self._invalid_chk = QCheckBox("Include trials marked invalid")
-        gp_lay.addRow("", self._invalid_chk)
-        self._per_session_chk = QCheckBox("Show per-session breakdown in notes")
-        self._per_session_chk.setChecked(True)
-        gp_lay.addRow("", self._per_session_chk)
-        g_pre.setLayout(gp_lay)
+    def _build_g_sessions_preprocessing(self) -> QGroupBox:
+        g = _styled_group("Preprocessing  (sessions)")
+        gp_lay = _form()
+        self._sessions_bad_ch_combo = QComboBox()
+        self._sessions_bad_ch_combo.addItem("Interpolate", "interpolate")
+        self._sessions_bad_ch_combo.addItem("Zero",        "zero")
+        gp_lay.addRow("Bad channels:", self._sessions_bad_ch_combo)
+        self._sessions_rotation_chk = QCheckBox("Apply per-session rotation")
+        self._sessions_rotation_chk.setChecked(True)
+        gp_lay.addRow("", self._sessions_rotation_chk)
+        self._sessions_invalid_chk = QCheckBox("Include trials marked invalid")
+        gp_lay.addRow("", self._sessions_invalid_chk)
+        self._sessions_per_session_chk = QCheckBox("Show per-session breakdown in notes")
+        self._sessions_per_session_chk.setChecked(True)
+        gp_lay.addRow("", self._sessions_per_session_chk)
+        g.setLayout(gp_lay)
+        return g
 
-        # Group: Feature ranking
-        g_feat = _styled_group("Optional · feature ranking")
+    def _build_g_sessions_features(self) -> QGroupBox:
+        g = _styled_group("Optional · feature ranking  (sessions)")
         gf = QVBoxLayout(); gf.setSpacing(8)
         info = QLabel("Score each feature individually with an LDA, in addition to "
                       "running the saved model. Useful as a quick 'which feature carries "
@@ -1283,233 +3019,97 @@ class _SessionsPanel(QWidget):
         info.setStyleSheet(f"color:{C_MUTED}; font-size:10px;")
         info.setWordWrap(True); gf.addWidget(info)
         feat_grid = QHBoxLayout(); feat_grid.setSpacing(10)
-        self._feat_choices: List[QCheckBox] = []
+        self._sessions_feat_choices: List[QCheckBox] = []
         for f in ("rms", "mav", "wl", "zc", "ssc", "var", "iemg"):
             cb = QCheckBox(f); cb.setChecked(f in {"rms", "mav", "wl"})
-            self._feat_choices.append(cb); feat_grid.addWidget(cb)
+            self._sessions_feat_choices.append(cb); feat_grid.addWidget(cb)
         feat_grid.addStretch(1)
         gf.addLayout(feat_grid)
-        feat_btn_row = QHBoxLayout(); feat_btn_row.addStretch(1)
-        self._btn_features = _ghost_button("Rank features (LDA)", accent=True)
-        self._btn_features.clicked.connect(self._on_features_clicked)
-        feat_btn_row.addWidget(self._btn_features)
-        gf.addLayout(feat_btn_row)
-        g_feat.setLayout(gf)
-
-        self._btn_run = _primary_button("▶  Run evaluation")
-        self._btn_run.clicked.connect(self._on_run_clicked)
-
-        right = _settings_scroll_host([g_model, g_win, g_pre, g_feat], self._btn_run)
-        outer.addWidget(right, 6)
+        # Note: the "Rank features (LDA)" button lives in the run row at
+        # the bottom, not inside this group, so it stays visible even
+        # when this group is scrolled past.
+        g.setLayout(gf)
+        return g
 
     # ──────────────────────────────────────────────────────────────────
+    # Settings group builders — Games mode
+    # ──────────────────────────────────────────────────────────────────
 
-    def _refresh_models(self) -> None:
-        prev = self._model_combo.currentText()
-        self._model_combo.clear()
-        names = _model_dirs(self._data_dir)
-        if not names:
-            self._model_combo.addItem("(no models found in data/models)", None)
-            self._model_combo.setEnabled(False)
-        else:
-            self._model_combo.setEnabled(True)
-            for n in names:
-                self._model_combo.addItem(n, n)
-            if prev and prev in names:
-                self._model_combo.setCurrentText(prev)
+    def _build_g_games_source(self) -> QGroupBox:
+        g = _styled_group("Prediction source  (games)")
+        gs = _form()
+        self._games_mode_combo = QComboBox()
+        self._games_mode_combo.addItem("Logged predictions  (use Pred* columns)", "logged")
+        self._games_mode_combo.addItem("Replay model on EMG   (re-run a saved model)", "replay")
+        self._games_mode_combo.currentIndexChanged.connect(self._on_games_source_changed)
+        gs.addRow("Source:", self._games_mode_combo)
 
-    def refresh(self) -> None:
-        self._picker.refresh(); self._refresh_models()
+        self._games_truth_combo = QComboBox()
+        # Order reflects post-migration semantics: RequestedGesture is the
+        # cleanest multi-class ground truth (with "rest" as a real class
+        # corresponding to walking-between-animals phases).
+        self._games_truth_combo.addItem("RequestedGesture  (multi-class — recommended)", TRUTH_REQUESTED)
+        self._games_truth_combo.addItem("GroundTruthActive  (binary, with camera-blocking grace)", TRUTH_ACTIVE)
+        self._games_truth_combo.addItem("RawGroundTruth  (binary, raw Unity flag)", TRUTH_RAW)
+        gs.addRow("Ground truth:", self._games_truth_combo)
+        g.setLayout(gs)
+        return g
 
-    def _settings_from_ui(self) -> Optional[SessionEvalSettings]:
-        model_name = self._model_combo.currentData()
-        if not model_name:
-            QMessageBox.warning(self, "No model",
-                                "No saved model is available — train a model first.")
-            return None
-        return SessionEvalSettings(
-            model_name=str(model_name),
-            window_size_ms=self._win_spin.value() or None,
-            window_stride_ms=int(self._stride_spin.value()),
-            apply_rotation=self._rotation_chk.isChecked(),
-            bad_channel_mode=self._bad_ch_combo.currentData(),
-            include_invalid=self._invalid_chk.isChecked(),
-            per_session_breakdown=self._per_session_chk.isChecked(),
+    def _build_g_games_filter(self) -> QGroupBox:
+        g = _styled_group("Filtering  (games)")
+        gf = _form()
+        self._games_drop_chk = QCheckBox(
+            "Restrict to active-gesture frames  (drop walking-phase rest periods)"
         )
-
-    def _on_run_clicked(self) -> None:
-        recs = self._picker.selected()
-        if not recs:
-            QMessageBox.information(self, "No sessions",
-                                    "Select at least one session on the left.")
-            return
-        s = self._settings_from_ui()
-        if s is None:
-            return
-        self.run_clicked.emit(s, recs)
-
-    def _on_features_clicked(self) -> None:
-        recs = self._picker.selected()
-        if not recs:
-            QMessageBox.information(self, "No sessions",
-                                    "Select at least one session on the left.")
-            return
-        feats = [c.text() for c in self._feat_choices if c.isChecked()]
-        if not feats:
-            QMessageBox.information(self, "No features",
-                                    "Select at least one feature to rank.")
-            return
-        self.features_clicked.emit(feats, recs)
-
-
-# ── Game recordings panel ──────────────────────────────────────────────────
-
-class _GamesPanel(QWidget):
-
-    run_clicked = Signal(GameEvalSettings, list)
-
-    def __init__(self, data_dir: Path, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self._data_dir = Path(data_dir)
-
-        outer = QHBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(14)
-
-        self._picker = _GamePicker(self._data_dir)
-        outer.addWidget(self._picker, 5)
-
-        # Group: source mode
-        g_src = _styled_group("Prediction source")
-        gs = _form_layout()
-        self._mode_combo = QComboBox()
-        self._mode_combo.addItem("Logged predictions  (use Pred* columns)", "logged")
-        self._mode_combo.addItem("Replay model on EMG   (re-run a saved model)", "replay")
-        self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
-        gs.addRow("Source:", self._mode_combo)
-
-        self._truth_combo = QComboBox()
-        self._truth_combo.addItem("RawGroundTruth  (multi-class — preferred)", TRUTH_RAW)
-        self._truth_combo.addItem("GroundTruthActive  (binary)",                TRUTH_ACTIVE)
-        self._truth_combo.addItem("RequestedGesture  (multi-class fallback)",   TRUTH_REQUESTED)
-        gs.addRow("Ground truth:", self._truth_combo)
-        g_src.setLayout(gs)
-
-        # Group: Filtering
-        g_filter = _styled_group("Filtering")
-        gf = _form_layout()
-        self._drop_chk = QCheckBox("Drop frames where the game wasn't asking for a gesture")
-        self._drop_chk.setChecked(True)
-        gf.addRow("", self._drop_chk)
-        self._min_conf_chk = QCheckBox("Filter by minimum confidence")
-        self._min_conf_spin = QDoubleSpinBox()
-        self._min_conf_spin.setRange(0.0, 1.0); self._min_conf_spin.setSingleStep(0.05)
-        self._min_conf_spin.setValue(0.5); self._min_conf_spin.setEnabled(False)
-        self._min_conf_chk.toggled.connect(self._min_conf_spin.setEnabled)
+        self._games_drop_chk.setToolTip(
+            "When OFF (default): the rest periods between animals are evaluated "
+            "as legitimate 'rest' (label 0) ground truth — false fists during "
+            "walking count as errors.\n"
+            "When ON: only frames where the game was actively asking for a "
+            "specific gesture are evaluated. Useful for measuring per-gesture "
+            "accuracy in isolation, ignoring rest-period behaviour."
+        )
+        self._games_drop_chk.setChecked(False)
+        gf.addRow("", self._games_drop_chk)
+        self._games_min_conf_chk = QCheckBox("Filter by minimum confidence")
+        self._games_min_conf_spin = QDoubleSpinBox()
+        self._games_min_conf_spin.setRange(0.0, 1.0); self._games_min_conf_spin.setSingleStep(0.05)
+        self._games_min_conf_spin.setValue(0.5); self._games_min_conf_spin.setEnabled(False)
+        self._games_min_conf_chk.toggled.connect(self._games_min_conf_spin.setEnabled)
         conf_row = QHBoxLayout(); conf_row.setContentsMargins(0,0,0,0); conf_row.setSpacing(8)
-        conf_row.addWidget(self._min_conf_chk); conf_row.addWidget(self._min_conf_spin); conf_row.addStretch(1)
+        conf_row.addWidget(self._games_min_conf_chk); conf_row.addWidget(self._games_min_conf_spin); conf_row.addStretch(1)
         cw = QWidget(); cw.setLayout(conf_row)
         gf.addRow("", cw)
-        self._per_chk = QCheckBox("Show per-recording breakdown in notes")
-        self._per_chk.setChecked(True)
-        gf.addRow("", self._per_chk)
-        g_filter.setLayout(gf)
+        self._games_per_chk = QCheckBox("Show per-recording breakdown in notes")
+        self._games_per_chk.setChecked(True)
+        gf.addRow("", self._games_per_chk)
+        g.setLayout(gf)
+        return g
 
-        # Group: replay options (model + window)
-        self._g_replay = _styled_group("Replay options")
-        gr = _form_layout()
-        self._model_combo = QComboBox(); self._refresh_models()
-        ref_btn = _ghost_button("⟳"); ref_btn.clicked.connect(self._refresh_models)
+    def _build_g_games_replay(self) -> QGroupBox:
+        g = _styled_group("Replay options  (games)")
+        gr = _form()
+        self._games_model_combo = QComboBox(); self._refresh_games_models()
+        ref_btn = _ghost_button("⟳"); ref_btn.clicked.connect(self._refresh_games_models)
         mr = QHBoxLayout(); mr.setContentsMargins(0,0,0,0); mr.setSpacing(6)
-        mr.addWidget(self._model_combo, 1); mr.addWidget(ref_btn)
+        mr.addWidget(self._games_model_combo, 1); mr.addWidget(ref_btn)
         mw = QWidget(); mw.setLayout(mr)
         gr.addRow("Saved model:", mw)
-        self._win_spin = QSpinBox(); self._win_spin.setRange(0, 5000); self._win_spin.setSingleStep(50)
-        self._win_spin.setSpecialValueText("(use model)"); self._win_spin.setSuffix(" ms")
-        gr.addRow("Window length:", self._win_spin)
-        self._stride_spin = QSpinBox(); self._stride_spin.setRange(1, 5000); self._stride_spin.setValue(50)
-        self._stride_spin.setSuffix(" ms")
-        gr.addRow("Window stride:", self._stride_spin)
-        self._g_replay.setLayout(gr)
-
-        self._btn_run = _primary_button("▶  Run evaluation")
-        self._btn_run.clicked.connect(self._on_run_clicked)
-
-        right = _settings_scroll_host([g_src, g_filter, self._g_replay], self._btn_run)
-        outer.addWidget(right, 6)
-
-        self._on_mode_changed()
+        self._games_win_spin = QSpinBox(); self._games_win_spin.setRange(0, 5000); self._games_win_spin.setSingleStep(50)
+        self._games_win_spin.setSpecialValueText("(use model)"); self._games_win_spin.setSuffix(" ms")
+        gr.addRow("Window length:", self._games_win_spin)
+        self._games_stride_spin = QSpinBox(); self._games_stride_spin.setRange(1, 5000); self._games_stride_spin.setValue(50)
+        self._games_stride_spin.setSuffix(" ms")
+        gr.addRow("Window stride:", self._games_stride_spin)
+        g.setLayout(gr)
+        return g
 
     # ──────────────────────────────────────────────────────────────────
+    # Settings group builders — Unity mode
+    # ──────────────────────────────────────────────────────────────────
 
-    def _refresh_models(self) -> None:
-        prev = self._model_combo.currentText()
-        self._model_combo.clear()
-        names = _model_dirs(self._data_dir)
-        if not names:
-            self._model_combo.addItem("(no models found)", None)
-            self._model_combo.setEnabled(False)
-        else:
-            self._model_combo.setEnabled(True)
-            for n in names:
-                self._model_combo.addItem(n, n)
-            if prev and prev in names:
-                self._model_combo.setCurrentText(prev)
-
-    def refresh(self) -> None:
-        self._picker.refresh(); self._refresh_models()
-
-    def _on_mode_changed(self) -> None:
-        is_replay = (self._mode_combo.currentData() == "replay")
-        self._g_replay.setVisible(is_replay)
-
-    def _settings_from_ui(self) -> Optional[GameEvalSettings]:
-        mode = self._mode_combo.currentData()
-        s = GameEvalSettings(
-            mode=mode,
-            truth_source=self._truth_combo.currentData(),
-            drop_inactive_truth_frames=self._drop_chk.isChecked(),
-            min_confidence=(self._min_conf_spin.value() if self._min_conf_chk.isChecked() else None),
-            per_recording_breakdown=self._per_chk.isChecked(),
-        )
-        if mode == "replay":
-            model_name = self._model_combo.currentData()
-            if not model_name:
-                QMessageBox.warning(self, "No model",
-                                    "Replay mode requires a saved model.")
-                return None
-            s.model_name = str(model_name)
-            s.window_size_ms = self._win_spin.value() or None
-            s.window_stride_ms = int(self._stride_spin.value())
-        return s
-
-    def _on_run_clicked(self) -> None:
-        recs = self._picker.selected()
-        if not recs:
-            QMessageBox.information(self, "No recordings",
-                                    "Select at least one game recording on the left.")
-            return
-        s = self._settings_from_ui()
-        if s is None:
-            return
-        self.run_clicked.emit(s, recs)
-
-
-# ── Unity panel ────────────────────────────────────────────────────────────
-
-class _UnityPanel(QWidget):
-
-    run_clicked = Signal(UnityEvalSettings, list)
-
-    def __init__(self, data_dir: Path, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self._data_dir = Path(data_dir)
-
-        outer = QHBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(14)
-
-        self._picker = _UnityPicker(self._data_dir)
-        outer.addWidget(self._picker, 5)
-
-        # Group: about
-        g_about = _styled_group("Threshold model")
+    def _build_g_unity_about(self) -> QGroupBox:
+        g = _styled_group("Threshold model  (unity)")
         ga = QVBoxLayout(); ga.setSpacing(6)
         info = QLabel(
             "Unity recordings use a binary RMS-threshold model: "
@@ -1520,197 +3120,564 @@ class _UnityPanel(QWidget):
         )
         info.setWordWrap(True); info.setStyleSheet(f"color:{C_MUTED}; font-size:11px; padding:2px;")
         ga.addWidget(info)
-        g_about.setLayout(ga)
+        g.setLayout(ga)
+        return g
 
-        # Group: objective
-        g_obj = _styled_group("Threshold objective")
-        go = _form_layout()
-        self._objective_combo = QComboBox()
-        self._objective_combo.addItem("Maximise F1",         "f1")
-        self._objective_combo.addItem("Maximise Youden's J", "youden")
-        self._objective_combo.addItem("Maximise accuracy",   "accuracy")
-        go.addRow("Objective:", self._objective_combo)
-        self._fixed_chk = QCheckBox("Use a fixed threshold instead")
-        self._fixed_spin = QDoubleSpinBox()
-        self._fixed_spin.setRange(0.0, 1e6); self._fixed_spin.setDecimals(8)
-        self._fixed_spin.setSingleStep(1e-5); self._fixed_spin.setValue(1e-4)
-        self._fixed_spin.setEnabled(False)
-        self._fixed_chk.toggled.connect(self._fixed_spin.setEnabled)
+    def _build_g_unity_objective(self) -> QGroupBox:
+        g = _styled_group("Threshold objective  (unity)")
+        go = _form()
+        self._unity_objective_combo = QComboBox()
+        self._unity_objective_combo.addItem("Maximise F1",         "f1")
+        self._unity_objective_combo.addItem("Maximise Youden's J", "youden")
+        self._unity_objective_combo.addItem("Maximise accuracy",   "accuracy")
+        go.addRow("Objective:", self._unity_objective_combo)
+        self._unity_fixed_chk = QCheckBox("Use a fixed threshold instead")
+        self._unity_fixed_spin = QDoubleSpinBox()
+        self._unity_fixed_spin.setRange(0.0, 1e6); self._unity_fixed_spin.setDecimals(8)
+        self._unity_fixed_spin.setSingleStep(1e-5); self._unity_fixed_spin.setValue(1e-4)
+        self._unity_fixed_spin.setEnabled(False)
+        self._unity_fixed_chk.toggled.connect(self._unity_fixed_spin.setEnabled)
         fixed_row = QHBoxLayout(); fixed_row.setContentsMargins(0,0,0,0); fixed_row.setSpacing(8)
-        fixed_row.addWidget(self._fixed_chk); fixed_row.addWidget(self._fixed_spin); fixed_row.addStretch(1)
+        fixed_row.addWidget(self._unity_fixed_chk); fixed_row.addWidget(self._unity_fixed_spin); fixed_row.addStretch(1)
         fw = QWidget(); fw.setLayout(fixed_row)
         go.addRow("Fixed:", fw)
-        self._n_thresh_spin = QSpinBox(); self._n_thresh_spin.setRange(20, 1000); self._n_thresh_spin.setValue(200)
-        go.addRow("Sweep points:", self._n_thresh_spin)
-        g_obj.setLayout(go)
+        self._unity_n_thresh_spin = QSpinBox(); self._unity_n_thresh_spin.setRange(20, 1000); self._unity_n_thresh_spin.setValue(200)
+        go.addRow("Sweep points:", self._unity_n_thresh_spin)
+        g.setLayout(go)
+        return g
 
-        # Group: computed RMS settings
-        g_rms = _styled_group("Computed-RMS  (converted sessions only)")
-        gr = _form_layout()
+    def _build_g_unity_rms(self) -> QGroupBox:
+        g = _styled_group("Computed-RMS  (unity, converted sessions only)")
+        gr = _form()
         rms_info = QLabel("These settings only apply when the source is a "
                            "converted Unity session — for raw Unity CSVs the "
                            "logged RMS column is used directly.")
         rms_info.setWordWrap(True); rms_info.setStyleSheet(f"color:{C_MUTED}; font-size:10px;")
         gr.addRow(rms_info)
-        self._rms_win_spin = QSpinBox(); self._rms_win_spin.setRange(1, 5000); self._rms_win_spin.setValue(100)
-        self._rms_win_spin.setSuffix(" ms")
-        gr.addRow("RMS window:", self._rms_win_spin)
-        self._rms_stride_spin = QSpinBox(); self._rms_stride_spin.setRange(1, 5000); self._rms_stride_spin.setValue(25)
-        self._rms_stride_spin.setSuffix(" ms")
-        gr.addRow("RMS stride:", self._rms_stride_spin)
-        self._active_label_spin = QSpinBox(); self._active_label_spin.setRange(0, 100); self._active_label_spin.setValue(1)
-        gr.addRow("Active label id:", self._active_label_spin)
-        g_rms.setLayout(gr)
+        self._unity_rms_win_spin = QSpinBox(); self._unity_rms_win_spin.setRange(1, 5000); self._unity_rms_win_spin.setValue(100)
+        self._unity_rms_win_spin.setSuffix(" ms")
+        gr.addRow("RMS window:", self._unity_rms_win_spin)
+        self._unity_rms_stride_spin = QSpinBox(); self._unity_rms_stride_spin.setRange(1, 5000); self._unity_rms_stride_spin.setValue(25)
+        self._unity_rms_stride_spin.setSuffix(" ms")
+        gr.addRow("RMS stride:", self._unity_rms_stride_spin)
+        self._unity_active_label_spin = QSpinBox(); self._unity_active_label_spin.setRange(0, 100); self._unity_active_label_spin.setValue(1)
+        gr.addRow("Active label id:", self._unity_active_label_spin)
+        g.setLayout(gr)
+        return g
 
-        self._btn_run = _primary_button("▶  Run evaluation")
-        self._btn_run.clicked.connect(self._on_run_clicked)
+    # ──────────────────────────────────────────────────────────────────
+    # Settings group builders — Cross-validation mode
+    # ──────────────────────────────────────────────────────────────────
 
-        right = _settings_scroll_host([g_about, g_obj, g_rms], self._btn_run)
-        outer.addWidget(right, 6)
+    def _build_g_cv_axis(self) -> QGroupBox:
+        g = _styled_group("Comparison axis  (cv)")
+        ga = _form()
+        self._cv_axis_combo = QComboBox()
+        self._cv_axis_combo.addItem("Single run  (no comparison)",   "none")
+        self._cv_axis_combo.addItem("Vary by model",                 "model")
+        self._cv_axis_combo.addItem("Vary by feature set",           "features")
+        self._cv_axis_combo.addItem("Vary by data subset",           "data_subset")
+        self._cv_axis_combo.currentIndexChanged.connect(self._on_cv_axis_changed)
+        ga.addRow("Vary by:", self._cv_axis_combo)
 
+        self._cv_name_edit = QLineEdit("cv_sweep")
+        ga.addRow("Run name:", self._cv_name_edit)
+        self._cv_seed_spin = QSpinBox(); self._cv_seed_spin.setRange(0, 99999); self._cv_seed_spin.setValue(42)
+        ga.addRow("Seed:", self._cv_seed_spin)
+        g.setLayout(ga)
+        return g
+
+    def _build_g_cv_strategy(self) -> QGroupBox:
+        g = _styled_group("CV strategy  (cv)")
+        gv = QVBoxLayout(); gv.setSpacing(8)
+        cv_form = _form()
+        self._cv_strategy_combo = QComboBox()
+        for key, label, tooltip in _CV_STRATEGIES:
+            self._cv_strategy_combo.addItem(label, key)
+            self._cv_strategy_combo.setItemData(
+                self._cv_strategy_combo.count() - 1, tooltip,
+                Qt.ItemDataRole.ToolTipRole,
+            )
+        self._cv_strategy_combo.currentIndexChanged.connect(self._on_cv_strategy_changed)
+        cv_form.addRow("Strategy:", self._cv_strategy_combo)
+        gv.addLayout(cv_form)
+
+        # Strategy-specific parameter stack
+        self._cv_params_stack = QStackedWidget()
+        # 0: empty (loso_subject / loso_session / within_session)
+        self._cv_params_stack.addWidget(QWidget())
+        # 1: k-fold
+        kf_w = QWidget(); kf_l = _form()
+        self._cv_kfold_spin = QSpinBox(); self._cv_kfold_spin.setRange(2, 20); self._cv_kfold_spin.setValue(5)
+        kf_l.addRow("k:", self._cv_kfold_spin)
+        kf_w.setLayout(kf_l); self._cv_params_stack.addWidget(kf_w)
+        # 2: cross-domain
+        xd_w = QWidget(); xd_l = _form()
+        self._cv_xd_train = QComboBox(); self._cv_xd_train.addItems(["pipeline", "unity"])
+        self._cv_xd_test  = QComboBox(); self._cv_xd_test .addItems(["unity", "pipeline"])
+        xd_l.addRow("Train domain:", self._cv_xd_train)
+        xd_l.addRow("Test domain:",  self._cv_xd_test)
+        xd_w.setLayout(xd_l); self._cv_params_stack.addWidget(xd_w)
+        # 3: holdout
+        ho_w = QWidget(); ho_l = _form()
+        self._cv_ho_val  = QDoubleSpinBox(); self._cv_ho_val .setRange(0.0, 0.5); self._cv_ho_val .setSingleStep(0.05); self._cv_ho_val .setValue(0.15)
+        self._cv_ho_test = QDoubleSpinBox(); self._cv_ho_test.setRange(0.0, 0.5); self._cv_ho_test.setSingleStep(0.05); self._cv_ho_test.setValue(0.20)
+        self._cv_ho_strat = QComboBox()
+        self._cv_ho_strat.addItem("None",     "none")
+        self._cv_ho_strat.addItem("By class", "class")
+        self._cv_ho_strat.addItem("By subject", "subject")
+        ho_l.addRow("Val ratio:",  self._cv_ho_val)
+        ho_l.addRow("Test ratio:", self._cv_ho_test)
+        ho_l.addRow("Stratify:",   self._cv_ho_strat)
+        ho_w.setLayout(ho_l); self._cv_params_stack.addWidget(ho_w)
+        gv.addWidget(self._cv_params_stack)
+        g.setLayout(gv)
+        return g
+
+    def _build_g_cv_windowing(self) -> QGroupBox:
+        g = _styled_group("Windowing  (cv)")
+        gw = _form()
+        self._cv_win_spin = QSpinBox(); self._cv_win_spin.setRange(50, 5000); self._cv_win_spin.setSingleStep(50); self._cv_win_spin.setValue(200); self._cv_win_spin.setSuffix(" ms")
+        gw.addRow("Window length:", self._cv_win_spin)
+        self._cv_stride_spin = QSpinBox(); self._cv_stride_spin.setRange(1, 5000); self._cv_stride_spin.setValue(50); self._cv_stride_spin.setSuffix(" ms")
+        gw.addRow("Window stride:", self._cv_stride_spin)
+        self._cv_drop_rest_chk = QCheckBox("Drop rest-class windows during training")
+        self._cv_drop_rest_chk.setChecked(False)
+        self._cv_drop_rest_chk.setToolTip(
+            "When checked, the runner removes label-0 (rest) windows before "
+            "training. Useful for measuring per-active-gesture accuracy in "
+            "isolation. Leave OFF for the honest 'how does the model handle "
+            "rest periods' picture."
+        )
+        gw.addRow("", self._cv_drop_rest_chk)
+        g.setLayout(gw)
+        return g
+
+    def _build_g_cv_defaults(self) -> QGroupBox:
+        g = _styled_group("Defaults for non-varied axes  (cv)")
+        gd = QVBoxLayout(); gd.setSpacing(10)
+
+        # Default model — combo (used when axis ≠ "model")
+        def_form = _form()
+        self._cv_default_model = QComboBox()
+        for key, _ in _AVAILABLE_MODELS:
+            self._cv_default_model.addItem(key, key)
+        idx = self._cv_default_model.findData(_DEFAULT_MODEL)
+        if idx >= 0:
+            self._cv_default_model.setCurrentIndex(idx)
+        def_form.addRow("Default model:", self._cv_default_model)
+        gd.addLayout(def_form)
+
+        # Default features — checklist (used when axis ≠ "features")
+        feat_lab = QLabel("Default features  (used when axis ≠ features):")
+        feat_lab.setStyleSheet(f"color:{C_MUTED}; font-size:10px; letter-spacing:0.04em;")
+        gd.addWidget(feat_lab)
+        self._cv_default_features = _CheckList(_AVAILABLE_FEATURES,
+                                                initial_checked=_DEFAULT_FEATURE_SET)
+        gd.addWidget(self._cv_default_features)
+
+        # Default subset — single editable subset
+        sub_lab = QLabel("Default data subset  (used when axis ≠ data subset):")
+        sub_lab.setStyleSheet(f"color:{C_MUTED}; font-size:10px; letter-spacing:0.04em;")
+        gd.addWidget(sub_lab)
+        sub_row = QHBoxLayout(); sub_row.setContentsMargins(0, 0, 0, 0); sub_row.setSpacing(6)
+        self._cv_default_subset_lbl = QLabel(self._cv_default_subset.describe())
+        self._cv_default_subset_lbl.setStyleSheet(
+            f"color:{C_TEXT}; padding:6px 10px; background:{C_BG};"
+            f"  border:1px solid {C_BORDER2}; border-radius:5px;"
+        )
+        edit_btn = _ghost_button("Edit…")
+        edit_btn.clicked.connect(self._on_cv_edit_default_subset)
+        sub_row.addWidget(self._cv_default_subset_lbl, 1)
+        sub_row.addWidget(edit_btn)
+        gd.addLayout(sub_row)
+        g.setLayout(gd)
+        return g
+
+    # ──────────────────────────────────────────────────────────────────
+    # Results pane (stacked: eval result | CV comparison)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _build_results_pane(self) -> QWidget:
+        self._results_stack = QStackedWidget()
+
+        self._eval_results = _EvaluationResultView()
+        self._cv_results   = _CrossValidationResultsView()
+        self._cv_results.export_requested.connect(self._on_cv_export)
+
+        self._results_stack.addWidget(self._eval_results)   # page 0
+        self._results_stack.addWidget(self._cv_results)     # page 1
+        return self._results_stack
+
+    # ──────────────────────────────────────────────────────────────────
+    # Mode-switching slots
+    # ──────────────────────────────────────────────────────────────────
+
+    def _on_eval_type_changed(self, *_args) -> None:
+        """
+        Driver for the entire tab. Toggles the visibility of every
+        settings group, swaps the left-hand picker, swaps the result
+        panel, and updates the Run button label / Sessions-only feature
+        button visibility.
+
+        Each group is bound to exactly one mode; we just iterate the
+        per-mode lists and call setVisible(True/False).
+        """
+        mode = self._eval_type_combo.currentData()
+
+        # All the sets are computed up-front to make the visibility
+        # toggle a single linear scan. Each group only ever lives in
+        # one of these sets, so flipping every group is correct.
+        sessions_groups = (self._g_sessions_model, self._g_sessions_windowing,
+                           self._g_sessions_preprocessing, self._g_sessions_features)
+        games_groups    = (self._g_games_source, self._g_games_filter,
+                           self._g_games_replay)
+        unity_groups    = (self._g_unity_about, self._g_unity_objective,
+                           self._g_unity_rms)
+        cv_groups       = (self._g_cv_axis, self._g_cv_strategy,
+                           self._g_cv_windowing, self._g_cv_defaults)
+
+        all_off = (
+            *sessions_groups, *games_groups, *unity_groups, *cv_groups,
+        )
+        for g in all_off:
+            g.setVisible(False)
+
+        if mode == EVAL_TYPE_SESSIONS:
+            for g in sessions_groups: g.setVisible(True)
+            self._selection_stack.setCurrentIndex(self._PICKER_PAGE_SESSIONS)
+            self._results_stack.setCurrentIndex(self._RESULTS_PAGE_EVAL)
+            self._btn_features.setVisible(True)
+            self._btn_run.setText("▶  Run evaluation")
+            self._type_hint.setText("Run a saved model over training-session recordings.")
+        elif mode == EVAL_TYPE_GAMES:
+            for g in games_groups: g.setVisible(True)
+            self._selection_stack.setCurrentIndex(self._PICKER_PAGE_GAMES)
+            self._results_stack.setCurrentIndex(self._RESULTS_PAGE_EVAL)
+            self._btn_features.setVisible(False)
+            self._btn_run.setText("▶  Run evaluation")
+            self._type_hint.setText("Evaluate logged predictions or replay a model on EMG.")
+            # Keep Games' replay-options visibility honest with the source combo
+            self._on_games_source_changed()
+        elif mode == EVAL_TYPE_UNITY:
+            for g in unity_groups: g.setVisible(True)
+            self._selection_stack.setCurrentIndex(self._PICKER_PAGE_UNITY)
+            self._results_stack.setCurrentIndex(self._RESULTS_PAGE_EVAL)
+            self._btn_features.setVisible(False)
+            self._btn_run.setText("▶  Run evaluation")
+            self._type_hint.setText("Sweep RMS thresholds to find an optimal binary cutoff.")
+        elif mode == EVAL_TYPE_CV:
+            for g in cv_groups: g.setVisible(True)
+            self._selection_stack.setCurrentIndex(self._PICKER_PAGE_CV)
+            self._results_stack.setCurrentIndex(self._RESULTS_PAGE_CV)
+            self._btn_features.setVisible(False)
+            self._btn_run.setText("▶  Run sweep")
+            self._type_hint.setText("Sweep multiple validation runs to compare models / features / data.")
+            # Sync the CV inner stacks with the combos
+            self._on_cv_axis_changed()
+            self._on_cv_strategy_changed()
+        else:
+            log.warning("Unknown evaluation type: %r", mode)
+
+        # Cancel button is only useful in CV mode AND only enabled while
+        # a sweep is in flight; here we just make sure it's disabled
+        # whenever the mode changes (a fresh switch never has a worker
+        # running).
+        self._btn_cancel.setEnabled(False)
+
+    def _on_cv_axis_changed(self, *_args) -> None:
+        """Swap the left-side CV axis-values stack to match the combo."""
+        axis = self._cv_axis_combo.currentData()
+        idx_map = {
+            "none":         self._CV_AXIS_PAGE_NONE,
+            "model":        self._CV_AXIS_PAGE_MODEL,
+            "features":     self._CV_AXIS_PAGE_FEATURES,
+            "data_subset":  self._CV_AXIS_PAGE_SUBSET,
+        }
+        self._cv_axis_stack.setCurrentIndex(idx_map.get(axis, self._CV_AXIS_PAGE_NONE))
+
+    def _on_cv_strategy_changed(self, *_args) -> None:
+        """Swap the strategy-specific parameters stack to match the combo."""
+        key = self._cv_strategy_combo.currentData()
+        idx_map = {
+            "loso_subject":    0,
+            "loso_session":    0,
+            "within_session":  0,
+            "k_fold_subjects": 1,
+            "cross_domain":    2,
+            "holdout_split":   3,
+        }
+        self._cv_params_stack.setCurrentIndex(idx_map.get(key, 0))
+
+    def _on_games_source_changed(self, *_args) -> None:
+        """
+        Keep the Games-mode replay options visible only when source = replay.
+
+        Note this applies *within* games mode; in other modes the entire
+        replay group is hidden by ``_on_eval_type_changed`` regardless.
+        """
+        if self._eval_type_combo.currentData() != EVAL_TYPE_GAMES:
+            return
+        is_replay = (self._games_mode_combo.currentData() == "replay")
+        self._g_games_replay.setVisible(is_replay)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Public API
     # ──────────────────────────────────────────────────────────────────
 
     def refresh(self) -> None:
-        self._picker.refresh()
+        """Re-scan recordings, models, and CV subjects across all modes."""
+        self._sessions_picker.refresh()
+        self._games_picker.refresh()
+        self._unity_picker.refresh()
+        self._refresh_sessions_models()
+        self._refresh_games_models()
+        self._refresh_cv_subjects()
 
-    def _settings_from_ui(self) -> UnityEvalSettings:
-        return UnityEvalSettings(
-            active_label=int(self._active_label_spin.value()),
-            rms_window_ms=int(self._rms_win_spin.value()),
-            rms_stride_ms=int(self._rms_stride_spin.value()),
-            n_thresholds=int(self._n_thresh_spin.value()),
-            objective=str(self._objective_combo.currentData()),
-            fixed_threshold=(self._fixed_spin.value() if self._fixed_chk.isChecked() else None),
-        )
+    # ──────────────────────────────────────────────────────────────────
+    # Refresh helpers
+    # ──────────────────────────────────────────────────────────────────
+
+    def _refresh_sessions_models(self) -> None:
+        prev = self._sessions_model_combo.currentText() if hasattr(self, "_sessions_model_combo") else ""
+        self._sessions_model_combo.clear()
+        names = _model_dirs(self._data_dir)
+        if not names:
+            self._sessions_model_combo.addItem("(no models found in data/models)", None)
+            self._sessions_model_combo.setEnabled(False)
+        else:
+            self._sessions_model_combo.setEnabled(True)
+            for n in names:
+                self._sessions_model_combo.addItem(n, n)
+            if prev and prev in names:
+                self._sessions_model_combo.setCurrentText(prev)
+
+    def _refresh_games_models(self) -> None:
+        prev = self._games_model_combo.currentText() if hasattr(self, "_games_model_combo") else ""
+        self._games_model_combo.clear()
+        names = _model_dirs(self._data_dir)
+        if not names:
+            self._games_model_combo.addItem("(no models found)", None)
+            self._games_model_combo.setEnabled(False)
+        else:
+            self._games_model_combo.setEnabled(True)
+            for n in names:
+                self._games_model_combo.addItem(n, n)
+            if prev and prev in names:
+                self._games_model_combo.setCurrentText(prev)
+
+    def _refresh_cv_subjects(self) -> None:
+        subjects = self._discover_subjects()
+        self._cv_subset_axis.set_available_subjects(subjects)
+
+    def _discover_subjects(self) -> List[str]:
+        """Pull subject IDs from ``<data_dir>/sessions/`` and ``unity_sessions``."""
+        out: set = set()
+        sess_root = self._data_dir / "sessions"
+        if sess_root.exists():
+            for d in sess_root.iterdir():
+                if d.is_dir() and d.name not in {"unity_sessions"}:
+                    out.add(d.name)
+            unity_root = sess_root / "unity_sessions"
+            if unity_root.exists():
+                for d in unity_root.iterdir():
+                    if d.is_dir():
+                        out.add(d.name)
+        return sorted(out, key=lambda s: (not s.upper().startswith("VP_"), s))
+
+    def _on_cv_edit_default_subset(self) -> None:
+        dlg = _SubsetEditorDialog(self._discover_subjects(),
+                                   subset=self._cv_default_subset, parent=self)
+        if dlg.exec():
+            self._cv_default_subset = dlg.result_subset()
+            self._cv_default_subset_lbl.setText(self._cv_default_subset.describe())
+
+    # ──────────────────────────────────────────────────────────────────
+    # Run dispatch  (one button, four code paths)
+    # ──────────────────────────────────────────────────────────────────
 
     def _on_run_clicked(self) -> None:
-        recs = self._picker.selected()
+        """
+        The single Run button at the bottom of the settings column
+        dispatches to the appropriate handler based on the active mode.
+        """
+        mode = self._eval_type_combo.currentData()
+        if mode == EVAL_TYPE_SESSIONS:
+            self._run_sessions()
+        elif mode == EVAL_TYPE_GAMES:
+            self._run_games()
+        elif mode == EVAL_TYPE_UNITY:
+            self._run_unity()
+        elif mode == EVAL_TYPE_CV:
+            self._on_run_cv_clicked()
+        else:
+            log.warning("Unknown evaluation type at run time: %r", mode)
+
+    def _on_cancel_clicked(self) -> None:
+        """Only meaningful in CV mode while a sweep is running."""
+        if self._cv_bridge is not None:
+            self._cv_bridge.request_cancel()
+            self._cv_results.append_log(
+                "Cancellation requested — finishing the current run, then stopping."
+            )
+            self._btn_cancel.setEnabled(False)
+
+    def _on_run_features_clicked(self) -> None:
+        """Sessions-only: rank features individually with an LDA."""
+        recs = self._sessions_picker.selected()
+        if not recs:
+            QMessageBox.information(self, "No sessions",
+                                    "Select at least one session on the left.")
+            return
+        feats = [c.text() for c in self._sessions_feat_choices if c.isChecked()]
+        if not feats:
+            QMessageBox.information(self, "No features",
+                                    "Select at least one feature to rank.")
+            return
+        data_dir = self._data_dir
+        def task() -> EvaluationResult:
+            return evaluate_features_lda(data_dir, recs, feats)
+        self._launch_eval(task, "Ranking features…")
+
+    # ──────────────────────────────────────────────────────────────────
+    # Settings collection helpers
+    # ──────────────────────────────────────────────────────────────────
+
+    def _collect_sessions_settings(self) -> Optional[SessionEvalSettings]:
+        model_name = self._sessions_model_combo.currentData()
+        if not model_name:
+            QMessageBox.warning(self, "No model",
+                                "No saved model is available — train a model first.")
+            return None
+        return SessionEvalSettings(
+            model_name=str(model_name),
+            window_size_ms=self._sessions_win_spin.value() or None,
+            window_stride_ms=int(self._sessions_stride_spin.value()),
+            apply_rotation=self._sessions_rotation_chk.isChecked(),
+            bad_channel_mode=self._sessions_bad_ch_combo.currentData(),
+            include_invalid=self._sessions_invalid_chk.isChecked(),
+            per_session_breakdown=self._sessions_per_session_chk.isChecked(),
+        )
+
+    def _collect_games_settings(self) -> Optional[GameEvalSettings]:
+        mode = self._games_mode_combo.currentData()
+        s = GameEvalSettings(
+            mode=mode,
+            truth_source=self._games_truth_combo.currentData(),
+            drop_inactive_truth_frames=self._games_drop_chk.isChecked(),
+            min_confidence=(self._games_min_conf_spin.value()
+                            if self._games_min_conf_chk.isChecked() else None),
+            per_recording_breakdown=self._games_per_chk.isChecked(),
+        )
+        if mode == "replay":
+            model_name = self._games_model_combo.currentData()
+            if not model_name:
+                QMessageBox.warning(self, "No model",
+                                    "Replay mode requires a saved model.")
+                return None
+            s.model_name = str(model_name)
+            s.window_size_ms = self._games_win_spin.value() or None
+            s.window_stride_ms = int(self._games_stride_spin.value())
+        return s
+
+    def _collect_unity_settings(self) -> UnityEvalSettings:
+        return UnityEvalSettings(
+            active_label=int(self._unity_active_label_spin.value()),
+            rms_window_ms=int(self._unity_rms_win_spin.value()),
+            rms_stride_ms=int(self._unity_rms_stride_spin.value()),
+            n_thresholds=int(self._unity_n_thresh_spin.value()),
+            objective=str(self._unity_objective_combo.currentData()),
+            fixed_threshold=(self._unity_fixed_spin.value()
+                             if self._unity_fixed_chk.isChecked() else None),
+        )
+
+    def _collect_cv_defaults(self) -> SweepDefaults:
+        # CV kwargs depend on which strategy is active
+        cv_key = self._cv_strategy_combo.currentData()
+        cv_kwargs: Dict[str, Any] = {}
+        if cv_key == "k_fold_subjects":
+            cv_kwargs = {"k": int(self._cv_kfold_spin.value()),
+                         "seed": int(self._cv_seed_spin.value())}
+        elif cv_key == "cross_domain":
+            cv_kwargs = {"train_domain": self._cv_xd_train.currentText(),
+                         "test_domain":  self._cv_xd_test.currentText()}
+        elif cv_key == "holdout_split":
+            cv_kwargs = {"val_ratio":  float(self._cv_ho_val .value()),
+                         "test_ratio": float(self._cv_ho_test.value()),
+                         "seed":       int(self._cv_seed_spin.value()),
+                         "stratify_by": self._cv_ho_strat.currentData()}
+
+        return SweepDefaults(
+            name=self._cv_name_edit.text().strip() or "cv_sweep",
+            seed=int(self._cv_seed_spin.value()),
+            window_ms=int(self._cv_win_spin.value()),
+            stride_ms=int(self._cv_stride_spin.value()),
+            drop_rest=self._cv_drop_rest_chk.isChecked(),
+            cv_strategy=cv_key,
+            cv_kwargs=cv_kwargs,
+            default_subset=self._cv_default_subset,
+            default_models=[self._cv_default_model.currentData()],
+            default_features=self._cv_default_features.selected(),
+        )
+
+    # ──────────────────────────────────────────────────────────────────
+    # Run handlers — Sessions / Games / Unity (modes 1-3)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _run_sessions(self) -> None:
+        recs = self._sessions_picker.selected()
+        if not recs:
+            QMessageBox.information(self, "No sessions",
+                                    "Select at least one session on the left.")
+            return
+        settings = self._collect_sessions_settings()
+        if settings is None:
+            return
+        data_dir = self._data_dir
+        def task() -> EvaluationResult:
+            return evaluate_sessions(data_dir, recs, settings)
+        self._launch_eval(task, "Running session evaluation…")
+
+    def _run_games(self) -> None:
+        recs = self._games_picker.selected()
+        if not recs:
+            QMessageBox.information(self, "No recordings",
+                                    "Select at least one game recording on the left.")
+            return
+        settings = self._collect_games_settings()
+        if settings is None:
+            return
+        data_dir = self._data_dir
+        def task() -> EvaluationResult:
+            return evaluate_games(data_dir, recs, settings)
+        self._launch_eval(task, "Evaluating game recordings…")
+
+    def _run_unity(self) -> None:
+        recs = self._unity_picker.selected()
         if not recs:
             QMessageBox.information(self, "No recordings",
                                     "Select at least one Unity recording on the left.")
             return
-        self.run_clicked.emit(self._settings_from_ui(), recs)
-
-
-# ═══════════════════════════════════════════════════════════════════════════
-# Top-level tab
-# ═══════════════════════════════════════════════════════════════════════════
-
-class EvaluationTab(QWidget):
-    """
-    Public widget for the redesigned Evaluation tab.
-
-    Construct with the project's ``DataManager`` (or any object that exposes
-    ``data_dir``), then add it to the main window like any other tab.
-    """
-
-    result_ready = Signal(object)   # EvaluationResult
-
-    def __init__(self, data_manager: Any, parent: Optional[QWidget] = None):
-        super().__init__(parent)
-        self._data_dir: Path = Path(getattr(data_manager, "data_dir", data_manager))
-        if not self._data_dir.exists():
-            log.warning("Data directory does not exist: %s", self._data_dir)
-
-        apply_app_style(self, theme="bright")
-
-        outer = QVBoxLayout(self); outer.setContentsMargins(12, 12, 12, 12); outer.setSpacing(12)
-
-        # ── Header banner
-        header = QFrame()
-        header.setStyleSheet(
-            f"QFrame {{ background: qlineargradient(x1:0,y1:0,x2:1,y2:0,"
-            f"  stop:0 {C_PANEL}, stop:1 {C_CARD});"
-            f"  border:1px solid {C_BORDER}; border-radius:10px; }}"
-        )
-        h_lay = QHBoxLayout(header); h_lay.setContentsMargins(18, 12, 18, 12); h_lay.setSpacing(12)
-        title = QLabel("Evaluation"); f = QFont(); f.setPointSize(16); f.setBold(True); title.setFont(f)
-        title.setStyleSheet(f"color:{C_ACCENT};")
-        h_lay.addWidget(title)
-        sub = QLabel("Sessions  ·  game recordings  ·  Unity threshold")
-        sub.setStyleSheet(f"color:{C_MUTED}; font-size:11px;")
-        h_lay.addWidget(sub)
-        h_lay.addStretch(1)
-        self._data_dir_lbl = QLabel(str(self._data_dir))
-        self._data_dir_lbl.setStyleSheet(f"color:{C_MUTED}; font-size:10px; font-family:'Menlo','DejaVu Sans Mono',monospace;")
-        self._data_dir_lbl.setToolTip("Active data directory")
-        h_lay.addWidget(self._data_dir_lbl)
-        outer.addWidget(header)
-
-        # ── Mode tabs
-        self._mode_tabs = QTabWidget(); self._mode_tabs.setDocumentMode(True)
-        self._sessions = _SessionsPanel(self._data_dir)
-        self._games    = _GamesPanel(self._data_dir)
-        self._unity    = _UnityPanel(self._data_dir)
-        self._mode_tabs.addTab(self._sessions, "  Sessions  ")
-        self._mode_tabs.addTab(self._games,    "  Game recordings  ")
-        self._mode_tabs.addTab(self._unity,    "  Unity recordings  ")
-
-        # ── Results panel
-        self._results = _ResultsView()
-
-        split = QSplitter(Qt.Orientation.Vertical)
-        split.addWidget(self._mode_tabs)
-        split.addWidget(self._results)
-        split.setStretchFactor(0, 1); split.setStretchFactor(1, 1)
-        split.setSizes([460, 600])
-        split.setHandleWidth(6)
-        outer.addWidget(split, 1)
-
-        # ── Wiring
-        self._sessions.run_clicked     .connect(self._run_sessions)
-        self._sessions.features_clicked.connect(self._run_features)
-        self._games   .run_clicked     .connect(self._run_games)
-        self._unity   .run_clicked     .connect(self._run_unity)
-
-        self._worker = None    # held to keep run_blocking's QThread alive
-
-    # ── public API ────────────────────────────────────────────────────
-
-    def refresh(self) -> None:
-        self._sessions.refresh(); self._games.refresh(); self._unity.refresh()
-
-    # ── run handlers ──────────────────────────────────────────────────
-
-    def _run_sessions(self, settings, recordings):
-        data_dir = self._data_dir
+        settings = self._collect_unity_settings()
         def task() -> EvaluationResult:
-            return evaluate_sessions(data_dir, recordings, settings)
-        self._launch(task, "Running session evaluation…")
+            return evaluate_unity(recs, settings)
+        self._launch_eval(task, "Sweeping RMS thresholds…")
 
-    def _run_features(self, features, recordings):
-        data_dir = self._data_dir
-        def task() -> EvaluationResult:
-            return evaluate_features_lda(data_dir, recordings, features)
-        self._launch(task, "Ranking features…")
-
-    def _run_games(self, settings, recordings):
-        data_dir = self._data_dir
-        def task() -> EvaluationResult:
-            return evaluate_games(data_dir, recordings, settings)
-        self._launch(task, "Evaluating game recordings…")
-
-    def _run_unity(self, settings, recordings):
-        def task() -> EvaluationResult:
-            return evaluate_unity(recordings, settings)
-        self._launch(task, "Sweeping RMS thresholds…")
-
-    def _launch(self, task, label: str) -> None:
+    def _launch_eval(self, task: Callable[[], EvaluationResult], label: str) -> None:
+        """Run a single eval-mode task on a worker thread via run_blocking."""
         self._worker = run_blocking(
             parent_widget=self,
             fn=task,
-            on_done=self._on_result_ready,
-            on_error=self._on_error,
+            on_done=self._on_eval_result_ready,
+            on_error=self._on_eval_error,
             label=label,
         )
 
-    # ── result + error handlers ───────────────────────────────────────
-
-    def _on_result_ready(self, result: EvaluationResult) -> None:
-        self._results.show_result(result)
+    def _on_eval_result_ready(self, result: EvaluationResult) -> None:
+        self._eval_results.show_result(result)
         self.result_ready.emit(result)
 
-    def _on_error(self, tb: str) -> None:
+    def _on_eval_error(self, tb: str) -> None:
         log.error("Evaluation failed:\n%s", tb)
         last_line = next((ln for ln in reversed(tb.splitlines()) if ln.strip()), "Unknown error")
         msg = QMessageBox(self)
@@ -1720,3 +3687,238 @@ class EvaluationTab(QWidget):
         msg.setDetailedText(tb)
         msg.setStandardButtons(QMessageBox.StandardButton.Ok)
         msg.exec()
+
+    # ──────────────────────────────────────────────────────────────────
+    # Run handler — Cross-validation  (mode 4)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _on_run_cv_clicked(self) -> None:
+        axis = self._cv_axis_combo.currentData()
+        defaults = self._collect_cv_defaults()
+
+        # Pre-flight: defaults sanity
+        if not defaults.default_features:
+            QMessageBox.warning(self, "No default features",
+                                "Select at least one default feature in the "
+                                "«Defaults for non-varied axes» group.")
+            return
+
+        # Build plans per axis. Each branch validates its own per-axis
+        # values before calling plan_sweep so the user gets an explicit
+        # 'nothing checked' message instead of a silent zero-run sweep.
+        if axis == "none":
+            plans = plan_sweep(axis="none", defaults=defaults)
+        elif axis == "model":
+            models, labels = self._cv_model_axis.axis_values()
+            if not models:
+                QMessageBox.warning(self, "No models selected",
+                                    "Tick at least one model in the comparison list.")
+                return
+            plans = plan_sweep(axis="model", defaults=defaults,
+                                axis_models=models, axis_labels=labels)
+        elif axis == "features":
+            feats, labels = self._cv_features_axis.axis_values()
+            if not feats:
+                QMessageBox.warning(self, "No feature presets",
+                                    "Add at least one feature preset to compare.")
+                return
+            plans = plan_sweep(axis="features", defaults=defaults,
+                                axis_features=feats, axis_labels=labels)
+        elif axis == "data_subset":
+            subsets = self._cv_subset_axis.axis_values()
+            if not subsets:
+                QMessageBox.warning(self, "No data subsets",
+                                    "Define at least one named subset to compare.")
+                return
+            plans = plan_sweep(axis="data_subset", defaults=defaults,
+                                axis_subsets=subsets)
+        else:
+            QMessageBox.warning(self, "Unknown axis", f"Unknown comparison axis: {axis}")
+            return
+
+        if not plans:
+            QMessageBox.warning(self, "Nothing to run",
+                                "The current configuration produced zero runs.")
+            return
+
+        # Confirm large sweeps
+        if len(plans) > 8:
+            if QMessageBox.question(
+                self, "Large sweep",
+                f"This will run {len(plans)} validation experiments back-to-back. "
+                f"Continue?",
+            ) != QMessageBox.StandardButton.Yes:
+                return
+
+        self._launch_sweep(plans, axis_label=axis)
+
+    def _launch_sweep(self, plans: List[SweepPlan], *, axis_label: str) -> None:
+        self._cv_axis_label = axis_label
+        self._cv_completed_rows = []
+        self._cv_completed_runs = []
+        # Make sure the results panel is the CV one — defensive in case
+        # the user pressed Run while in CV mode but the stack got out of
+        # sync somehow.
+        self._results_stack.setCurrentIndex(self._RESULTS_PAGE_CV)
+        self._cv_results.reset_for_sweep(len(plans), axis_label)
+
+        bridge = _SweepProgressBridge()
+        worker = _SweepWorker(self._data_dir, plans, bridge)
+
+        # Wire signals — QueuedConnection is implicit because the worker
+        # lives on a different thread. The bridge proxies the runner's
+        # ProgressReporter callbacks onto these signals.
+        bridge.run_started   .connect(self._on_cv_run_started)
+        bridge.run_finished  .connect(self._on_cv_run_finished)
+        bridge.fold_finished .connect(self._on_cv_fold_finished)
+        bridge.log_line      .connect(self._cv_results.append_log)
+        bridge.sweep_finished.connect(self._on_cv_sweep_finished)
+        bridge.sweep_failed  .connect(self._on_cv_sweep_failed)
+        worker.finished      .connect(self._cleanup_cv_worker)
+
+        self._cv_bridge = bridge
+        self._cv_worker = worker
+
+        self._btn_run   .setEnabled(False)
+        self._btn_cancel.setEnabled(True)
+        worker.start()
+
+    @Slot(int, int, str)
+    def _on_cv_run_started(self, idx: int, total: int, label: str) -> None:
+        self._cv_results.on_run_started(idx, total, label)
+
+    @Slot(int, int, str, object)
+    def _on_cv_run_finished(self, idx: int, total: int, label: str, result: Any) -> None:
+        agg = result.aggregate() if result is not None else {}
+        self._cv_completed_rows.append((label, agg))
+        self._cv_completed_runs.append((label, result))
+        self._cv_results.show_completed_sweep(self._cv_completed_rows)
+        self._cv_results.on_run_finished(idx, total, label, result)
+
+    @Slot(int, int, object)
+    def _on_cv_fold_finished(self, idx: int, total: int, fr: FoldResult) -> None:
+        self._cv_results.append_log(
+            f"  fold {idx}/{total}  ·  {fr.model_type}  ·  "
+            f"acc={fr.accuracy:.3f}  f1={fr.macro_f1:.3f}"
+        )
+
+    @Slot(object)
+    def _on_cv_sweep_finished(self, runs: List[Tuple[str, Any]]) -> None:
+        self._cv_results.append_log(
+            f"Sweep finished — {len(self._cv_completed_rows)} run(s) total."
+        )
+        self.sweep_finished.emit(runs)
+
+    @Slot(str)
+    def _on_cv_sweep_failed(self, tb: str) -> None:
+        log.error("Sweep failed:\n%s", tb)
+        last = tb.splitlines()[-1] if tb.splitlines() else tb
+        QMessageBox.critical(self, "Sweep failed", last)
+        self._cv_results.append_log(tb)
+
+    def _cleanup_cv_worker(self) -> None:
+        # Re-enable Run only if we're still in CV mode — switching to a
+        # different mode while a sweep was running is unusual but not
+        # impossible.
+        if self._eval_type_combo.currentData() == EVAL_TYPE_CV:
+            self._btn_run.setEnabled(True)
+        self._btn_cancel.setEnabled(False)
+        self._cv_bridge = None
+        # Worker is auto-deleted via QThread.finished handling
+
+    # ──────────────────────────────────────────────────────────────────
+    # CV exports
+    # ──────────────────────────────────────────────────────────────────
+
+    @Slot(str)
+    def _on_cv_export(self, kind: str) -> None:
+        if not self._cv_completed_rows:
+            return
+        if kind == "comparison_csv":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save comparison CSV", "cv_comparison.csv", "CSV (*.csv)")
+            if path: self._write_cv_comparison_csv(Path(path))
+        elif kind == "per_model_csv":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save per-model CSV", "cv_per_model.csv", "CSV (*.csv)")
+            if path: self._write_cv_per_model_csv(Path(path))
+        elif kind == "summary_json":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save sweep JSON", "cv_sweep.json", "JSON (*.json)")
+            if path: self._write_cv_summary_json(Path(path))
+        elif kind == "bundle":
+            d = QFileDialog.getExistingDirectory(self, "Save full bundle to folder",
+                                                  str(Path.home()))
+            if d:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                target = Path(d) / f"cv_sweep_{ts}"
+                target.mkdir(parents=True, exist_ok=True)
+                self._write_cv_comparison_csv(target / "comparison.csv")
+                self._write_cv_per_model_csv(target / "per_model.csv")
+                self._write_cv_summary_json(target / "sweep.json")
+                QMessageBox.information(self, "Export complete",
+                                        f"Saved bundle to:\n{target}")
+
+    def _write_cv_comparison_csv(self, path: Path) -> None:
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["run", "best_model", "n_folds",
+                        "accuracy_mean", "accuracy_std",
+                        "macro_f1_mean", "macro_f1_std",
+                        "train_seconds_mean"])
+            for label, agg in self._cv_completed_rows:
+                if not agg:
+                    w.writerow([label, "", 0, "", "", "", "", ""])
+                    continue
+                best, m = max(agg.items(), key=lambda kv: kv[1].get("accuracy_mean", 0.0))
+                w.writerow([label, best, int(m.get("n_folds", 0)),
+                             f"{m.get('accuracy_mean', 0.0):.6f}",
+                             f"{m.get('accuracy_std', 0.0):.6f}",
+                             f"{m.get('macro_f1_mean', 0.0):.6f}",
+                             f"{m.get('macro_f1_std', 0.0):.6f}",
+                             f"{m.get('train_seconds_mean', 0.0):.3f}"])
+
+    def _write_cv_per_model_csv(self, path: Path) -> None:
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["run", "model", "n_folds",
+                        "accuracy_mean", "accuracy_std",
+                        "macro_f1_mean", "macro_f1_std",
+                        "train_seconds_mean"])
+            for label, agg in self._cv_completed_rows:
+                for model, m in sorted((agg or {}).items()):
+                    w.writerow([label, model, int(m.get("n_folds", 0)),
+                                 f"{m.get('accuracy_mean', 0.0):.6f}",
+                                 f"{m.get('accuracy_std', 0.0):.6f}",
+                                 f"{m.get('macro_f1_mean', 0.0):.6f}",
+                                 f"{m.get('macro_f1_std', 0.0):.6f}",
+                                 f"{m.get('train_seconds_mean', 0.0):.3f}"])
+
+    def _write_cv_summary_json(self, path: Path) -> None:
+        payload = {
+            "axis":       self._cv_axis_label,
+            "created_at": datetime.now().isoformat(),
+            "data_dir":   str(self._data_dir),
+            "runs": [
+                {"label": label, "aggregate": agg}
+                for label, agg in self._cv_completed_rows
+            ],
+        }
+        with open(path, "w") as f:
+            json.dump(payload, f, indent=2, default=str)
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Back-compat alias
+# ═══════════════════════════════════════════════════════════════════════════
+# The old cross-validation tab module exposed a class called
+# ``CrossValidationTab``. Anything still importing that name will get
+# the merged tab back instead — opening on the CV mode is still a
+# matter of one line:
+#
+#     tab = CrossValidationTab(self.data_manager)
+#     tab._eval_type_combo.setCurrentIndex(3)
+#
+# but new code should import ``EvaluationTab`` directly.
+
+CrossValidationTab = EvaluationTab

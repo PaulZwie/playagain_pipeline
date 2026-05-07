@@ -48,6 +48,16 @@ class GameRecorder:
         GroundTruthActive, RawGroundTruth, RequestedGesture, CameraBlocking,
         EMG_Ch0, ..., EMG_ChN
 
+        RequestedGesture column:
+                The name of the gesture Unity is currently asking the user to perform.
+                When Unity is between requests (i.e. nothing is being asked of the user),
+                this column reads ``"rest"`` rather than ``"none"`` — the user is at rest
+                during these intervals, so labelling them as such matches what's actually
+                being recorded and makes the column directly usable as ground truth.
+                Older recordings written before this change use ``"none"``; run
+                ``python -m playagain_pipeline.utils.migrate_requested_gesture <data_dir>``
+                to migrate them in place.
+
         Ground Truth Logic:
                 GroundTruthActive is derived from Unity game-state signals using a
                 small deterministic state machine.
@@ -68,6 +78,18 @@ class GameRecorder:
         All state updates use atomic assignments (Python GIL protected).
         Buffer flushing uses a lock to prevent concurrent writes.
     """
+
+    # ── Sentinel written into the RequestedGesture CSV column whenever
+    # Unity is *not* currently asking the user for a specific gesture.
+    # The user is at rest during these intervals, so we label them as
+    # such — this makes the column directly usable as ground truth and
+    # also matches the existing "rest" class in the gesture set
+    # (label_id 0). Older recordings used "none" here; the migration
+    # script `playagain_pipeline.utils.migrate_requested_gesture`
+    # rewrites them in place. The set below lists every spelling
+    # accepted as "no active request" coming in from Unity.
+    REST_LABEL: str = "rest"
+    _NO_REQUEST_INPUTS: frozenset = frozenset({"", "none", "null"})
 
     def __init__(self, output_dir: Path):
         """
@@ -110,7 +132,7 @@ class GameRecorder:
         # Current ground truth state (updated atomically via on_game_state)
         self._ground_truth_active = False
         self._raw_ground_truth = False
-        self._requested_gesture = "none"
+        self._requested_gesture = self.REST_LABEL
         self._camera_blocking = False
 
         # GT timing state for robust camera-transition handling
@@ -298,7 +320,7 @@ class GameRecorder:
         # Reset ground truth (in case leftover from previous session)
         self._ground_truth_active = False
         self._raw_ground_truth = False
-        self._requested_gesture = "none"
+        self._requested_gesture = self.REST_LABEL
         self._camera_blocking = False
         self._gt_request_started_at_monotonic = None
 
@@ -469,6 +491,12 @@ class GameRecorder:
         This handles out-of-sync request/camera updates without coupling to model
         predictions and avoids false positives outside request windows.
 
+        The RequestedGesture written into the CSV is either the normalised
+        gesture name (e.g. ``"fist"``) when Unity is asking for one, or
+        :attr:`REST_LABEL` (``"rest"``) when Unity is between requests —
+        the user is at rest during those intervals, so labelling them as
+        such makes the column directly usable as a ground-truth label.
+
         Args:
             ground_truth_active: Raw Unity flag (request active on Unity side).
             requested_gesture: Name of requested gesture (e.g., "fist" or "none").
@@ -478,7 +506,13 @@ class GameRecorder:
         self._camera_blocking = bool(camera_blocking)
 
         requested_norm = self._normalize_label(requested_gesture)
-        has_requested_gesture = requested_norm not in ("", "none", "null")
+        # Treat the rest-sentinel input as "no active request" so that even
+        # if Unity ever sends "rest" explicitly, it's not mistakenly treated
+        # as a real request that would flip GroundTruthActive on.
+        has_requested_gesture = (
+            requested_norm not in self._NO_REQUEST_INPUTS
+            and requested_norm != self.REST_LABEL
+        )
 
         now = time.monotonic()
         previous_requested = self._normalize_label(self._requested_gesture)
@@ -498,7 +532,7 @@ class GameRecorder:
                 or in_pre_block_grace
             )
         )
-        self._requested_gesture = requested_norm if has_requested_gesture else "none"
+        self._requested_gesture = requested_norm if has_requested_gesture else self.REST_LABEL
 
         if self._is_recording and self._debug_ground_truth:
             now_log = time.monotonic()
