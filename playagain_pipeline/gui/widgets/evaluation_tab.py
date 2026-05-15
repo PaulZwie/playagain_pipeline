@@ -98,6 +98,13 @@ from playagain_pipeline.validation import (
     SessionCorpus, ExperimentConfig, ValidationRunner, RunResult,
 )
 from playagain_pipeline.validation.runner import FoldResult
+
+# ── Participant-group registry (healthy / impaired cohorts) ───────────────
+# Qt-free; used to tag the games-mode per-recording breakdown by cohort.
+from playagain_pipeline.validation.participant_groups import (
+    GROUP_HEALTHY, GROUP_IMPAIRED,
+    ParticipantGroups, default_groups_path,
+)
 from playagain_pipeline.validation.config import (
     DataSelection, WindowingConfig, FeatureConfig, ModelConfig, CVConfig,
 )
@@ -139,12 +146,34 @@ EVAL_TYPE_SESSIONS = "sessions"
 EVAL_TYPE_GAMES    = "games"
 EVAL_TYPE_UNITY    = "unity"
 EVAL_TYPE_CV       = "cross_validation"
+EVAL_TYPE_INTRA_VP = "intra_participant"
 
 _EVAL_TYPE_LABELS: List[Tuple[str, str]] = [
     (EVAL_TYPE_SESSIONS, "Sessions  (run a saved model over training recordings)"),
     (EVAL_TYPE_GAMES,    "Game recordings  (logged predictions or replay)"),
     (EVAL_TYPE_UNITY,    "Unity recordings  (RMS threshold)"),
-    (EVAL_TYPE_CV,       "Cross-validation  (multi-run sweep)"),
+    (EVAL_TYPE_CV,       "Cross-validation  (multi-run sweep across subjects)"),
+    (EVAL_TYPE_INTRA_VP, "Intra-participant CV  (single-subject train / test sweep)"),
+]
+
+
+# CV strategies offered specifically in INTRA-PARTICIPANT mode. These are
+# the subset of _CV_STRATEGIES that genuinely make sense when the data
+# is locked to a single subject — anything that cuts across subjects is
+# omitted, since it would either degenerate to one fold or make no sense.
+_INTRA_VP_STRATEGIES: List[Tuple[str, str, str]] = [
+    ("holdout_split",   "Train / val / test split",
+        "One fold with explicit Train / Val / Test ratios. The simplest "
+        "and most common choice for measuring 'how well does this model "
+        "do on this person'."),
+    ("loso_session",    "Leave-One-Session-Out",
+        "Train on every session but one, test on the held-out session. "
+        "The honest measure of session-to-session drift within the same "
+        "person — what a clinician actually cares about."),
+    ("within_session",  "Within-Session  (80/20)",
+        "Train on the first 80% of each session's windows, test on the "
+        "last 20%. Optimistic — windows from the same session share "
+        "hardware placement and user state — but useful as a ceiling."),
 ]
 
 
@@ -666,6 +695,245 @@ class _UnityPicker(_TreePicker):
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Intra-participant picker  (used by the intra-participant CV mode)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class _IntraParticipantPicker(QWidget):
+    """
+    Single-subject picker for intra-participant CV.
+
+    Layout: a participant dropdown at the top, followed by a checkable
+    list of that participant's available sessions (auto-populated when
+    the dropdown changes), and a pair of domain checkboxes for filtering
+    by recording origin (training-pipeline vs Unity).
+
+    The widget exposes the user's choice as a :class:`DataSubset` via
+    :meth:`current_subset` so the run handler can plug it straight into
+    a ``SweepDefaults`` without further translation.
+
+    Why a list of sessions instead of just a subject?
+    ─────────────────────────────────────────────────
+    The runner consumes a ``DataSelection`` whose granularity is
+    ``subjects`` and ``domains`` — there is no "specific sessions"
+    knob. So when the user un-ticks a session in the list, the only
+    truthful thing we can do is annotate the resulting subset's notes
+    with the user's intent ("excluded sessions: VP_07/sess_3"). The CV
+    runner will still see *all* sessions for that subject. That tradeoff
+    is documented in the picker's caption — exposing the list keeps the
+    user oriented even when it doesn't change what gets sent through.
+    """
+
+    selection_changed = Signal()
+
+    def __init__(self, data_dir: Path, parent: Optional[QWidget] = None):
+        super().__init__(parent)
+        self._data_dir = Path(data_dir)
+        self._available_subjects: List[str] = []
+        self._sessions_by_subject: Dict[str, List[Tuple[str, Path]]] = {}
+
+        outer = QVBoxLayout(self); outer.setContentsMargins(0, 0, 0, 0); outer.setSpacing(8)
+
+        # Caption
+        caption = QLabel(
+            "Pick one participant and run cross-validation across that "
+            "person's recordings only. Useful for the per-subject numbers "
+            "you need in a paper or thesis."
+        )
+        caption.setStyleSheet(f"color:{C_MUTED}; font-size:11px;")
+        caption.setWordWrap(True)
+        outer.addWidget(caption)
+
+        # Subject dropdown
+        subj_row = QHBoxLayout(); subj_row.setSpacing(6)
+        subj_lbl = QLabel("Participant:")
+        subj_lbl.setStyleSheet(f"color:{C_TEXT}; font-weight:600; font-size:11px;")
+        subj_row.addWidget(subj_lbl)
+        self._subject_combo = QComboBox(); self._subject_combo.setMinimumWidth(160)
+        self._subject_combo.currentIndexChanged.connect(self._on_subject_changed)
+        subj_row.addWidget(self._subject_combo, 1)
+        ref_btn = _ghost_button("⟳"); ref_btn.setToolTip("Re-scan data/sessions")
+        ref_btn.clicked.connect(self.refresh)
+        subj_row.addWidget(ref_btn)
+        outer.addLayout(subj_row)
+
+        # Domains
+        dom_row = QHBoxLayout(); dom_row.setSpacing(8)
+        self._dom_pipeline = QCheckBox("Training sessions"); self._dom_pipeline.setChecked(True)
+        self._dom_unity    = QCheckBox("Unity sessions");    self._dom_unity   .setChecked(True)
+        for cb in (self._dom_pipeline, self._dom_unity):
+            cb.toggled.connect(self._emit_changed)
+            dom_row.addWidget(cb)
+        dom_row.addStretch(1)
+        outer.addLayout(dom_row)
+
+        # Sessions list
+        sess_lbl = QLabel("Sessions  (informational — the runner uses all sessions for the subject):")
+        sess_lbl.setStyleSheet(f"color:{C_MUTED}; font-size:10px;")
+        outer.addWidget(sess_lbl)
+        self._session_list = QListWidget()
+        self._session_list.setStyleSheet(
+            f"QListWidget {{ background:{C_PANEL}; border:1px solid {C_BORDER2};"
+            f"  border-radius:6px; padding:4px; }}"
+            f"QListWidget::item {{ padding:5px 8px; border-radius:4px; }}"
+            f"QListWidget::item:selected {{ background:{C_CARD}; color:{C_TEXT}; }}"
+        )
+        outer.addWidget(self._session_list, 1)
+
+        # Footer
+        self._count_lbl = QLabel("")
+        self._count_lbl.setStyleSheet(f"color:{C_MUTED}; font-size:10px;")
+        outer.addWidget(self._count_lbl)
+
+        self.refresh()
+
+    # ── public API ────────────────────────────────────────────────────
+
+    def refresh(self) -> None:
+        """Re-scan the data directory for subjects and their sessions."""
+        prev = self._subject_combo.currentText()
+        self._available_subjects = self._discover_subjects()
+        self._sessions_by_subject = self._discover_sessions_by_subject()
+
+        self._subject_combo.blockSignals(True)
+        self._subject_combo.clear()
+        for s in self._available_subjects:
+            self._subject_combo.addItem(s, s)
+        # Try to restore previous selection
+        if prev:
+            idx = self._subject_combo.findText(prev)
+            if idx >= 0:
+                self._subject_combo.setCurrentIndex(idx)
+        self._subject_combo.blockSignals(False)
+
+        self._populate_session_list()
+        self._update_count()
+
+    def current_subject(self) -> Optional[str]:
+        return self._subject_combo.currentData() or None
+
+    def current_domains(self) -> List[str]:
+        out: List[str] = []
+        if self._dom_pipeline.isChecked(): out.append("pipeline")
+        if self._dom_unity   .isChecked(): out.append("unity")
+        return out
+
+    def current_subset(self) -> Optional[DataSubset]:
+        """Build a :class:`DataSubset` matching the current picker state."""
+        subj = self.current_subject()
+        if not subj:
+            return None
+        domains = self.current_domains()
+        # Both ticked = no domain filter (matches the editor dialog's convention)
+        if len(domains) == 2:
+            domains = []
+        # Note any unchecked sessions in the subset's notes for provenance
+        excluded = self._unchecked_sessions()
+        notes = ""
+        if excluded:
+            notes = f"informational: user un-ticked {len(excluded)} session(s)"
+        return DataSubset(
+            name=subj,
+            subjects=[subj],
+            domains=domains,
+            notes=notes,
+        )
+
+    # ── internal slots ────────────────────────────────────────────────
+
+    def _on_subject_changed(self, *_args) -> None:
+        self._populate_session_list()
+        self._update_count()
+        self._emit_changed()
+
+    def _emit_changed(self, *_args) -> None:
+        self.selection_changed.emit()
+
+    def _populate_session_list(self) -> None:
+        self._session_list.clear()
+        subj = self.current_subject()
+        if not subj:
+            return
+        for label, _path in self._sessions_by_subject.get(subj, []):
+            it = QListWidgetItem(label)
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Checked)
+            self._session_list.addItem(it)
+        self._session_list.itemChanged.connect(self._on_session_item_changed)
+
+    def _on_session_item_changed(self, _it) -> None:
+        self._update_count()
+        self._emit_changed()
+
+    def _unchecked_sessions(self) -> List[str]:
+        out: List[str] = []
+        for i in range(self._session_list.count()):
+            it = self._session_list.item(i)
+            if it.checkState() != Qt.CheckState.Checked:
+                out.append(it.text())
+        return out
+
+    def _update_count(self) -> None:
+        subj = self.current_subject() or "(none)"
+        all_sessions = self._sessions_by_subject.get(subj or "", [])
+        n_total = len(all_sessions)
+        n_checked = sum(
+            1 for i in range(self._session_list.count())
+            if self._session_list.item(i).checkState() == Qt.CheckState.Checked
+        )
+        self._count_lbl.setText(
+            f"Subject {subj}  ·  {n_checked} of {n_total} sessions checked"
+        )
+
+    # ── disk discovery ────────────────────────────────────────────────
+
+    def _discover_subjects(self) -> List[str]:
+        """Same logic as EvaluationTab._discover_subjects, kept here so the
+        picker is self-contained and refreshable in isolation."""
+        out: set = set()
+        sess_root = self._data_dir / "sessions"
+        if sess_root.exists():
+            for d in sess_root.iterdir():
+                if d.is_dir() and d.name not in {"unity_sessions"}:
+                    out.add(d.name)
+            unity_root = sess_root / "unity_sessions"
+            if unity_root.exists():
+                for d in unity_root.iterdir():
+                    if d.is_dir():
+                        out.add(d.name)
+        return sorted(out, key=lambda s: (not s.upper().startswith("VP_"), s))
+
+    def _discover_sessions_by_subject(self) -> Dict[str, List[Tuple[str, Path]]]:
+        """Return ``{subject: [(label, path), ...]}`` for both domains."""
+        out: Dict[str, List[Tuple[str, Path]]] = {}
+        sess_root = self._data_dir / "sessions"
+        if not sess_root.exists():
+            return out
+
+        # Pipeline (training) sessions
+        for subj_dir in sess_root.iterdir():
+            if not subj_dir.is_dir() or subj_dir.name == "unity_sessions":
+                continue
+            entries = []
+            for sd in sorted(subj_dir.iterdir()):
+                if sd.is_dir():
+                    entries.append((f"{sd.name}  (pipeline)", sd))
+            if entries:
+                out[subj_dir.name] = entries
+
+        # Unity sessions
+        unity_root = sess_root / "unity_sessions"
+        if unity_root.exists():
+            for subj_dir in unity_root.iterdir():
+                if not subj_dir.is_dir():
+                    continue
+                entries = out.setdefault(subj_dir.name, [])
+                for sd in sorted(subj_dir.iterdir()):
+                    if sd.is_dir():
+                        entries.append((f"{sd.name}  (unity)", sd))
+        return out
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # Per-result detail widgets  (used by the eval-result panel)
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -943,6 +1211,9 @@ class _EvaluationResultView(QWidget):
         self._export_menu.addSeparator()
         a_cm    = self._export_menu.addAction("Confusion matrix PNG…")
         a_box   = self._export_menu.addAction("Per-class F1 box plot PNG…")
+        a_pcbar = self._export_menu.addAction("Per-class F1 bar chart PNG…")
+        a_supp  = self._export_menu.addAction("Class support distribution PNG…")
+        a_conf  = self._export_menu.addAction("Confidence histogram PNG…")
         a_sweep = self._export_menu.addAction("Threshold sweep PNG…")
         a_feat  = self._export_menu.addAction("Per-feature accuracy PNG…")
         a_roc   = self._export_menu.addAction("ROC curve PNG…")
@@ -954,6 +1225,9 @@ class _EvaluationResultView(QWidget):
         a_pkg   .triggered.connect(self._on_export_bundle)
         a_cm    .triggered.connect(lambda: self._on_export_one("confusion_png"))
         a_box   .triggered.connect(lambda: self._on_export_one("boxplot_png"))
+        a_pcbar .triggered.connect(lambda: self._on_export_one("per_class_bar_png"))
+        a_supp  .triggered.connect(lambda: self._on_export_one("class_support_png"))
+        a_conf  .triggered.connect(lambda: self._on_export_one("confidence_hist_png"))
         a_sweep .triggered.connect(lambda: self._on_export_one("threshold_png"))
         a_feat  .triggered.connect(lambda: self._on_export_one("feature_bar_png"))
         a_roc   .triggered.connect(lambda: self._on_export_one("roc_png"))
@@ -967,7 +1241,7 @@ class _EvaluationResultView(QWidget):
 
         outer.addWidget(header)
 
-        # ── Cards row
+        # ── Cards row 1 — headline metrics (accuracy / F1 / etc.) ─
         ch = QWidget()
         clay = QHBoxLayout(ch); clay.setContentsMargins(0, 0, 0, 0); clay.setSpacing(10)
         self._card_acc   = _MetricCard("ACCURACY")
@@ -982,9 +1256,30 @@ class _EvaluationResultView(QWidget):
         clay.addStretch(1)
         outer.addWidget(ch)
 
+        # ── Cards row 2 — robustness / agreement metrics ─
+        # Cohen's κ and MCC are robust on imbalanced classes where raw
+        # accuracy is misleading; balanced accuracy is the macro-recall;
+        # top-2 / top-k accuracy only populates for multi-class with
+        # probabilities (cycles between top-2 and top-3 depending on
+        # class count, mirroring the existing _card_extra cycling).
+        ch2 = QWidget()
+        c2lay = QHBoxLayout(ch2); c2lay.setContentsMargins(0, 0, 0, 0); c2lay.setSpacing(10)
+        self._card_kappa = _MetricCard("COHEN'S  κ")
+        self._card_mcc   = _MetricCard("MCC")
+        self._card_bal   = _MetricCard("BALANCED  ACC")
+        self._card_topk  = _MetricCard("TOP-2  ACC")
+        for c in (self._card_kappa, self._card_mcc, self._card_bal, self._card_topk):
+            c2lay.addWidget(c)
+        c2lay.addStretch(1)
+        outer.addWidget(ch2)
+
         # ── Detail tabs
         self._tabs = QTabWidget(); self._tabs.setDocumentMode(True)
         self._tabs.setStyleSheet(f"QTabWidget::pane {{ border-top: 1px solid {C_BORDER2}; }}")
+        # Keep the tab body tall enough that confusion matrices, per-class
+        # tables and plots are actually legible; the surrounding scroll
+        # area handles the case where the window can't fit it all.
+        self._tabs.setMinimumHeight(360)
         outer.addWidget(self._tabs, 1)
 
         self._confusion = _ConfusionView();   self._tabs.addTab(self._confusion, "Confusion matrix")
@@ -1015,7 +1310,9 @@ class _EvaluationResultView(QWidget):
         self._title_lbl.setText("No evaluation run yet")
         self._sub_lbl.setText("Pick a source on the left, set options on the right, then press Run.")
         for c in (self._card_acc, self._card_f1, self._card_prec,
-                  self._card_rec, self._card_spec, self._card_extra):
+                  self._card_rec, self._card_spec, self._card_extra,
+                  self._card_kappa, self._card_mcc, self._card_bal,
+                  self._card_topk):
             c.set_value(float("nan"))
         self._confusion.set_matrix(None)
         self._per_class.set_rows([])
@@ -1075,6 +1372,52 @@ class _EvaluationResultView(QWidget):
                 len(result.per_class) if result.per_class else float("nan"),
                 fmt="{:.0f}",
             )
+
+        # Second row of cards — robustness/agreement metrics.
+        # Cohen's κ and MCC range from -1..+1, so they pass straight to
+        # _MetricCard, which formats them with three decimals (the
+        # 0..1 mapping that auto-converts to a percentage only triggers
+        # for values strictly between 0 and 1, which kappa is for any
+        # better-than-chance classifier).
+        self._card_kappa.set_value(
+            result.cohen_kappa if not np.isnan(result.cohen_kappa) else float("nan"),
+            caption="chance-corrected",
+        )
+        self._card_mcc.set_value(
+            result.mcc if not np.isnan(result.mcc) else float("nan"),
+            caption="Matthews corr.",
+        )
+        self._card_bal.set_value(
+            result.balanced_accuracy if not np.isnan(result.balanced_accuracy) else float("nan"),
+            caption="mean per-class recall",
+        )
+        # Top-k card cycles between top-2 and top-3 depending on which
+        # is more informative for the active class count. With probas
+        # absent the card stays at "—" via NaN.
+        n_classes = len(result.per_class) if result.per_class else 0
+        if result.top_3_accuracy is not None and n_classes >= 4:
+            self._card_topk.set_title("TOP-3  ACC")
+            self._card_topk.set_value(
+                result.top_3_accuracy,
+                caption=f"top-2: {result.top_2_accuracy * 100:.1f}%"
+                        if result.top_2_accuracy is not None else "",
+            )
+        elif result.top_2_accuracy is not None and n_classes >= 3:
+            self._card_topk.set_title("TOP-2  ACC")
+            self._card_topk.set_value(result.top_2_accuracy)
+        elif result.inference_ms_per_window is not None:
+            # Fall back to showing inference latency when top-k isn't
+            # available — equally useful for the "is this fast enough"
+            # question and the data is cheap to populate.
+            self._card_topk.set_title("LATENCY")
+            self._card_topk.set_value(
+                result.inference_ms_per_window,
+                fmt="{:.2f} ms",
+                caption="per window",
+            )
+        else:
+            self._card_topk.set_title("TOP-2  ACC")
+            self._card_topk.set_value(float("nan"))
 
         self._confusion.set_matrix(result.confusion)
         self._per_class.set_rows(result.per_class)
@@ -1209,6 +1552,24 @@ class _EvaluationResultView(QWidget):
                 self, "Save per-recording scatter PNG", "per_recording_scatter.png", "PNG (*.png)")
             if path:
                 self._save_per_recording_scatter_png(Path(path))
+        elif kind == "per_class_bar_png":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save per-class F1 bar chart PNG",
+                "per_class_f1_bar.png", "PNG (*.png)")
+            if path:
+                self._save_per_class_bar_png(Path(path))
+        elif kind == "class_support_png":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save class support distribution PNG",
+                "class_support.png", "PNG (*.png)")
+            if path:
+                self._save_class_support_png(Path(path))
+        elif kind == "confidence_hist_png":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save confidence histogram PNG",
+                "confidence_histogram.png", "PNG (*.png)")
+            if path:
+                self._save_confidence_histogram_png(Path(path))
         elif kind == "metrics_csv":
             path, _ = QFileDialog.getSaveFileName(
                 self, "Save per-class metrics CSV", "per_class_metrics.csv", "CSV (*.csv)")
@@ -1232,6 +1593,9 @@ class _EvaluationResultView(QWidget):
         self._save_per_recording_csv(target / "per_recording.csv")
         self._save_confusion_png(target / "confusion_matrix.png")
         self._save_boxplot_png(target / "per_class_f1_box.png")
+        self._save_per_class_bar_png(target / "per_class_f1_bar.png")
+        self._save_class_support_png(target / "class_support.png")
+        self._save_confidence_histogram_png(target / "confidence_histogram.png")
         self._save_threshold_sweep_csv(target / "threshold_sweep.csv")
         self._save_threshold_sweep_png(target / "threshold_sweep.png")
         self._save_feature_csv(target / "per_feature_accuracy.csv")
@@ -1674,6 +2038,185 @@ class _EvaluationResultView(QWidget):
         ax.set_ylim(0, 1.05)
         ax.set_ylabel("Accuracy")
         ax.set_title(f"Per-recording accuracy — {r.title}", fontsize=11, pad=12)
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+    # ── New (v3) plots — per-class bar, support distribution, conf hist
+
+    def _save_per_class_bar_png(self, path: Path) -> None:
+        """
+        Horizontal bar chart of per-class F1, sorted descending so the
+        worst class is at the bottom and immediately visible.
+
+        Companion to the existing per-class table — same data, different
+        shape: useful when scanning many classes at once or when the
+        figure is going into a paper.
+        """
+        r = self._current
+        if r is None or not r.per_class:
+            return
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            log.warning("matplotlib unavailable — per-class bar skipped: %s", exc)
+            return
+
+        # Sort classes by F1 descending; ties broken by support (more
+        # supported class first) so the order is stable across runs.
+        rows = sorted(r.per_class, key=lambda c: (-c.f1, -c.support))
+        names = [c.name for c in rows]
+        f1s   = [c.f1   for c in rows]
+        # Same green/amber/red palette the table uses
+        colors = ["#16a34a" if v >= 0.8 else "#d97706" if v >= 0.6 else "#dc2626"
+                  for v in f1s]
+
+        fig, ax = plt.subplots(figsize=(8, max(3.5, 0.42 * len(names) + 1.6)),
+                                dpi=140)
+        ys = list(range(len(names)))
+        ax.barh(ys, f1s, color=colors, edgecolor="#6d28d9", linewidth=1.0)
+        for y, v, c in zip(ys, f1s, rows):
+            ax.text(min(v + 0.015, 0.98), y, f"{v * 100:.1f}%  (n={c.support:,})",
+                    va="center", ha="left", fontsize=8, color="#1f2937")
+
+        ax.set_yticks(ys)
+        ax.set_yticklabels(names, fontsize=9)
+        ax.invert_yaxis()                 # best at the top
+        ax.set_xlim(0, 1.05)
+        ax.set_xlabel("F1")
+        ax.axvline(0.8, color="#16a34a", linewidth=1, linestyle=":", alpha=0.4)
+        ax.axvline(0.6, color="#d97706", linewidth=1, linestyle=":", alpha=0.4)
+        ax.set_title(f"Per-class F1 — {r.title}", fontsize=11, pad=10)
+        ax.grid(axis="x", alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+    def _save_class_support_png(self, path: Path) -> None:
+        """
+        Bar chart of class supports (sample counts) — exposes class
+        imbalance at a glance. A heavily skewed support is the single
+        biggest reason raw accuracy lies, so this plot belongs in any
+        results bundle.
+        """
+        r = self._current
+        if r is None or not r.per_class:
+            return
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            log.warning("matplotlib unavailable — support plot skipped: %s", exc)
+            return
+
+        # Keep the order from per_class (label-id ascending) so the
+        # plot mirrors the per-class table on screen.
+        rows = list(r.per_class)
+        names    = [c.name    for c in rows]
+        supports = [c.support for c in rows]
+        total    = sum(supports) or 1
+
+        fig, ax = plt.subplots(figsize=(max(7, 0.85 * len(names) + 2), 4.5), dpi=140)
+        xs = list(range(len(names)))
+        bars = ax.bar(xs, supports, color="#eef2ff", edgecolor="#6d28d9",
+                      linewidth=1.2)
+        # Annotate each bar with count and percentage of total
+        for x, s in zip(xs, supports):
+            pct = 100.0 * s / total
+            ax.text(x, s + max(supports) * 0.012,
+                    f"{s:,}\n({pct:.1f}%)",
+                    ha="center", va="bottom", fontsize=8, color="#1f2937")
+        # Reference line at uniform-distribution support
+        if names:
+            uniform = total / len(names)
+            ax.axhline(uniform, color="#0284c7", linewidth=1,
+                       linestyle="--", alpha=0.5,
+                       label=f"uniform = {uniform:,.0f}")
+            ax.legend(loc="upper right", fontsize=9, frameon=False)
+
+        ax.set_xticks(xs)
+        ax.set_xticklabels(names, rotation=20, ha="right", fontsize=9)
+        ax.set_ylabel("samples")
+        # Headroom for the top annotations
+        ax.set_ylim(0, max(supports) * 1.18 if supports else 1.0)
+        ax.set_title(f"Class support — {r.title}  (n = {total:,} total)",
+                     fontsize=11, pad=10)
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+    def _save_confidence_histogram_png(self, path: Path) -> None:
+        """
+        Stacked histogram of top-1 confidence on correct vs incorrect
+        predictions.
+
+        A well-calibrated model has its incorrect bars concentrated on
+        the LEFT of the plot (low confidence on its mistakes) and its
+        correct bars on the RIGHT (high confidence on its hits). Models
+        that are confident-and-wrong show their pathology here long
+        before ECE reduces it to a single number.
+
+        No-op when the result has no probabilities (e.g. Unity threshold
+        runs, or models that don't expose ``predict_proba``).
+        """
+        r = self._current
+        if r is None or not r.confidence_histogram:
+            return
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            log.warning("matplotlib unavailable — confidence hist skipped: %s", exc)
+            return
+
+        h = r.confidence_histogram
+        edges = np.asarray(h.get("bin_edges",        []), dtype=np.float64)
+        c_cnt = np.asarray(h.get("correct_counts",   []), dtype=np.int64)
+        i_cnt = np.asarray(h.get("incorrect_counts", []), dtype=np.int64)
+        if edges.size < 2 or c_cnt.size == 0 or i_cnt.size == 0:
+            return
+
+        centers = (edges[:-1] + edges[1:]) / 2.0
+        width = (edges[1] - edges[0]) * 0.95
+
+        fig, ax = plt.subplots(figsize=(8.5, 4.5), dpi=140)
+        # Stack incorrect on top of correct so the eye reads the total
+        # bar height as "samples in this confidence range" and the green
+        # vs red split as "how many of those were right".
+        ax.bar(centers, c_cnt, width=width,
+               color="#16a34a", edgecolor="white", linewidth=0.4,
+               label=f"correct  (n = {int(c_cnt.sum()):,})")
+        ax.bar(centers, i_cnt, width=width, bottom=c_cnt,
+               color="#dc2626", edgecolor="white", linewidth=0.4,
+               label=f"incorrect  (n = {int(i_cnt.sum()):,})")
+
+        # Annotate the chosen-confidence summary stats from the result
+        bits = []
+        if r.mean_confidence_correct is not None:
+            bits.append(f"mean conf ✓ {r.mean_confidence_correct * 100:.1f}%")
+        if r.mean_confidence_incorrect is not None:
+            bits.append(f"mean conf ✗ {r.mean_confidence_incorrect * 100:.1f}%")
+        if r.expected_calibration_error is not None:
+            bits.append(f"ECE {r.expected_calibration_error:.3f}")
+        if bits:
+            ax.text(0.02, 0.97, "  ·  ".join(bits),
+                    transform=ax.transAxes, fontsize=9, va="top",
+                    color="#374151",
+                    bbox=dict(boxstyle="round,pad=0.4",
+                              facecolor="#f8fafc", edgecolor="#c7d2fe"))
+
+        ax.set_xlabel("Top-1 prediction confidence")
+        ax.set_ylabel("samples")
+        ax.set_xlim(0, 1)
+        ax.set_title(f"Confidence histogram — {r.title}", fontsize=11, pad=10)
+        ax.legend(loc="upper left", fontsize=9, frameon=False,
+                  bbox_to_anchor=(0.02, 0.88))
         ax.grid(axis="y", alpha=0.3)
         fig.tight_layout()
         fig.savefig(path, bbox_inches="tight")
@@ -2579,14 +3122,30 @@ class _CrossValidationResultsView(QWidget):
         self._btn_export = _ghost_button("⤓ Export…", accent=True)
         self._btn_export.setEnabled(False)
         menu = QMenu(self._btn_export)
-        a_csv  = menu.addAction("Comparison CSV…")
-        a_pmcsv = menu.addAction("Per-model CSV…")
-        a_json = menu.addAction("Sweep JSON…")
-        a_pkg  = menu.addAction("Save full bundle (folder)…")
-        a_csv .triggered.connect(lambda: self.export_requested.emit("comparison_csv"))
-        a_pmcsv.triggered.connect(lambda: self.export_requested.emit("per_model_csv"))
-        a_json.triggered.connect(lambda: self.export_requested.emit("summary_json"))
-        a_pkg .triggered.connect(lambda: self.export_requested.emit("bundle"))
+        a_pkg     = menu.addAction("Save full bundle (folder)…")
+        menu.addSeparator()
+        a_acc_png = menu.addAction("Accuracy bar chart PNG…")
+        a_f1_png  = menu.addAction("Macro-F1 bar chart PNG…")
+        a_fold_png = menu.addAction("Per-fold scatter PNG…")
+        a_box_acc = menu.addAction("Per-fold accuracy box plot PNG…")
+        a_box_f1  = menu.addAction("Per-fold macro-F1 box plot PNG…")
+        a_train   = menu.addAction("Train-time bar chart PNG…")
+        a_plots   = menu.addAction("All performance plots (folder)…")
+        menu.addSeparator()
+        a_csv     = menu.addAction("Comparison CSV…")
+        a_pmcsv   = menu.addAction("Per-model CSV…")
+        a_json    = menu.addAction("Sweep JSON…")
+        a_pkg    .triggered.connect(lambda: self.export_requested.emit("bundle"))
+        a_acc_png.triggered.connect(lambda: self.export_requested.emit("accuracy_png"))
+        a_f1_png .triggered.connect(lambda: self.export_requested.emit("macro_f1_png"))
+        a_fold_png.triggered.connect(lambda: self.export_requested.emit("per_fold_png"))
+        a_box_acc.triggered.connect(lambda: self.export_requested.emit("acc_box_png"))
+        a_box_f1 .triggered.connect(lambda: self.export_requested.emit("f1_box_png"))
+        a_train  .triggered.connect(lambda: self.export_requested.emit("train_time_png"))
+        a_plots  .triggered.connect(lambda: self.export_requested.emit("plots"))
+        a_csv    .triggered.connect(lambda: self.export_requested.emit("comparison_csv"))
+        a_pmcsv  .triggered.connect(lambda: self.export_requested.emit("per_model_csv"))
+        a_json   .triggered.connect(lambda: self.export_requested.emit("summary_json"))
         self._btn_export.setMenu(menu)
         self._btn_export.setPopupMode(QToolButton.ToolButtonPopupMode.InstantPopup)
         header.addWidget(self._btn_export, 0, Qt.AlignmentFlag.AlignTop)
@@ -2699,6 +3258,7 @@ class EvaluationTab(QWidget):
     _PICKER_PAGE_GAMES    = 1
     _PICKER_PAGE_UNITY    = 2
     _PICKER_PAGE_CV       = 3
+    _PICKER_PAGE_INTRA_VP = 4
     _RESULTS_PAGE_EVAL    = 0
     _RESULTS_PAGE_CV      = 1
 
@@ -2707,6 +3267,13 @@ class EvaluationTab(QWidget):
     _CV_AXIS_PAGE_MODEL   = 1
     _CV_AXIS_PAGE_FEATURES = 2
     _CV_AXIS_PAGE_SUBSET  = 3
+
+    # Intra-participant "vary by" sub-stack page indices.
+    # The intra-VP axis omits data_subset (subject is locked), so the
+    # values here mirror the CV ones but stop at FEATURES.
+    _INTRA_AXIS_PAGE_NONE     = 0
+    _INTRA_AXIS_PAGE_MODEL    = 1
+    _INTRA_AXIS_PAGE_FEATURES = 2
 
     def __init__(self, data_manager: Any, parent: Optional[QWidget] = None):
         super().__init__(parent)
@@ -2724,6 +3291,13 @@ class EvaluationTab(QWidget):
         self._cv_completed_runs: List[Tuple[str, Any]] = []
         self._cv_axis_label: str = "(none)"
 
+        # Per-run fold-level capture, keyed by run label. Populated as
+        # each fold finishes so the plot exporter can show individual
+        # fold accuracies overlaid on the per-run summary bars. Both CV
+        # and intra-VP modes feed this — same machinery, same data shape.
+        self._cv_per_fold: Dict[str, List[FoldResult]] = {}
+        self._cv_current_run_label: str = ""
+
         # Default subset for CV mode (used when axis ≠ data_subset)
         self._cv_default_subset: DataSubset = DataSubset(
             name="default", subjects=[], domains=[],
@@ -2738,8 +3312,11 @@ class EvaluationTab(QWidget):
         body = QSplitter(Qt.Orientation.Vertical)
         body.addWidget(self._build_top_pane())
         body.addWidget(self._build_results_pane())
-        body.setStretchFactor(0, 1); body.setStretchFactor(1, 1)
-        body.setSizes([460, 600])
+        # The results pane grows preferentially when the window is
+        # resized; the top pane (pickers + settings) already scrolls
+        # internally so it copes with whatever height is left.
+        body.setStretchFactor(0, 0); body.setStretchFactor(1, 1)
+        body.setSizes([420, 760])
         body.setHandleWidth(6)
         outer.addWidget(body, 1)
 
@@ -2823,6 +3400,10 @@ class EvaluationTab(QWidget):
         split.addWidget(self._build_settings_column())
         split.setStretchFactor(0, 5); split.setStretchFactor(1, 6)
         split.setSizes([520, 660])
+        # Both children scroll internally, so the top pane can be dragged
+        # quite short without losing usability — that headroom is what
+        # lets the results pane below grow on small displays.
+        split.setMinimumHeight(220)
         return split
 
     def _build_selection_stack(self) -> QWidget:
@@ -2886,6 +3467,39 @@ class EvaluationTab(QWidget):
         cv_lay.addWidget(cv_title, 1)
 
         self._selection_stack.addWidget(cv_wrap)
+
+        # Intra-participant page — single-subject picker plus the inner
+        # "vary by" stack for None / Model / Features (no DataSubset).
+        self._intra_picker = _IntraParticipantPicker(self._data_dir)
+
+        self._intra_axis_stack = QStackedWidget()
+        none_intra = QWidget(); none_intra_l = QVBoxLayout(none_intra)
+        none_intra_l.setContentsMargins(8, 8, 8, 8)
+        none_intra_msg = QLabel(
+            "No comparison axis selected.\n\n"
+            "Single-run mode runs one CV experiment for the chosen "
+            "participant using the default model and features. Pick an "
+            "axis on the right to compare multiple models or feature sets."
+        )
+        none_intra_msg.setWordWrap(True)
+        none_intra_msg.setStyleSheet(f"color:{C_MUTED}; font-size:11px; padding:20px;")
+        none_intra_l.addWidget(none_intra_msg); none_intra_l.addStretch(1)
+        self._intra_axis_stack.addWidget(none_intra)
+
+        self._intra_model_axis    = _ModelAxisPanel()
+        self._intra_features_axis = _FeaturesAxisPanel()
+        self._intra_axis_stack.addWidget(self._intra_model_axis)
+        self._intra_axis_stack.addWidget(self._intra_features_axis)
+
+        intra_wrap = QWidget()
+        iw_lay = QVBoxLayout(intra_wrap); iw_lay.setContentsMargins(0, 0, 0, 0); iw_lay.setSpacing(8)
+        iw_lay.addWidget(self._intra_picker, 2)
+        intra_axis_box = _styled_group("Comparison values")
+        intra_axis_lay = QVBoxLayout(); intra_axis_lay.addWidget(self._intra_axis_stack)
+        intra_axis_box.setLayout(intra_axis_lay)
+        iw_lay.addWidget(intra_axis_box, 3)
+
+        self._selection_stack.addWidget(intra_wrap)
         return self._selection_stack
 
     @staticmethod
@@ -2918,6 +3532,7 @@ class EvaluationTab(QWidget):
         # ── Games-mode groups ────────────────────────────────────────
         self._g_games_source   = self._build_g_games_source()
         self._g_games_filter   = self._build_g_games_filter()
+        self._g_games_cohort   = self._build_g_games_cohort()
         self._g_games_replay   = self._build_g_games_replay()
 
         # ── Unity-mode groups ────────────────────────────────────────
@@ -2930,6 +3545,12 @@ class EvaluationTab(QWidget):
         self._g_cv_strategy    = self._build_g_cv_strategy()
         self._g_cv_windowing   = self._build_g_cv_windowing()
         self._g_cv_defaults    = self._build_g_cv_defaults()
+
+        # ── Intra-participant CV groups ──────────────────────────────
+        self._g_intra_axis      = self._build_g_intra_axis()
+        self._g_intra_strategy  = self._build_g_intra_strategy()
+        self._g_intra_windowing = self._build_g_intra_windowing()
+        self._g_intra_defaults  = self._build_g_intra_defaults()
 
         # ── Run row (bottom of the scroll) ───────────────────────────
         # The Run button label changes per mode. Cancel is only useful
@@ -2955,10 +3576,13 @@ class EvaluationTab(QWidget):
         all_groups = [
             self._g_sessions_model, self._g_sessions_windowing,
             self._g_sessions_preprocessing, self._g_sessions_features,
-            self._g_games_source, self._g_games_filter, self._g_games_replay,
+            self._g_games_source, self._g_games_filter,
+            self._g_games_cohort, self._g_games_replay,
             self._g_unity_about, self._g_unity_objective, self._g_unity_rms,
             self._g_cv_axis, self._g_cv_strategy, self._g_cv_windowing,
             self._g_cv_defaults,
+            self._g_intra_axis, self._g_intra_strategy,
+            self._g_intra_windowing, self._g_intra_defaults,
         ]
         return _settings_scroll_host(all_groups, run_holder)
 
@@ -3085,6 +3709,141 @@ class EvaluationTab(QWidget):
         gf.addRow("", self._games_per_chk)
         g.setLayout(gf)
         return g
+
+    def _build_g_games_cohort(self) -> QGroupBox:
+        """
+        Optional healthy / impaired tagging for the per-recording
+        breakdown. When enabled with a valid registry, every per-
+        recording row in the result notes is annotated with the
+        subject's cohort, so healthy and impaired participants can be
+        told apart at a glance.
+        """
+        g = _styled_group("Cohort tagging  (games)")
+        gc = _form()
+
+        info = QLabel(
+            "Tag each per-recording row with the participant's cohort "
+            "(healthy / impaired), read from a participant_groups.json "
+            "registry. Purely additive — it does not change the scores."
+        )
+        info.setStyleSheet(f"color:{C_MUTED}; font-size:10px;")
+        info.setWordWrap(True)
+        gc.addRow(info)
+
+        self._games_cohort_chk = QCheckBox("Tag per-recording rows by cohort")
+        self._games_cohort_chk.setChecked(False)
+        gc.addRow("", self._games_cohort_chk)
+
+        # Registry path + browse + edit.
+        self._games_groups_edit = QLineEdit(
+            str(default_groups_path(self._data_dir))
+        )
+        self._games_groups_edit.setPlaceholderText("participant_groups.json")
+        self._games_groups_edit.setEnabled(False)
+        browse_btn = _ghost_button("…")
+        browse_btn.setEnabled(False)
+        browse_btn.clicked.connect(self._on_browse_games_groups)
+        edit_btn = _ghost_button("Edit")
+        edit_btn.setEnabled(False)
+        edit_btn.clicked.connect(self._on_edit_games_groups)
+        path_row = QHBoxLayout()
+        path_row.setContentsMargins(0, 0, 0, 0); path_row.setSpacing(6)
+        path_row.addWidget(self._games_groups_edit, 1)
+        path_row.addWidget(browse_btn)
+        path_row.addWidget(edit_btn)
+        path_w = QWidget(); path_w.setLayout(path_row)
+        gc.addRow("Groups file:", path_w)
+
+        self._games_groups_status = QLabel("")
+        self._games_groups_status.setTextFormat(Qt.TextFormat.RichText)
+        self._games_groups_status.setStyleSheet("font-size:10px;")
+        gc.addRow("", self._games_groups_status)
+
+        # Enable the path widgets only when tagging is on.
+        def _toggle(on: bool) -> None:
+            self._games_groups_edit.setEnabled(on)
+            browse_btn.setEnabled(on)
+            edit_btn.setEnabled(on)
+            self._refresh_games_groups_status()
+        self._games_cohort_chk.toggled.connect(_toggle)
+        self._games_groups_edit.textChanged.connect(
+            lambda *_: self._refresh_games_groups_status()
+        )
+
+        g.setLayout(gc)
+        return g
+
+    def _on_browse_games_groups(self) -> None:
+        start = self._games_groups_edit.text().strip() or str(self._data_dir)
+        chosen, _ = QFileDialog.getOpenFileName(
+            self, "Participant-group registry", start,
+            "Group registry (*.json *.csv);;All files (*)",
+        )
+        if chosen:
+            self._games_groups_edit.setText(chosen)
+
+    def _on_edit_games_groups(self) -> None:
+        try:
+            from playagain_pipeline.gui.widgets.participant_groups_dialog import (
+                ParticipantGroupsDialog,
+            )
+        except Exception as exc:                                # noqa: BLE001
+            QMessageBox.warning(
+                self, "Editor unavailable",
+                f"Could not open the participant-group editor:\n\n{exc}")
+            return
+        cur = Path(self._games_groups_edit.text().strip())
+        dlg = ParticipantGroupsDialog(
+            data_dir=self._data_dir,
+            initial_path=cur if cur.exists() else None,
+            parent=self,
+        )
+        dlg.registry_saved.connect(
+            lambda p: self._games_groups_edit.setText(str(p))
+        )
+        dlg.show()
+
+    def _refresh_games_groups_status(self) -> None:
+        if not getattr(self, "_games_cohort_chk", None) \
+                or not self._games_cohort_chk.isChecked():
+            self._games_groups_status.setText("")
+            return
+        path = Path(self._games_groups_edit.text().strip())
+        if not path.exists():
+            self._games_groups_status.setText(
+                "<span style='color:#94a3b8;'>file not found — rows will "
+                "not be tagged</span>")
+            return
+        try:
+            groups = ParticipantGroups.from_file(path)
+            counts = groups.counts()
+        except Exception as exc:                                # noqa: BLE001
+            self._games_groups_status.setText(
+                f"<span style='color:#dc2626;'>⚠ {exc}</span>")
+            return
+        self._games_groups_status.setText(
+            f"<span style='color:#16a34a;'>✓ {counts.get(GROUP_HEALTHY, 0)} "
+            f"healthy · {counts.get(GROUP_IMPAIRED, 0)} impaired</span>")
+
+    def _games_group_resolver(self):
+        """
+        Build a ``subject_id -> cohort`` callable for GameEvalSettings,
+        or ``None`` when cohort tagging is off / unavailable. Kept as a
+        plain closure so the evaluation backend needs no validation
+        import.
+        """
+        if not self._games_cohort_chk.isChecked():
+            return None
+        path = Path(self._games_groups_edit.text().strip())
+        if not path.exists():
+            return None
+        try:
+            groups = ParticipantGroups.from_file(path)
+        except Exception as exc:                                # noqa: BLE001
+            log.warning("Cohort tagging disabled — bad registry %s: %s",
+                        path, exc)
+            return None
+        return lambda subject_id: groups.group_of(subject_id)
 
     def _build_g_games_replay(self) -> QGroupBox:
         g = _styled_group("Replay options  (games)")
@@ -3295,6 +4054,140 @@ class EvaluationTab(QWidget):
         return g
 
     # ──────────────────────────────────────────────────────────────────
+    # Settings group builders — Intra-participant CV mode
+    # ──────────────────────────────────────────────────────────────────
+    # These mirror the cross-validation groups but are trimmed for the
+    # single-subject case: the comparison axis can vary by model or
+    # features (but NOT by data subset, since the subset is locked to
+    # the picker's chosen participant), and the CV strategy menu is the
+    # curated list in ``_INTRA_VP_STRATEGIES`` instead of the full set.
+
+    def _build_g_intra_axis(self) -> QGroupBox:
+        g = _styled_group("Comparison axis  (intra-participant)")
+        ga = _form()
+        self._intra_axis_combo = QComboBox()
+        # data_subset is intentionally absent here — varying by data
+        # subset doesn't make sense when the subject is fixed.
+        self._intra_axis_combo.addItem("Single run  (no comparison)", "none")
+        self._intra_axis_combo.addItem("Vary by model",               "model")
+        self._intra_axis_combo.addItem("Vary by feature set",         "features")
+        self._intra_axis_combo.currentIndexChanged.connect(self._on_intra_axis_changed)
+        ga.addRow("Vary by:", self._intra_axis_combo)
+
+        self._intra_name_edit = QLineEdit("intra_vp_sweep")
+        ga.addRow("Run name:", self._intra_name_edit)
+        self._intra_seed_spin = QSpinBox(); self._intra_seed_spin.setRange(0, 99999); self._intra_seed_spin.setValue(42)
+        ga.addRow("Seed:", self._intra_seed_spin)
+        g.setLayout(ga)
+        return g
+
+    def _build_g_intra_strategy(self) -> QGroupBox:
+        g = _styled_group("CV strategy  (intra-participant)")
+        gv = QVBoxLayout(); gv.setSpacing(8)
+        cv_form = _form()
+        self._intra_strategy_combo = QComboBox()
+        for key, label, tooltip in _INTRA_VP_STRATEGIES:
+            self._intra_strategy_combo.addItem(label, key)
+            self._intra_strategy_combo.setItemData(
+                self._intra_strategy_combo.count() - 1, tooltip,
+                Qt.ItemDataRole.ToolTipRole,
+            )
+        self._intra_strategy_combo.currentIndexChanged.connect(self._on_intra_strategy_changed)
+        cv_form.addRow("Strategy:", self._intra_strategy_combo)
+        gv.addLayout(cv_form)
+
+        # Strategy-specific parameter stack — one page per strategy.
+        # The page indices are derived dynamically from _INTRA_VP_STRATEGIES
+        # in _on_intra_strategy_changed so re-ordering the strategy list
+        # never desynchronises the params.
+        self._intra_params_stack = QStackedWidget()
+
+        # Page A: holdout — train / val / test ratios + stratification
+        ho_w = QWidget(); ho_l = _form()
+        self._intra_ho_val  = QDoubleSpinBox(); self._intra_ho_val .setRange(0.0, 0.5); self._intra_ho_val .setSingleStep(0.05); self._intra_ho_val .setValue(0.15)
+        self._intra_ho_test = QDoubleSpinBox(); self._intra_ho_test.setRange(0.0, 0.5); self._intra_ho_test.setSingleStep(0.05); self._intra_ho_test.setValue(0.20)
+        self._intra_ho_strat = QComboBox()
+        self._intra_ho_strat.addItem("None",       "none")
+        self._intra_ho_strat.addItem("By class",   "class")
+        self._intra_ho_strat.addItem("By session", "subject")    # 'subject' is the runner's name; stratifying within one subject ⇒ effectively per-session
+        ho_l.addRow("Val ratio:",  self._intra_ho_val)
+        ho_l.addRow("Test ratio:", self._intra_ho_test)
+        ho_l.addRow("Stratify:",   self._intra_ho_strat)
+        ho_w.setLayout(ho_l); self._intra_params_stack.addWidget(ho_w)
+
+        # Page B: leave-one-session-out — no params (strategy is parameterless)
+        loso_w = QWidget(); loso_l = QVBoxLayout(loso_w); loso_l.setContentsMargins(4, 4, 4, 4)
+        loso_msg = QLabel(
+            "No parameters — runs once per session in the participant's "
+            "data, holding that session out as the test set each time."
+        )
+        loso_msg.setWordWrap(True)
+        loso_msg.setStyleSheet(f"color:{C_MUTED}; font-size:10px;")
+        loso_l.addWidget(loso_msg); loso_l.addStretch(1)
+        self._intra_params_stack.addWidget(loso_w)
+
+        # Page C: within-session — no params (fixed 80/20)
+        ws_w = QWidget(); ws_l = QVBoxLayout(ws_w); ws_l.setContentsMargins(4, 4, 4, 4)
+        ws_msg = QLabel(
+            "No parameters — uses the first 80% of each session's "
+            "windows for training and the last 20% for testing. "
+            "Optimistic but useful as an upper bound."
+        )
+        ws_msg.setWordWrap(True)
+        ws_msg.setStyleSheet(f"color:{C_MUTED}; font-size:10px;")
+        ws_l.addWidget(ws_msg); ws_l.addStretch(1)
+        self._intra_params_stack.addWidget(ws_w)
+
+        gv.addWidget(self._intra_params_stack)
+        g.setLayout(gv)
+        return g
+
+    def _build_g_intra_windowing(self) -> QGroupBox:
+        g = _styled_group("Windowing  (intra-participant)")
+        gw = _form()
+        self._intra_win_spin = QSpinBox(); self._intra_win_spin.setRange(50, 5000); self._intra_win_spin.setSingleStep(50); self._intra_win_spin.setValue(200); self._intra_win_spin.setSuffix(" ms")
+        gw.addRow("Window length:", self._intra_win_spin)
+        self._intra_stride_spin = QSpinBox(); self._intra_stride_spin.setRange(1, 5000); self._intra_stride_spin.setValue(50); self._intra_stride_spin.setSuffix(" ms")
+        gw.addRow("Window stride:", self._intra_stride_spin)
+        self._intra_drop_rest_chk = QCheckBox("Drop rest-class windows during training")
+        self._intra_drop_rest_chk.setChecked(False)
+        self._intra_drop_rest_chk.setToolTip(
+            "When checked, label-0 (rest) windows are removed before training. "
+            "Useful for measuring per-active-gesture accuracy in isolation."
+        )
+        gw.addRow("", self._intra_drop_rest_chk)
+        g.setLayout(gw)
+        return g
+
+    def _build_g_intra_defaults(self) -> QGroupBox:
+        # Intentionally lighter than the CV-mode defaults group: there is
+        # no "default subset" row because the subject picker on the left
+        # already pins the data subset.
+        g = _styled_group("Defaults for non-varied axes  (intra-participant)")
+        gd = QVBoxLayout(); gd.setSpacing(10)
+
+        # Default model
+        def_form = _form()
+        self._intra_default_model = QComboBox()
+        for key, _ in _AVAILABLE_MODELS:
+            self._intra_default_model.addItem(key, key)
+        idx = self._intra_default_model.findData(_DEFAULT_MODEL)
+        if idx >= 0:
+            self._intra_default_model.setCurrentIndex(idx)
+        def_form.addRow("Default model:", self._intra_default_model)
+        gd.addLayout(def_form)
+
+        # Default features
+        feat_lab = QLabel("Default features  (used when axis ≠ features):")
+        feat_lab.setStyleSheet(f"color:{C_MUTED}; font-size:10px; letter-spacing:0.04em;")
+        gd.addWidget(feat_lab)
+        self._intra_default_features = _CheckList(_AVAILABLE_FEATURES,
+                                                    initial_checked=_DEFAULT_FEATURE_SET)
+        gd.addWidget(self._intra_default_features)
+        g.setLayout(gd)
+        return g
+
+    # ──────────────────────────────────────────────────────────────────
     # Results pane (stacked: eval result | CV comparison)
     # ──────────────────────────────────────────────────────────────────
 
@@ -3305,9 +4198,27 @@ class EvaluationTab(QWidget):
         self._cv_results   = _CrossValidationResultsView()
         self._cv_results.export_requested.connect(self._on_cv_export)
 
+        # Give each results view a real minimum height. Without this the
+        # vertical splitter can squeeze the metric cards + detail tabs
+        # into an unreadable strip when the window is short. The scroll
+        # area below then lets the user scroll instead of crushing.
+        self._eval_results.setMinimumHeight(620)
+        self._cv_results.setMinimumHeight(620)
+
         self._results_stack.addWidget(self._eval_results)   # page 0
         self._results_stack.addWidget(self._cv_results)     # page 1
-        return self._results_stack
+
+        # Wrap the stack in a scroll area: when the results pane is tall
+        # enough everything shows at once; when it isn't, the user gets a
+        # scrollbar rather than shrunken charts and tables.
+        results_scroll = QScrollArea()
+        results_scroll.setWidgetResizable(True)
+        results_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        results_scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        results_scroll.setWidget(self._results_stack)
+        return results_scroll
 
     # ──────────────────────────────────────────────────────────────────
     # Mode-switching slots
@@ -3331,14 +4242,17 @@ class EvaluationTab(QWidget):
         sessions_groups = (self._g_sessions_model, self._g_sessions_windowing,
                            self._g_sessions_preprocessing, self._g_sessions_features)
         games_groups    = (self._g_games_source, self._g_games_filter,
-                           self._g_games_replay)
+                           self._g_games_cohort, self._g_games_replay)
         unity_groups    = (self._g_unity_about, self._g_unity_objective,
                            self._g_unity_rms)
         cv_groups       = (self._g_cv_axis, self._g_cv_strategy,
                            self._g_cv_windowing, self._g_cv_defaults)
+        intra_groups    = (self._g_intra_axis, self._g_intra_strategy,
+                           self._g_intra_windowing, self._g_intra_defaults)
 
         all_off = (
             *sessions_groups, *games_groups, *unity_groups, *cv_groups,
+            *intra_groups,
         )
         for g in all_off:
             g.setVisible(False)
@@ -3376,13 +4290,25 @@ class EvaluationTab(QWidget):
             # Sync the CV inner stacks with the combos
             self._on_cv_axis_changed()
             self._on_cv_strategy_changed()
+        elif mode == EVAL_TYPE_INTRA_VP:
+            for g in intra_groups: g.setVisible(True)
+            self._selection_stack.setCurrentIndex(self._PICKER_PAGE_INTRA_VP)
+            # Reuse the CV results panel — comparison + per-fold + log
+            # are exactly the same shape, just with a single subject's
+            # data behind every run.
+            self._results_stack.setCurrentIndex(self._RESULTS_PAGE_CV)
+            self._btn_features.setVisible(False)
+            self._btn_run.setText("▶  Run intra-participant CV")
+            self._type_hint.setText("Cross-validate a single participant's data — one VP, one sweep.")
+            # Sync the intra-VP inner stacks with the combos
+            self._on_intra_axis_changed()
+            self._on_intra_strategy_changed()
         else:
             log.warning("Unknown evaluation type: %r", mode)
 
-        # Cancel button is only useful in CV mode AND only enabled while
-        # a sweep is in flight; here we just make sure it's disabled
-        # whenever the mode changes (a fresh switch never has a worker
-        # running).
+        # Cancel button is only useful while a sweep is in flight; here
+        # we just make sure it's disabled whenever the mode changes (a
+        # fresh switch never has a worker running).
         self._btn_cancel.setEnabled(False)
 
     def _on_cv_axis_changed(self, *_args) -> None:
@@ -3409,6 +4335,34 @@ class EvaluationTab(QWidget):
         }
         self._cv_params_stack.setCurrentIndex(idx_map.get(key, 0))
 
+    def _on_intra_axis_changed(self, *_args) -> None:
+        """Swap the intra-VP axis-values stack to match the combo."""
+        axis = self._intra_axis_combo.currentData()
+        idx_map = {
+            "none":     self._INTRA_AXIS_PAGE_NONE,
+            "model":    self._INTRA_AXIS_PAGE_MODEL,
+            "features": self._INTRA_AXIS_PAGE_FEATURES,
+        }
+        self._intra_axis_stack.setCurrentIndex(idx_map.get(axis, self._INTRA_AXIS_PAGE_NONE))
+
+    def _on_intra_strategy_changed(self, *_args) -> None:
+        """
+        Swap the intra-VP params stack to match the chosen strategy.
+
+        The mapping comes straight from the order strategies are added
+        in ``_build_g_intra_strategy``:
+          page 0 = holdout_split  (val/test ratios + stratify)
+          page 1 = loso_session   (no params)
+          page 2 = within_session (no params)
+        """
+        key = self._intra_strategy_combo.currentData()
+        idx_map = {
+            "holdout_split":   0,
+            "loso_session":    1,
+            "within_session":  2,
+        }
+        self._intra_params_stack.setCurrentIndex(idx_map.get(key, 0))
+
     def _on_games_source_changed(self, *_args) -> None:
         """
         Keep the Games-mode replay options visible only when source = replay.
@@ -3430,6 +4384,7 @@ class EvaluationTab(QWidget):
         self._sessions_picker.refresh()
         self._games_picker.refresh()
         self._unity_picker.refresh()
+        self._intra_picker.refresh()
         self._refresh_sessions_models()
         self._refresh_games_models()
         self._refresh_cv_subjects()
@@ -3510,11 +4465,19 @@ class EvaluationTab(QWidget):
             self._run_unity()
         elif mode == EVAL_TYPE_CV:
             self._on_run_cv_clicked()
+        elif mode == EVAL_TYPE_INTRA_VP:
+            self._on_run_intra_clicked()
         else:
             log.warning("Unknown evaluation type at run time: %r", mode)
 
     def _on_cancel_clicked(self) -> None:
-        """Only meaningful in CV mode while a sweep is running."""
+        """
+        Only meaningful while a sweep is running.
+
+        Both CV and intra-VP modes share the same sweep machinery
+        (``_SweepWorker`` + ``_SweepProgressBridge``), so a single cancel
+        path covers both.
+        """
         if self._cv_bridge is not None:
             self._cv_bridge.request_cancel()
             self._cv_results.append_log(
@@ -3568,6 +4531,7 @@ class EvaluationTab(QWidget):
             min_confidence=(self._games_min_conf_spin.value()
                             if self._games_min_conf_chk.isChecked() else None),
             per_recording_breakdown=self._games_per_chk.isChecked(),
+            group_of=self._games_group_resolver(),
         )
         if mode == "replay":
             model_name = self._games_model_combo.currentData()
@@ -3752,10 +4716,119 @@ class EvaluationTab(QWidget):
 
         self._launch_sweep(plans, axis_label=axis)
 
+    # ──────────────────────────────────────────────────────────────────
+    # Run handler — Intra-participant CV  (mode 5)
+    # ──────────────────────────────────────────────────────────────────
+
+    def _collect_intra_defaults(self, locked_subset: DataSubset) -> SweepDefaults:
+        """
+        Build a :class:`SweepDefaults` for the intra-participant sweep.
+
+        ``locked_subset`` is the picker's current subject — passed in
+        as the ``default_subset`` so even runs on the model/features
+        axis stay constrained to the chosen VP. The CV strategy and its
+        per-strategy kwargs come from the intra-VP combos.
+        """
+        cv_key = self._intra_strategy_combo.currentData()
+        cv_kwargs: Dict[str, Any] = {}
+        if cv_key == "holdout_split":
+            cv_kwargs = {
+                "val_ratio":   float(self._intra_ho_val .value()),
+                "test_ratio":  float(self._intra_ho_test.value()),
+                "seed":        int(self._intra_seed_spin.value()),
+                "stratify_by": self._intra_ho_strat.currentData(),
+            }
+        # loso_session and within_session take no kwargs.
+
+        return SweepDefaults(
+            name=self._intra_name_edit.text().strip() or "intra_vp_sweep",
+            seed=int(self._intra_seed_spin.value()),
+            window_ms=int(self._intra_win_spin.value()),
+            stride_ms=int(self._intra_stride_spin.value()),
+            drop_rest=self._intra_drop_rest_chk.isChecked(),
+            cv_strategy=cv_key,
+            cv_kwargs=cv_kwargs,
+            default_subset=locked_subset,
+            default_models=[self._intra_default_model.currentData()],
+            default_features=self._intra_default_features.selected(),
+        )
+
+    def _on_run_intra_clicked(self) -> None:
+        """
+        Build a sweep where the data subset is locked to the picker's
+        chosen participant. The comparison axis can still be none / model
+        / features (so within one VP you can compare e.g. lda vs catboost
+        vs random_forest), but never data_subset — that knob is replaced
+        by the picker.
+        """
+        # 1) Pin the data subset to whatever the picker says
+        locked_subset = self._intra_picker.current_subset()
+        if locked_subset is None:
+            QMessageBox.warning(self, "No participant selected",
+                                "Pick a participant from the dropdown on the left.")
+            return
+
+        # 2) Pre-flight: at least one default feature must be checked
+        defaults = self._collect_intra_defaults(locked_subset)
+        if not defaults.default_features:
+            QMessageBox.warning(self, "No default features",
+                                "Select at least one default feature in the "
+                                "«Defaults for non-varied axes» group.")
+            return
+
+        # 3) Build plans per axis, mirroring the CV-mode logic but with
+        #    no data_subset axis available.
+        axis = self._intra_axis_combo.currentData()
+        if axis == "none":
+            plans = plan_sweep(axis="none", defaults=defaults)
+        elif axis == "model":
+            models, labels = self._intra_model_axis.axis_values()
+            if not models:
+                QMessageBox.warning(self, "No models selected",
+                                    "Tick at least one model in the comparison list.")
+                return
+            plans = plan_sweep(axis="model", defaults=defaults,
+                                axis_models=models, axis_labels=labels)
+        elif axis == "features":
+            feats, labels = self._intra_features_axis.axis_values()
+            if not feats:
+                QMessageBox.warning(self, "No feature presets",
+                                    "Add at least one feature preset to compare.")
+                return
+            plans = plan_sweep(axis="features", defaults=defaults,
+                                axis_features=feats, axis_labels=labels)
+        else:
+            QMessageBox.warning(self, "Unknown axis",
+                                f"Unknown intra-VP axis: {axis}")
+            return
+
+        if not plans:
+            QMessageBox.warning(self, "Nothing to run",
+                                "The current configuration produced zero runs.")
+            return
+
+        # Same large-sweep confirmation as CV mode
+        if len(plans) > 8:
+            if QMessageBox.question(
+                self, "Large sweep",
+                f"This will run {len(plans)} validation experiments back-to-back. "
+                f"Continue?",
+            ) != QMessageBox.StandardButton.Yes:
+                return
+
+        # Tag the sweep label with the subject so the results panel
+        # makes it obvious that the sweep was intra-VP rather than full CV.
+        axis_label = f"intra-{locked_subset.name} · {axis}"
+        self._launch_sweep(plans, axis_label=axis_label)
+
     def _launch_sweep(self, plans: List[SweepPlan], *, axis_label: str) -> None:
         self._cv_axis_label = axis_label
         self._cv_completed_rows = []
         self._cv_completed_runs = []
+        # Per-fold capture is reset alongside the row buffer so plot
+        # exports never see stale data from a previous sweep.
+        self._cv_per_fold = {}
+        self._cv_current_run_label = ""
         # Make sure the results panel is the CV one — defensive in case
         # the user pressed Run while in CV mode but the stack got out of
         # sync somehow.
@@ -3786,6 +4859,13 @@ class EvaluationTab(QWidget):
     @Slot(int, int, str)
     def _on_cv_run_started(self, idx: int, total: int, label: str) -> None:
         self._cv_results.on_run_started(idx, total, label)
+        # Track which run is currently in flight so fold_finished can
+        # tag its results correctly. Initialise the per-fold list now
+        # so even runs that produce zero folds (e.g. an immediate
+        # exception in the runner) leave a key behind in the dict and
+        # the plot exporter can show that the run was attempted.
+        self._cv_current_run_label = label
+        self._cv_per_fold.setdefault(label, [])
 
     @Slot(int, int, str, object)
     def _on_cv_run_finished(self, idx: int, total: int, label: str, result: Any) -> None:
@@ -3797,6 +4877,13 @@ class EvaluationTab(QWidget):
 
     @Slot(int, int, object)
     def _on_cv_fold_finished(self, idx: int, total: int, fr: FoldResult) -> None:
+        # Append to the current run's per-fold bucket. The run_started
+        # slot guarantees the bucket exists by the time we get here, but
+        # we use setdefault as belt-and-braces in case fold_finished
+        # somehow races ahead of run_started (e.g. if the runner dispatch
+        # order changes in a future version).
+        if self._cv_current_run_label:
+            self._cv_per_fold.setdefault(self._cv_current_run_label, []).append(fr)
         self._cv_results.append_log(
             f"  fold {idx}/{total}  ·  {fr.model_type}  ·  "
             f"acc={fr.accuracy:.3f}  f1={fr.macro_f1:.3f}"
@@ -3846,6 +4933,52 @@ class EvaluationTab(QWidget):
             path, _ = QFileDialog.getSaveFileName(
                 self, "Save sweep JSON", "cv_sweep.json", "JSON (*.json)")
             if path: self._write_cv_summary_json(Path(path))
+        elif kind == "accuracy_png":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save accuracy bar chart PNG",
+                "cv_accuracy.png", "PNG (*.png)")
+            if path: self._save_cv_accuracy_plot(Path(path))
+        elif kind == "macro_f1_png":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save macro-F1 bar chart PNG",
+                "cv_macro_f1.png", "PNG (*.png)")
+            if path: self._save_cv_macro_f1_plot(Path(path))
+        elif kind == "per_fold_png":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save per-fold scatter PNG",
+                "cv_per_fold.png", "PNG (*.png)")
+            if path: self._save_cv_per_fold_plot(Path(path))
+        elif kind == "acc_box_png":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save per-fold accuracy box plot PNG",
+                "cv_accuracy_box.png", "PNG (*.png)")
+            if path: self._save_cv_accuracy_box_plot(Path(path))
+        elif kind == "f1_box_png":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save per-fold macro-F1 box plot PNG",
+                "cv_macro_f1_box.png", "PNG (*.png)")
+            if path: self._save_cv_macro_f1_box_plot(Path(path))
+        elif kind == "train_time_png":
+            path, _ = QFileDialog.getSaveFileName(
+                self, "Save train-time bar chart PNG",
+                "cv_train_time.png", "PNG (*.png)")
+            if path: self._save_cv_train_time_plot(Path(path))
+        elif kind == "plots":
+            # Write all six plots into a single user-chosen folder.
+            d = QFileDialog.getExistingDirectory(
+                self, "Save performance plots to folder", str(Path.home()))
+            if d:
+                ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+                target = Path(d) / f"cv_plots_{ts}"
+                target.mkdir(parents=True, exist_ok=True)
+                self._save_cv_accuracy_plot     (target / "accuracy.png")
+                self._save_cv_macro_f1_plot     (target / "macro_f1.png")
+                self._save_cv_per_fold_plot     (target / "per_fold.png")
+                self._save_cv_accuracy_box_plot (target / "accuracy_box.png")
+                self._save_cv_macro_f1_box_plot (target / "macro_f1_box.png")
+                self._save_cv_train_time_plot   (target / "train_time.png")
+                QMessageBox.information(self, "Export complete",
+                                        f"Saved performance plots to:\n{target}")
         elif kind == "bundle":
             d = QFileDialog.getExistingDirectory(self, "Save full bundle to folder",
                                                   str(Path.home()))
@@ -3856,6 +4989,15 @@ class EvaluationTab(QWidget):
                 self._write_cv_comparison_csv(target / "comparison.csv")
                 self._write_cv_per_model_csv(target / "per_model.csv")
                 self._write_cv_summary_json(target / "sweep.json")
+                # Bundle now also captures all six performance plots so
+                # a single "Save full bundle" gives the user everything
+                # needed for a paper figure or thesis appendix.
+                self._save_cv_accuracy_plot     (target / "accuracy.png")
+                self._save_cv_macro_f1_plot     (target / "macro_f1.png")
+                self._save_cv_per_fold_plot     (target / "per_fold.png")
+                self._save_cv_accuracy_box_plot (target / "accuracy_box.png")
+                self._save_cv_macro_f1_box_plot (target / "macro_f1_box.png")
+                self._save_cv_train_time_plot   (target / "train_time.png")
                 QMessageBox.information(self, "Export complete",
                                         f"Saved bundle to:\n{target}")
 
@@ -3906,6 +5048,402 @@ class EvaluationTab(QWidget):
         }
         with open(path, "w") as f:
             json.dump(payload, f, indent=2, default=str)
+
+    # ──────────────────────────────────────────────────────────────────
+    # Performance plot exports  (CV + intra-VP)
+    # ──────────────────────────────────────────────────────────────────
+    # These three methods produce the figures the user asked for in the
+    # intra-participant feature request. They live on EvaluationTab (not
+    # _CrossValidationResultsView) because they need access to the
+    # ``_cv_per_fold`` data captured during the sweep — the results view
+    # only knows about the aggregated rows. Each plot is a no-op when
+    # there's nothing to draw, so a missing fold-level signal never
+    # blows up the bundle export; it just leaves that file out.
+
+    def _save_cv_accuracy_plot(self, path: Path) -> None:
+        """
+        Bar chart of per-run accuracy (best-model-per-row) ± std-dev.
+
+        The per-row aggregate already gives us mean and std across folds,
+        so this is a faithful summary of every sweep regardless of which
+        comparison axis was used.
+        """
+        if not self._cv_completed_rows:
+            return
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            log.warning("matplotlib unavailable — accuracy plot skipped: %s", exc)
+            return
+
+        labels: List[str] = []
+        means:  List[float] = []
+        stds:   List[float] = []
+        models: List[str] = []
+        for label, agg in self._cv_completed_rows:
+            if not agg:
+                continue
+            best_model, m = max(agg.items(),
+                                 key=lambda kv: kv[1].get("accuracy_mean", 0.0))
+            labels.append(label)
+            means .append(float(m.get("accuracy_mean", 0.0)))
+            stds  .append(float(m.get("accuracy_std",  0.0)))
+            models.append(best_model)
+        if not labels:
+            return
+
+        # Colour each bar by score so the eye reads quality at a glance,
+        # using the same green/amber/red thresholds the rest of the tab
+        # uses for table cells.
+        colors = ["#16a34a" if v >= 0.8 else "#d97706" if v >= 0.6 else "#dc2626"
+                  for v in means]
+
+        fig, ax = plt.subplots(figsize=(max(7, 0.85 * len(labels) + 2), 4.8), dpi=140)
+        xs = list(range(len(labels)))
+        bars = ax.bar(xs, means, yerr=stds,
+                      color=colors, edgecolor="#6d28d9", linewidth=1.0,
+                      capsize=5, error_kw={"elinewidth": 1.2,
+                                            "ecolor": "#1f2937"})
+        for x, m, s, model in zip(xs, means, stds, models):
+            ax.text(x, m + s + 0.015, f"{m * 100:.1f}%\n({model})",
+                    ha="center", va="bottom", fontsize=8, color="#1f2937")
+
+        # Reference lines at the 60 / 80 % thresholds match the table colours
+        ax.axhline(0.8, color="#16a34a", linewidth=1, linestyle=":", alpha=0.4)
+        ax.axhline(0.6, color="#d97706", linewidth=1, linestyle=":", alpha=0.4)
+
+        ax.set_xticks(xs)
+        ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=9)
+        ax.set_ylim(0, 1.12)
+        ax.set_ylabel("Accuracy")
+        ax.set_title(f"Accuracy per run — {self._cv_axis_label}", fontsize=11, pad=12)
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+    def _save_cv_macro_f1_plot(self, path: Path) -> None:
+        """Bar chart of per-run macro-F1 (best model per row) ± std."""
+        if not self._cv_completed_rows:
+            return
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            log.warning("matplotlib unavailable — macro-F1 plot skipped: %s", exc)
+            return
+
+        labels: List[str] = []
+        means:  List[float] = []
+        stds:   List[float] = []
+        for label, agg in self._cv_completed_rows:
+            if not agg:
+                continue
+            # Pick the same "best by accuracy" model so this chart is
+            # readable next to the accuracy chart; F1 from a different
+            # model would be apples-to-oranges.
+            _best, m = max(agg.items(),
+                            key=lambda kv: kv[1].get("accuracy_mean", 0.0))
+            labels.append(label)
+            means .append(float(m.get("macro_f1_mean", 0.0)))
+            stds  .append(float(m.get("macro_f1_std",  0.0)))
+        if not labels:
+            return
+
+        colors = ["#16a34a" if v >= 0.8 else "#d97706" if v >= 0.6 else "#dc2626"
+                  for v in means]
+
+        fig, ax = plt.subplots(figsize=(max(7, 0.85 * len(labels) + 2), 4.8), dpi=140)
+        xs = list(range(len(labels)))
+        ax.bar(xs, means, yerr=stds,
+               color=colors, edgecolor="#0284c7", linewidth=1.0,
+               capsize=5, error_kw={"elinewidth": 1.2, "ecolor": "#1f2937"})
+        for x, m, s in zip(xs, means, stds):
+            ax.text(x, m + s + 0.015, f"{m * 100:.1f}%",
+                    ha="center", va="bottom", fontsize=8, color="#1f2937")
+
+        ax.axhline(0.8, color="#16a34a", linewidth=1, linestyle=":", alpha=0.4)
+        ax.axhline(0.6, color="#d97706", linewidth=1, linestyle=":", alpha=0.4)
+
+        ax.set_xticks(xs)
+        ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=9)
+        ax.set_ylim(0, 1.12)
+        ax.set_ylabel("Macro-F1")
+        ax.set_title(f"Macro-F1 per run — {self._cv_axis_label}", fontsize=11, pad=12)
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+    def _save_cv_per_fold_plot(self, path: Path) -> None:
+        """
+        Per-fold scatter: one dot per fold, grouped by run, overlaid on a
+        translucent bar showing the per-run mean.
+
+        This is the figure that actually exposes variance — the bar
+        charts hide whether a 75 % mean accuracy comes from "every fold
+        is between 73 and 77" or "two folds at 50 and one fold at 100".
+        Without per-fold data this falls back to a no-op rather than
+        drawing a misleading single-dot-per-bar figure.
+        """
+        if not self._cv_completed_rows or not self._cv_per_fold:
+            return
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            log.warning("matplotlib unavailable — per-fold plot skipped: %s", exc)
+            return
+
+        # Walk completed rows in their original order so the plot
+        # mirrors the comparison table the user sees on screen.
+        labels: List[str] = []
+        means:  List[float] = []
+        fold_buckets: List[List[float]] = []
+        for label, agg in self._cv_completed_rows:
+            folds = self._cv_per_fold.get(label, [])
+            if not folds:
+                continue
+            accs = [float(f.accuracy) for f in folds]
+            labels.append(label)
+            fold_buckets.append(accs)
+            # Use the best-model row's mean to match the accuracy chart
+            if agg:
+                _b, m = max(agg.items(),
+                             key=lambda kv: kv[1].get("accuracy_mean", 0.0))
+                means.append(float(m.get("accuracy_mean", float(np.mean(accs)))))
+            else:
+                means.append(float(np.mean(accs)))
+        if not labels:
+            return
+
+        fig, ax = plt.subplots(figsize=(max(7, 0.95 * len(labels) + 2), 5.0), dpi=140)
+        xs = list(range(len(labels)))
+
+        # Translucent bars = per-run means
+        ax.bar(xs, means, color="#eef2ff", edgecolor="#6d28d9",
+               linewidth=1.0, width=0.55, zorder=2)
+
+        # Fold dots, slightly jittered along x so two folds with the
+        # same accuracy don't perfectly overlap. The seed is per-run so
+        # the same input always produces the same picture.
+        for i, accs in enumerate(fold_buckets):
+            rng = np.random.RandomState(i * 7 + 11)
+            jitter = (rng.rand(len(accs)) - 0.5) * 0.30
+            xj = np.full(len(accs), i) + jitter
+            ax.scatter(xj, accs,
+                       color="#0284c7", s=42, zorder=4,
+                       edgecolors="white", linewidths=0.6)
+
+        # Annotate the count of folds underneath each bar
+        for i, accs in enumerate(fold_buckets):
+            ax.text(i, -0.06, f"n={len(accs)}",
+                    ha="center", va="top", fontsize=8, color="#6b7280",
+                    transform=ax.get_xaxis_transform())
+
+        # Reference threshold lines for visual orientation
+        ax.axhline(0.8, color="#16a34a", linewidth=1, linestyle=":", alpha=0.4)
+        ax.axhline(0.6, color="#d97706", linewidth=1, linestyle=":", alpha=0.4)
+
+        ax.set_xticks(xs)
+        ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=9)
+        ax.set_ylim(0, 1.05)
+        ax.set_ylabel("Per-fold accuracy")
+        ax.set_title(f"Per-fold spread — {self._cv_axis_label}",
+                     fontsize=11, pad=12)
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+    # ── New (v3) CV plots — proper boxplots and train-time bars ──────
+
+    def _save_cv_accuracy_box_plot(self, path: Path) -> None:
+        """
+        Per-run box-and-whisker plot of fold accuracies.
+
+        Differs from :meth:`_save_cv_per_fold_plot` (which is a
+        scatter-on-bar) in that this is a *real* boxplot — quartiles,
+        whiskers, individual outliers — which is the standard figure
+        for cross-validation comparison in machine-learning papers.
+        Use the scatter when you want to see every fold; use this when
+        you want the distribution summary.
+        """
+        if not self._cv_completed_rows or not self._cv_per_fold:
+            return
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            log.warning("matplotlib unavailable — accuracy box plot skipped: %s", exc)
+            return
+
+        labels: List[str] = []
+        buckets: List[List[float]] = []
+        for label, _agg in self._cv_completed_rows:
+            folds = self._cv_per_fold.get(label, [])
+            if not folds:
+                continue
+            labels .append(label)
+            buckets.append([float(f.accuracy) for f in folds])
+        if not labels:
+            return
+
+        fig, ax = plt.subplots(figsize=(max(7, 0.95 * len(labels) + 2), 4.8), dpi=140)
+        bp = ax.boxplot(buckets, patch_artist=True, showmeans=True,
+                        widths=0.55, meanline=False)
+        for patch in bp["boxes"]:
+            patch.set_facecolor("#eef2ff"); patch.set_edgecolor("#6d28d9"); patch.set_linewidth(2)
+        for whisker in bp["whiskers"]:
+            whisker.set_color("#6d28d9"); whisker.set_linewidth(1.5)
+        for cap in bp["caps"]:
+            cap.set_color("#6d28d9")
+        for median in bp["medians"]:
+            median.set_color("#0284c7"); median.set_linewidth(2.5)
+        for mean in bp.get("means", []):
+            mean.set_marker("D"); mean.set_markerfacecolor("#16a34a")
+            mean.set_markeredgecolor("#16a34a"); mean.set_markersize(7)
+        # Jittered scatter on top so the underlying fold count is honest
+        rng = np.random.RandomState(0)
+        for i, vals in enumerate(buckets):
+            x = np.full(len(vals), i + 1) + (rng.rand(len(vals)) - 0.5) * 0.18
+            ax.scatter(x, vals, color="#0284c7", alpha=0.55, s=28, zorder=3,
+                       edgecolor="white", linewidth=0.5)
+
+        ax.axhline(0.8, color="#16a34a", linewidth=1, linestyle=":", alpha=0.4)
+        ax.axhline(0.6, color="#d97706", linewidth=1, linestyle=":", alpha=0.4)
+        ax.set_xticks(range(1, len(labels) + 1))
+        ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=9)
+        ax.set_ylim(0, 1.05)
+        ax.set_ylabel("Fold accuracy")
+        ax.set_title(f"Per-fold accuracy box plot — {self._cv_axis_label}",
+                     fontsize=11, pad=12)
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+    def _save_cv_macro_f1_box_plot(self, path: Path) -> None:
+        """Per-run box-and-whisker plot of fold macro-F1 scores."""
+        if not self._cv_completed_rows or not self._cv_per_fold:
+            return
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            log.warning("matplotlib unavailable — F1 box plot skipped: %s", exc)
+            return
+
+        labels: List[str] = []
+        buckets: List[List[float]] = []
+        for label, _agg in self._cv_completed_rows:
+            folds = self._cv_per_fold.get(label, [])
+            if not folds:
+                continue
+            labels .append(label)
+            buckets.append([float(f.macro_f1) for f in folds])
+        if not labels:
+            return
+
+        fig, ax = plt.subplots(figsize=(max(7, 0.95 * len(labels) + 2), 4.8), dpi=140)
+        bp = ax.boxplot(buckets, patch_artist=True, showmeans=True,
+                        widths=0.55)
+        for patch in bp["boxes"]:
+            patch.set_facecolor("#eef2ff"); patch.set_edgecolor("#6d28d9"); patch.set_linewidth(2)
+        for whisker in bp["whiskers"]:
+            whisker.set_color("#6d28d9"); whisker.set_linewidth(1.5)
+        for cap in bp["caps"]:
+            cap.set_color("#6d28d9")
+        for median in bp["medians"]:
+            median.set_color("#0284c7"); median.set_linewidth(2.5)
+        for mean in bp.get("means", []):
+            mean.set_marker("D"); mean.set_markerfacecolor("#16a34a")
+            mean.set_markeredgecolor("#16a34a"); mean.set_markersize(7)
+        rng = np.random.RandomState(1)
+        for i, vals in enumerate(buckets):
+            x = np.full(len(vals), i + 1) + (rng.rand(len(vals)) - 0.5) * 0.18
+            ax.scatter(x, vals, color="#0284c7", alpha=0.55, s=28, zorder=3,
+                       edgecolor="white", linewidth=0.5)
+
+        ax.axhline(0.8, color="#16a34a", linewidth=1, linestyle=":", alpha=0.4)
+        ax.axhline(0.6, color="#d97706", linewidth=1, linestyle=":", alpha=0.4)
+        ax.set_xticks(range(1, len(labels) + 1))
+        ax.set_xticklabels(labels, rotation=25, ha="right", fontsize=9)
+        ax.set_ylim(0, 1.05)
+        ax.set_ylabel("Fold macro-F1")
+        ax.set_title(f"Per-fold macro-F1 box plot — {self._cv_axis_label}",
+                     fontsize=11, pad=12)
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
+
+    def _save_cv_train_time_plot(self, path: Path) -> None:
+        """
+        Bar chart of mean training time per run, with std-dev error bars.
+
+        Practical concern: for production deployment a model that hits
+        80 % accuracy in 1 s of training is often preferable to one
+        that hits 82 % in 30 s. This plot makes that trade-off explicit
+        without needing to read the per-model CSV.
+        """
+        if not self._cv_completed_rows:
+            return
+        try:
+            import matplotlib
+            matplotlib.use("Agg")
+            import matplotlib.pyplot as plt
+        except Exception as exc:
+            log.warning("matplotlib unavailable — train time plot skipped: %s", exc)
+            return
+
+        labels: List[str] = []
+        means:  List[float] = []
+        stds:   List[float] = []
+        for label, agg in self._cv_completed_rows:
+            if not agg:
+                continue
+            # Match the comparison-table convention: pick the row with
+            # best accuracy and report ITS train time, so this plot lines
+            # up cleanly with the accuracy bar chart.
+            best_model, m = max(agg.items(),
+                                 key=lambda kv: kv[1].get("accuracy_mean", 0.0))
+            labels.append(f"{label}\n({best_model})")
+            means .append(float(m.get("train_seconds_mean", 0.0)))
+            # Train-time std isn't always populated by the runner; fall
+            # back to a small error bar (or zero) when missing rather
+            # than silently using NaN.
+            stds  .append(float(m.get("train_seconds_std", 0.0)))
+        if not labels:
+            return
+
+        fig, ax = plt.subplots(figsize=(max(7, 0.95 * len(labels) + 2), 4.8), dpi=140)
+        xs = list(range(len(labels)))
+        ax.bar(xs, means, yerr=stds,
+               color="#eef2ff", edgecolor="#6d28d9", linewidth=1.2,
+               capsize=5, error_kw={"elinewidth": 1.2, "ecolor": "#1f2937"})
+        for x, m in zip(xs, means):
+            ax.text(x, m, f"  {_fmt_dur(m)}",
+                    ha="center", va="bottom", fontsize=9, color="#1f2937")
+
+        ax.set_xticks(xs)
+        ax.set_xticklabels(labels, rotation=20, ha="right", fontsize=9)
+        ax.set_ylabel("Train time (seconds)")
+        ax.set_title(f"Train time per run — {self._cv_axis_label}",
+                     fontsize=11, pad=12)
+        # Headroom for the duration label
+        if means:
+            ax.set_ylim(0, max(means) * 1.18 + 0.5)
+        ax.grid(axis="y", alpha=0.3)
+        fig.tight_layout()
+        fig.savefig(path, bbox_inches="tight")
+        plt.close(fig)
 
 
 # ═══════════════════════════════════════════════════════════════════════════

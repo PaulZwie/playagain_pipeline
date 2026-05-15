@@ -33,6 +33,7 @@ import numpy as np
 from scipy import signal as scipy_signal
 from datetime import datetime
 import re
+from .calibration_stability import compute_stability_metrics
 
 
 @dataclass
@@ -616,14 +617,32 @@ class CalibrationProcessor:
         sync_energy, ref_sync_energy, sync_gesture = self._select_sync_pattern(
             energy_patterns, ref_patterns_map
         )
-        
+
         # Calculate offset using the selected patterns
         if ref_sync_energy is not None and len(ref_sync_energy) == self.num_channels:
-            offset, confidence = self.find_rotation_offset(sync_energy, ref_sync_energy)
+            offset, peak_prominence = self.find_rotation_offset(sync_energy, ref_sync_energy)
         else:
             offset = 0
-            # If creating a new reference, confidence is how "peaked" the selected gesture is
-            confidence = self._compute_energy_confidence(sync_energy)
+            # If creating a new reference, "peakedness" is the only number we can return.
+            peak_prominence = self._compute_energy_confidence(sync_energy)
+
+        # ── Stability (new primary confidence, see calibration_stability.py) ──
+        confidence = peak_prominence  # default fallback if we can't compute stability
+        stability_result = None
+        if (ref_sync_energy is not None
+                and isinstance(calibration_data.get(sync_gesture), list)
+                and len(calibration_data[sync_gesture]) >= 2):
+            try:
+                stability_result = compute_stability_metrics(
+                    calibration_data[sync_gesture],
+                    np.asarray(ref_sync_energy, dtype=np.float64),
+                    num_channels=self.num_channels,
+                    sampling_rate=getattr(self, "sampling_rate", 2000),
+                    bootstrap_n=0,  # cheap mode for live; bump to 200 in batch
+                )
+                confidence = float(stability_result.stability)
+            except Exception:  # pragma: no cover — defensive
+                stability_result = None
 
         channel_mapping = self.create_channel_mapping(offset)
 
@@ -643,13 +662,18 @@ class CalibrationProcessor:
             reference_patterns=energy_patterns,
             metadata={
                 "method": "maximum_energy_channel",
-                "sync_gesture": sync_gesture,  # Record which gesture was used
+                "sync_gesture": sync_gesture,
                 "per_gesture_confidence": per_gesture_confidence,
                 "num_gestures": len(calibration_data),
                 "has_reference": ref_patterns_map is not None,
                 "signal_mode": str(signal_mode or "monopolar").lower(),
                 "reference_incompatible": reference_incompatible,
                 "mec_channel": int(np.argmax(sync_energy)),
+                "peak_prominence": float(peak_prominence),
+                "rotation_metric_version": 2,
+                "stability_diagnostics": (
+                    stability_result.to_dict() if stability_result is not None else None
+                ),
             },
         )
 

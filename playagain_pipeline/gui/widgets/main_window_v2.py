@@ -65,6 +65,10 @@ from playagain_pipeline.gui.main_window import MainWindow
 
 from playagain_pipeline.gui.widgets.evaluation_tab import EvaluationTab
 
+from playagain_pipeline.gui.widgets.thesis_report_dialog import (
+        ThesisReportDialog,
+    )
+
 
 log = logging.getLogger(__name__)
 
@@ -314,6 +318,14 @@ class MainWindowV2(MainWindow):
         act_validate.triggered.connect(self._v2_open_evaluation)
         menu.addAction(act_validate)
 
+        act_thesis = QAction("Build thesis report…", self)
+        act_thesis.setToolTip(
+            "Create the validation runs Chapter 6 depends on and generate "
+            "every table and figure referenced from chapters 6, 7 and 8."
+        )
+        act_thesis.triggered.connect(self._v2_open_thesis_report)
+        menu.addAction(act_thesis)
+
         act_calibrate = QAction("Calibrate bracelet…", self)
         # Reuse the existing handler — in v1 this was a tab that the
         # user opened via self.mode_tabs.setCurrentIndex(...). Here we
@@ -432,6 +444,20 @@ class MainWindowV2(MainWindow):
         self._v2_evaluation_window.show()
         self._v2_evaluation_window.raise_()
         self._v2_evaluation_window.activateWindow()
+
+    def _v2_open_thesis_report(self) -> None:
+        '''Open the thesis-report builder dialog.'''
+        # The dialog is non-modal so the user can keep the main window
+        # visible while a long-running validation suite is queued. We
+        # cache it on self so reopening doesn't lose state.
+        if not hasattr(self, "_v2_thesis_dialog") or self._v2_thesis_dialog is None:
+            data_dir = Path(self.data_manager.data_dir)
+            self._v2_thesis_dialog = ThesisReportDialog(
+                data_dir=data_dir, parent=self,
+            )
+        self._v2_thesis_dialog.show()
+        self._v2_thesis_dialog.raise_()
+        self._v2_thesis_dialog.activateWindow()
 
     def _v2_open_calibration(self) -> None:
         """

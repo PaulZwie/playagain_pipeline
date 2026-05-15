@@ -153,6 +153,10 @@ class FoldResult:
     confusion_labels: Optional[List[int]] = None
     label_names:      Dict[int, str] = field(default_factory=dict)
 
+    test_subjects: List[str] = field(default_factory=list)
+    test_sessions: List[Tuple[str, str]] = field(default_factory=list)  # (subject, session_id)
+    split_kind: str = ""
+
     # seed actually used for this (fold, model), for reproduction
     fold_seed:    int = 0
 
@@ -430,6 +434,11 @@ class ValidationRunner:
             except Exception as e:  # noqa: BLE001
                 log.warning("Val evaluation failed for fold %s: %s", fold.get("id"), e)
 
+        test_records = fold.get("test", []) or []
+        test_subjects = sorted({r.subject_id for r in test_records})
+        test_sessions = [(r.subject_id, r.session_id) for r in test_records]
+        split_kind = str(fold.get("split_kind", ""))
+
         return FoldResult(
             fold_id=str(fold["id"]),
             model_type=model_cfg.type,
@@ -448,6 +457,9 @@ class ValidationRunner:
             label_names=label_names,
             fold_seed=seed,
             extra={"train_meta": _slim_train_meta(train_meta)},
+            test_subjects=test_subjects,
+            test_sessions=test_sessions,
+            split_kind=split_kind,
         )
 
     # ------------------------------------------------------------------

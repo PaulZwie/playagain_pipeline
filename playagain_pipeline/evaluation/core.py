@@ -137,6 +137,29 @@ class EvaluationResult:
     precision_macro: float                 = float("nan")
     recall_macro:    float                 = float("nan")
 
+    # Robustness / agreement metrics  (added in v3)
+    # All three of these are scalar summaries that scale better than raw
+    # accuracy when classes are imbalanced — Cohen's kappa subtracts the
+    # agreement you'd expect by chance, MCC is robust under skewed
+    # support, and balanced accuracy averages per-class recall so a
+    # 95% rest / 5% fist split can't hide a model that ignores fist.
+    cohen_kappa:        float = float("nan")
+    mcc:                float = float("nan")
+    balanced_accuracy:  float = float("nan")
+
+    # Top-k accuracy  (multi-class with predicted probabilities only).
+    # ``None`` when the predictor doesn't expose probas, when the
+    # number of classes is too small for k to be informative (top-2 on
+    # a binary task is always 100%), or when the classifier is binary.
+    top_2_accuracy: Optional[float] = None
+    top_3_accuracy: Optional[float] = None
+
+    # Inference latency hint, in milliseconds per window. Populated by
+    # evaluators that time the prediction step; left as ``None`` when
+    # the evaluator didn't measure it. Useful for "is this model fast
+    # enough for real-time use" — EMG decisions land at ~50 ms cadence.
+    inference_ms_per_window: Optional[float] = None
+
     # Binary fields (Unity / one-vs-rest views)
     specificity:     float                 = float("nan")
     auroc:           Optional[float]       = None
@@ -146,6 +169,14 @@ class EvaluationResult:
     mean_confidence_correct:    Optional[float] = None
     mean_confidence_incorrect:  Optional[float] = None
     expected_calibration_error: Optional[float] = None
+
+    # Confidence histogram for the correct/incorrect overlay plot.
+    # When the predictor exposes probabilities, ``fill_classification_metrics``
+    # bins the top-1 confidences into 20 equal-width bins and records
+    # how many landed in each bin among correct / incorrect predictions.
+    # The dict is JSON-safe and small; absent when no probas were given.
+    #   {"bin_edges": [...], "correct_counts": [...], "incorrect_counts": [...]}
+    confidence_histogram: Optional[Dict[str, List[float]]] = None
 
     # Detail
     per_class:       List[ClassMetrics]    = field(default_factory=list)

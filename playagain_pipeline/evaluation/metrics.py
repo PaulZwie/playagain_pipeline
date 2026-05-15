@@ -51,6 +51,8 @@ def fill_classification_metrics(
     from sklearn.metrics import (
         accuracy_score, f1_score, precision_score, recall_score,
         confusion_matrix, classification_report,
+        cohen_kappa_score, matthews_corrcoef, balanced_accuracy_score,
+        top_k_accuracy_score,
     )
 
     y_true = np.asarray(y_true).astype(np.int64).ravel()
@@ -93,6 +95,26 @@ def fill_classification_metrics(
     result.precision_macro = float(precision_score(y_true, y_pred, average="macro", labels=label_set, zero_division=0))
     result.recall_macro    = float(recall_score(y_true, y_pred, average="macro", labels=label_set, zero_division=0))
 
+    # Robustness/agreement metrics. Cohen's kappa and MCC both reduce
+    # to a meaningful single number even on heavy class imbalance, and
+    # balanced accuracy is just the macro-recall under another name —
+    # but it's so commonly cited it deserves its own field rather than
+    # making readers do the translation.
+    try:
+        result.cohen_kappa = float(cohen_kappa_score(y_true, y_pred))
+    except Exception:
+        # cohen_kappa_score blows up when there's only one class in
+        # both arrays. Leave NaN and add a note rather than crashing.
+        result.add_note("Cohen's κ undefined (single-class predictions).")
+    try:
+        result.mcc = float(matthews_corrcoef(y_true, y_pred))
+    except Exception:
+        result.add_note("MCC undefined (single-class predictions).")
+    try:
+        result.balanced_accuracy = float(balanced_accuracy_score(y_true, y_pred))
+    except Exception:
+        result.add_note("Balanced accuracy undefined.")
+
     # Per-class
     rep = classification_report(
         y_true, y_pred, labels=label_set, target_names=target_names,
@@ -128,6 +150,43 @@ def fill_classification_metrics(
             result.mean_confidence_incorrect = float(np.mean(top_conf[~correct]))
         # Expected Calibration Error (15-bin, classic Guo et al. 2017).
         result.expected_calibration_error = float(_ece(top_conf, correct, n_bins=15))
+
+        # Top-k accuracy. Only meaningful when n_classes > k — top-2 on
+        # a binary task is always 100% and top-3 on a 2-class task is
+        # impossible. We also guard against y_proba columns not lining
+        # up with the label_set, which happens when a model dropped a
+        # class at training time (rare but the runner has produced it).
+        n_classes = int(y_proba.shape[1])
+        if n_classes >= 3:
+            try:
+                # We need the proba columns to correspond to label IDs in
+                # ``label_set`` order. sklearn's top_k_accuracy_score lets
+                # you pass `labels=...` to disambiguate; do that to stay
+                # robust to dropped-class models.
+                proba_labels = list(range(n_classes))
+                if n_classes >= 3:
+                    result.top_2_accuracy = float(top_k_accuracy_score(
+                        y_true, y_proba, k=2, labels=proba_labels,
+                    ))
+                if n_classes >= 4:
+                    result.top_3_accuracy = float(top_k_accuracy_score(
+                        y_true, y_proba, k=3, labels=proba_labels,
+                    ))
+            except Exception as exc:
+                # Don't fail the whole eval over a top-k edge case
+                result.add_note(f"Top-k accuracy skipped: {exc}")
+
+        # Confidence histogram for the correct/incorrect overlay plot.
+        # 20 equal-width bins between 0 and 1 — fine enough to expose
+        # over- and under-confidence, coarse enough to plot at any size.
+        edges = np.linspace(0.0, 1.0, 21)
+        c_counts, _ = np.histogram(top_conf[correct],  bins=edges)
+        i_counts, _ = np.histogram(top_conf[~correct], bins=edges)
+        result.confidence_histogram = {
+            "bin_edges":        [float(x) for x in edges],
+            "correct_counts":   [int(x)   for x in c_counts],
+            "incorrect_counts": [int(x)   for x in i_counts],
+        }
 
 
 def _ece(confidences: np.ndarray, correct: np.ndarray, *, n_bins: int = 15) -> float:
@@ -168,6 +227,7 @@ def fill_binary_metrics(
     from sklearn.metrics import (
         accuracy_score, f1_score, precision_score, recall_score,
         confusion_matrix,
+        cohen_kappa_score, matthews_corrcoef, balanced_accuracy_score,
     )
 
     y_true = (np.asarray(y_true) > 0).astype(np.int64).ravel()
@@ -188,6 +248,22 @@ def fill_binary_metrics(
     result.precision_macro = float(precision_score(y_true, y_pred, average="macro", labels=[0, 1], zero_division=0))
     result.recall_macro    = float(recall_score(y_true, y_pred, average="macro", labels=[0, 1], zero_division=0))
     result.specificity     = safe_div(tn, tn + fp)
+
+    # Same agreement/robustness metrics as in the multi-class path.
+    # Cohen's κ on a binary task is sometimes called "Heidke skill score";
+    # MCC on a binary task is also known as the phi coefficient.
+    try:
+        result.cohen_kappa = float(cohen_kappa_score(y_true, y_pred))
+    except Exception:
+        pass
+    try:
+        result.mcc = float(matthews_corrcoef(y_true, y_pred))
+    except Exception:
+        pass
+    try:
+        result.balanced_accuracy = float(balanced_accuracy_score(y_true, y_pred))
+    except Exception:
+        pass
 
     p_pos = safe_div(tp, tp + fp); r_pos = safe_div(tp, tp + fn)
     p_neg = safe_div(tn, tn + fn); r_neg = safe_div(tn, tn + fp)

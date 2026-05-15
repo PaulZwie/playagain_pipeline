@@ -77,6 +77,16 @@ class GameEvalSettings:
     # ── Output options ──────────────────────────────────────────────
     per_recording_breakdown: bool = True
 
+    # Optional ``subject_id -> cohort`` resolver. When supplied, every
+    # per-recording breakdown row is tagged with the participant's
+    # cohort ("H" / "I" / "?") so the UI can separate healthy and
+    # impaired participants without re-deriving the grouping. Kept as a
+    # plain callable so this module needs no dependency on the
+    # validation package's ParticipantGroups — the caller (GUI or the
+    # thesis pipeline) passes whatever resolver it has. None disables
+    # the tagging entirely.
+    group_of: Optional[Callable[[str], str]] = None
+
 
 # ---------------------------------------------------------------------------
 # Public entry point
@@ -158,14 +168,20 @@ def _evaluate_logged(
 
         if settings.per_recording_breakdown:
             acc = float(np.mean(y_pred == y_true)) if y_true.size else 0.0
-            per_rec.append({
+            rec_row = {
                 "subject_id":   rec.subject_id,
                 "session_id":   rec.session_id,
                 "n":            int(y_true.size),
                 "accuracy":     acc,
                 "model":        rec.meta.get("model_name"),
                 "per_class_f1": _per_class_f1(y_true, y_pred),
-            })
+            }
+            if settings.group_of is not None:
+                try:
+                    rec_row["group"] = settings.group_of(rec.subject_id)
+                except Exception:
+                    rec_row["group"] = "?"
+            per_rec.append(rec_row)
 
         notes.append(
             f"• {rec.label}: {y_true.size} frames → "
@@ -385,13 +401,19 @@ def _evaluate_replay(
         if y_proba is not None: pooled_proba.append(y_proba)
 
         if settings.per_recording_breakdown:
-            per_rec.append({
+            rec_row = {
                 "subject_id":   rec.subject_id,
                 "session_id":   rec.session_id,
                 "n":            int(y_true.size),
                 "accuracy":     float(np.mean(y_pred == y_true)) if y_true.size else 0.0,
                 "per_class_f1": _per_class_f1(y_true, y_pred),
-            })
+            }
+            if settings.group_of is not None:
+                try:
+                    rec_row["group"] = settings.group_of(rec.subject_id)
+                except Exception:
+                    rec_row["group"] = "?"
+            per_rec.append(rec_row)
         notes.append(f"• {rec.label}: {y_true.size} frames → acc="
                      f"{float(np.mean(y_pred == y_true)):.3f}")
 
