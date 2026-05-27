@@ -1,0 +1,22 @@
+# Data directories
+playagain_pipeline/data/datasets
+playagain_pipeline/data/quattrocento
+playagain_pipeline/data/calibrations
+playagain_pipeline/data/game_recordings
+playagain_pipeline/data/models
+playagain_pipeline/data/.feature_cache
+playagain_pipeline/data/datasets
+playagain_pipeline/data/data_tmp_storage
+playagain_pipeline/data/thesis_outputs
+playagain_pipeline/data/unity
+playagain_pipeline/data/validation_runs
+playagain_pipeline/data/sessions
+storage/
+
+# Build and cache
+__pycache__/
+*.pyc
+
+# CatBoost
+catboost_info/
+playagain_pipeline/catboost_info/

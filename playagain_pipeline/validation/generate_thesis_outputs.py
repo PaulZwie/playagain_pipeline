@@ -43,6 +43,15 @@ Outputs (under ``--out``)
     fig_6_7_game_per_class_f1_data.csv
     fig_6_8_game_confusion_data.json
     game_report.json
+    table_6_10_threshold_gameplay.csv         (threshold game, per recording)
+    table_6_11_threshold_pooled.csv           (threshold game, per cohort)
+    table_threshold_per_subject.csv           (threshold game, per subject)
+    fig_6_9_threshold_sweep.{csv,pdf,png}     ROC + F1-vs-threshold sweep
+    fig_6_10_confusion_overall.{pdf,png}      3 confusion matrices, pooled
+    fig_6_11_confusion_per_subject.{pdf,png}  per-participant matrix grid
+    fig_6_12_perspective_comparison.{pdf,png} as-rec / profile / optimal F1
+    fig_6_13_per_subject_f1.{pdf,png}         per-participant F1 bars
+    threshold_report.json
     fig_7_4_calibration_vs_f1.{pdf,png}   (when calibration data available)
     correlation_calibration_f1.json
 
@@ -90,6 +99,7 @@ from .calibration_report import (
 )
 from .game_corpus import GameCorpus
 from .game_report import build_game_report, write_game_report
+from .threshold_report import build_threshold_report, write_threshold_report
 from .participant_groups import (
     ParticipantGroups, default_groups_path, metadata_group_resolver,
 )
@@ -177,6 +187,16 @@ def build_parser() -> argparse.ArgumentParser:
                          "report. By default game recordings under "
                          "<data-dir>/game_recordings are discovered and "
                          "scored from their logged predictions."))
+
+    # Threshold-gameplay (original Unity RMS-threshold game).
+    p.add_argument("--skip-threshold-gameplay", action="store_true",
+                   help=("Do not build the threshold-gameplay report. "
+                         "By default raw Unity CSVs anywhere under "
+                         "<data-dir> are discovered and scored three ways "
+                         "(as-recorded / profile-threshold / optimal). "
+                         "Profile thresholds are checked for plausibility "
+                         "and the temporally-correct history entry is "
+                         "preferred over currentThreshold."))
 
     p.add_argument("--flag-threshold", type=float,
                    default=DEFAULT_FLAG_THRESHOLD,
@@ -454,6 +474,119 @@ def run(args: argparse.Namespace) -> Dict[str, List[Path]]:
     else:
         log.info("No game recordings found — game report skipped.")
 
+    # 8. Threshold-gameplay (§6.10 / appendix). Discovers raw Unity CSVs
+    #    with the original RMS-threshold schema anywhere under data_dir,
+    #    pairs each with the closest profile.json, and scores three ways:
+    #    as-recorded (what the user actually experienced), profile-
+    #    threshold (re-derived from the threshold the profile claims
+    #    was active at the time), and the F1-optimal threshold (post-
+    #    hoc upper bound). The gap between as-recorded and optimal F1
+    #    is the headroom that manual threshold calibration leaves on
+    #    the table — and the headline motivation for the gesture
+    #    model that replaced this game mode.
+    if not args.skip_threshold_gameplay:
+        try:
+            from playagain_pipeline.evaluation.threshold_eval import (
+                discover_threshold_gameplay, ThresholdEvalSettings,
+            )
+        except ImportError as exc:
+            log.warning(
+                "Threshold-gameplay evaluator not importable (%s); "
+                "skipping that report.", exc
+            )
+        else:
+            csv_paths = discover_threshold_gameplay(args.data_dir)
+            if csv_paths:
+                log.info(
+                    "Building threshold-gameplay report from %d "
+                    "Unity CSV(s)…", len(csv_paths),
+                )
+                thr_bundle = build_threshold_report(
+                    csv_paths,
+                    profile_path=None,        # per-CSV auto-discovery
+                    groups=groups,
+                    settings=ThresholdEvalSettings(),
+                )
+                thr_paths = write_threshold_report(thr_bundle, out_dir)
+                # Rename to chapter-style filenames the README documents.
+                # The per-subject table keeps its descriptive name —
+                # it has no thesis number, it's a supporting artefact.
+                _thr_renames = [
+                    ("per_recording", "table_6_10_threshold_gameplay.csv"),
+                    ("pooled",        "table_6_11_threshold_pooled.csv"),
+                    ("per_subject",   "table_threshold_per_subject.csv"),
+                    ("sweep",         "fig_6_9_threshold_sweep.csv"),
+                    ("json",          "threshold_report.json"),
+                ]
+                for key, target_name in _thr_renames:
+                    src = thr_paths.get(key)
+                    if src is not None and src.exists():
+                        dst = out_dir / target_name
+                        if src != dst:
+                            src.replace(dst)
+                            thr_paths[key] = dst
+                produced["threshold_gameplay"] = list(thr_paths.values())
+
+                # Render the threshold-gameplay figures from the
+                # just-written tables. Kept in a separate module so it
+                # can be re-run independently of the (slow) evaluation;
+                # failures here must not abort the rest of the report.
+                try:
+                    from .threshold_plots import render_all_threshold_figures
+                    fig_map = render_all_threshold_figures(
+                        out_dir,
+                        pooled_csv=thr_paths.get("pooled"),
+                        per_subject_csv=thr_paths.get("per_subject"),
+                        sweep_csv=thr_paths.get("sweep"),
+                    )
+                    for fig_key, fig_paths in fig_map.items():
+                        produced[fig_key] = fig_paths
+                    if fig_map:
+                        log.info(
+                            "Threshold-gameplay: rendered %d figure set(s) "
+                            "(%s).",
+                            len(fig_map), ", ".join(sorted(fig_map)),
+                        )
+                except Exception as exc:                    # noqa: BLE001
+                    log.warning(
+                        "Threshold-gameplay figures could not be "
+                        "rendered (%s); tables were still written.", exc,
+                    )
+
+                # Surface the suspect count in the run log — it's the
+                # most actionable indicator that threshold calibration
+                # was off for that subject/session.
+                n_suspect = sum(
+                    1 for r in thr_bundle.per_recording
+                    if bool(r.get("suspect_threshold"))
+                )
+                n_excluded = sum(
+                    1 for r in thr_bundle.per_recording
+                    if bool(r.get("excluded"))
+                )
+                if n_suspect:
+                    log.info(
+                        "Threshold-gameplay: %d recording(s) flagged "
+                        "with suspect profile thresholds (profile > "
+                        "max RMS); see notes column in the per-recording "
+                        "table.", n_suspect,
+                    )
+                if n_excluded:
+                    log.info(
+                        "Threshold-gameplay: %d recording(s) excluded "
+                        "from pooled metrics (single-class ground truth "
+                        "or too short); still listed in the per-recording "
+                        "table.", n_excluded,
+                    )
+            else:
+                log.info(
+                    "Threshold-gameplay: no Unity raw CSVs found under "
+                    "%s — report skipped.", args.data_dir,
+                )
+    else:
+        log.info("Threshold-gameplay report skipped "
+                 "(--skip-threshold-gameplay).")
+
     log.info("Wrote %d artefact group(s) to %s", len(produced), out_dir)
     for name, paths in produced.items():
         for p in paths:
@@ -482,6 +615,7 @@ def run_in_subprocess(args: argparse.Namespace) -> int:
     cmd += ["--gate-ms",       str(args.gate_ms)]
     if args.groups:      cmd += ["--groups", str(args.groups)]
     if args.skip_game:   cmd.append("--skip-game")
+    if args.skip_threshold_gameplay: cmd.append("--skip-threshold-gameplay")
     if args.drop_rest:    cmd.append("--drop-rest")
     if args.verbose:      cmd.append("--verbose")
 

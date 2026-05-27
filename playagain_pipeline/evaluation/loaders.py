@@ -407,10 +407,19 @@ def discover_unity_recordings(
 
 
 def _looks_like_unity_csv(header: str) -> bool:
-    """Cheap header sniff for the Unity raw-CSV format."""
+    """Cheap header sniff for the Unity raw-CSV format.
+
+    Two schemas are accepted:
+      • newer schema: ``Timestamp, RMS, GroundTruthActive, …``
+      • original threshold-gameplay schema:
+        ``Timestamp, RMS, GroundTruth, …`` (no ``Active`` suffix)
+    Both contain the columns ``unity_eval`` needs; only the truth-
+    column name differs.
+    """
     cols = {c.strip().lower() for c in header.split(",")}
-    needed = {"timestamp", "rms", "groundtruthactive"}
-    return needed.issubset(cols)
+    if "rms" not in cols or "timestamp" not in cols:
+        return False
+    return bool(cols & {"groundtruth", "groundtruthactive"})
 
 
 # ---------------------------------------------------------------------------

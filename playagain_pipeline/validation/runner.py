@@ -50,11 +50,13 @@ import csv
 import hashlib
 import json
 import logging
+import os
 import platform
 import random as _random
 import subprocess
 import sys
 import time
+import threading
 from dataclasses import dataclass, field, asdict
 from datetime import datetime
 from pathlib import Path
@@ -82,6 +84,189 @@ def _model_wants_raw_windows(model_type: str) -> bool:
     return str(model_type).lower() in _RAW_WINDOW_MODELS
 
 
+# Per-model wall-clock budgets for a single fold's fit phase. When the
+# heartbeat thread crosses one of these it escalates from a plain "still
+# fitting" message to a "this looks slow, consider cancelling" hint.
+# Tuned so the budget is comfortably above a healthy run on the same
+# data — anything past it is genuinely abnormal and worth flagging.
+_FIT_BUDGET_SECONDS: Dict[str, float] = {
+    "lda":            60.0,
+    "random_forest":  180.0,
+    "catboost":       300.0,
+    "mlp":            600.0,
+    "svm":            600.0,        # 10 min — RBF on 20k+ samples is fine; >10 min is not
+    "attention_net":  900.0,
+    "cnn":            900.0,
+    "mstnet":         900.0,
+}
+
+
+def _fit_budget_seconds(model_type: str) -> float:
+    return _FIT_BUDGET_SECONDS.get(str(model_type).lower(), 600.0)
+
+
+class _FitHeartbeat(threading.Thread):
+    """
+    Daemon thread that periodically logs "still fitting, elapsed X" so
+    the user has live feedback during long sklearn fits that hold the
+    GIL (libsvm RBF in particular). Self-terminates when ``stop()`` is
+    called.
+
+    Two reasons this isn't just a Qt timer:
+      • the runner runs in a worker thread, but it's not strictly a
+        Qt worker — non-GUI callers (CLI, tests) need feedback too;
+      • the work being measured is blocking C code holding the GIL,
+        so the only thread that can post status updates is one we
+        start *before* the blocking call.
+    """
+
+    # Heartbeat cadence. Short enough that the user sees movement
+    # within a minute; long enough that the log doesn't get spammed
+    # for a model that finishes fine in 90 seconds.
+    INTERVAL_SECONDS = 30.0
+
+    def __init__(
+        self,
+        prog: "ProgressReporter",
+        eval_idx: int,
+        total_evals: int,
+        fold_id: str,
+        model_type: str,
+        budget_seconds: float,
+    ):
+        super().__init__(daemon=True, name=f"fit-heartbeat-{model_type}")
+        self._prog = prog
+        self._eval_idx = eval_idx
+        self._total_evals = total_evals
+        self._fold_id = fold_id
+        self._model_type = model_type
+        self._budget = float(budget_seconds)
+        self._t0 = time.time()
+        self._stop = threading.Event()
+        self._budget_warned = False
+
+    def stop(self) -> None:
+        self._stop.set()
+        # Don't join() — the worker is a daemon and we just want to
+        # stop the next tick. Joining would block the fit-complete
+        # path waiting up to INTERVAL_SECONDS.
+
+    def run(self) -> None:
+        # Skip the first tick so quick fits never produce noise.
+        if self._stop.wait(self.INTERVAL_SECONDS):
+            return
+        while not self._stop.is_set():
+            elapsed = time.time() - self._t0
+            self._emit(elapsed)
+            # Re-arm; bail out immediately if stop() is called between
+            # ticks. wait() returns True when the event is set.
+            if self._stop.wait(self.INTERVAL_SECONDS):
+                return
+
+    def _emit(self, elapsed: float) -> None:
+        try:
+            self._prog.on_fold_phase(
+                self._eval_idx, self._total_evals,
+                self._fold_id, self._model_type,
+                "fit",
+                f"still fitting · {_fmt_dur(elapsed)}",
+            )
+            self._prog.log(
+                f"  · still fitting {self._model_type} on {self._fold_id} "
+                f"· {_fmt_dur(elapsed)}"
+            )
+            if elapsed > self._budget and not self._budget_warned:
+                self._budget_warned = True
+                # One-shot escalation — a clear, actionable suggestion
+                # the user can act on without having to know what
+                # libsvm's complexity class is. Subsequent ticks fall
+                # back to the regular elapsed-time line.
+                self._prog.log(self._budget_hint(elapsed))
+        except Exception:  # noqa: BLE001
+            # Never let a logging failure crash the heartbeat. We
+            # really do want to ignore everything here.
+            pass
+
+    def _budget_hint(self, elapsed: float) -> str:
+        mt = self._model_type.lower()
+        if mt == "svm":
+            return (
+                f"  ⚠ {self._model_type} on {self._fold_id} has been "
+                f"fitting for {_fmt_dur(elapsed)}, well past the "
+                f"{_fmt_dur(self._budget)} budget. RBF SVMs are O(N²); "
+                f"if you didn't set max_train_samples, the runner now "
+                f"defaults it to 20 000 — but a previously-started "
+                f"run won't pick that up. Consider cancelling and "
+                f"restarting, or skipping SVM for this suite."
+            )
+        if mt in {"cnn", "attention_net", "mstnet"}:
+            return (
+                f"  ⚠ {self._model_type} on {self._fold_id} has been "
+                f"fitting for {_fmt_dur(elapsed)}, past the "
+                f"{_fmt_dur(self._budget)} budget. Deep models can "
+                f"genuinely take this long on CPU; check whether the "
+                f"PyTorch backend picked up a GPU as expected."
+            )
+        return (
+            f"  ⚠ {self._model_type} on {self._fold_id} has been "
+            f"fitting for {_fmt_dur(elapsed)}, past the "
+            f"{_fmt_dur(self._budget)} budget. If this seems wrong "
+            f"you can cancel and re-queue with fewer sessions."
+        )
+
+
+# Heuristics for "hey the next fit may take a while" messages. Tuned
+# from real LOSO runs: SVM(RBF) is dominated by the kernel matrix
+# build, CatBoost rebuilds its internal data caches, and the
+# deep-net models have to lazily allocate GPU/CPU tensors and
+# re-window. None of these are bugs; they're just unhelpfully quiet.
+_SLOW_FIRST_FOLD_MODELS = {
+    "svm":           "RBF SVM is O(N²); validation runs default to "
+                     "max_train_samples=20 000 + probability=False to "
+                     "keep folds tractable. Even so, expect a few "
+                     "minutes per fold on large LOSO splits.",
+    "catboost":      "CatBoost rebuilds its internal data layout on "
+                     "every fit; first fold is the slowest.",
+    "cnn":           "Raw windows aren't cached for deep models — the "
+                     "first fold re-extracts every session.",
+    "attention_net": "Raw windows aren't cached for deep models — the "
+                     "first fold re-extracts every session.",
+    "mstnet":        "Raw windows aren't cached for deep models — the "
+                     "first fold re-extracts every session.",
+    "mlp":           "Feature mode is cached, but the first PyTorch "
+                     "import + tensor allocation has some warm-up cost.",
+}
+
+
+def _first_fold_hint(model_type: str) -> Optional[str]:
+    """Return a 'first fold may be slow' message, or None."""
+    return _SLOW_FIRST_FOLD_MODELS.get(str(model_type).lower())
+
+
+def _fmt_dur(seconds: float) -> str:
+    """Pretty duration: 13.4s, 2m 41s, 1h 04m."""
+    s = max(0.0, float(seconds))
+    if s < 60:
+        return f"{s:.1f}s"
+    m, rs = divmod(int(round(s)), 60)
+    if m < 60:
+        return f"{m}m {rs:02d}s"
+    h, rm = divmod(m, 60)
+    return f"{h}h {rm:02d}m"
+
+
+def _shape_brief(arr) -> str:
+    """One-line shape descriptor used in phase log lines."""
+    try:
+        if arr.ndim == 2:
+            return f"{arr.shape[1]} features"
+        if arr.ndim == 3:
+            return f"{arr.shape[1]}×{arr.shape[2]} window"
+        return f"ndim={arr.ndim}"
+    except Exception:  # noqa: BLE001
+        return "shape=?"
+
+
 # ---------------------------------------------------------------------------
 # Progress reporting — pure Python, thread-safe to call from a worker.
 # The GUI wraps this in QMetaObject.invokeMethod to bounce to the UI thread.
@@ -99,11 +284,28 @@ class ProgressReporter(Protocol):
     def on_run_start(self, total_folds: int, total_models: int,
                      records: List[SessionRecord]) -> None: ...
 
+    def on_model_start(self, model_idx: int, total_models: int,
+                       model_type: str, total_folds: int) -> None: ...
+
     def on_fold_start(self, fold_idx: int, total_evals: int,
                       fold_id: str, model_type: str) -> None: ...
 
+    def on_fold_phase(self, fold_idx: int, total_evals: int,
+                      fold_id: str, model_type: str,
+                      phase: str, detail: str = "") -> None:
+        """
+        Fired between fold milestones (materialise → fit → evaluate)
+        so the UI can show movement during long-running phases such as
+        SVM kernel fitting on 100 k+ samples. Optional; default no-op.
+        """
+        ...
+
     def on_fold_done(self, fold_idx: int, total_evals: int,
                      fold_result: "FoldResult") -> None: ...
+
+    def on_model_done(self, model_idx: int, total_models: int,
+                      model_type: str, n_folds_completed: int,
+                      total_seconds: float) -> None: ...
 
     def on_run_done(self, result: "RunResult") -> None: ...
 
@@ -116,8 +318,11 @@ class NoopProgress:
     """Default reporter — silent, never cancels."""
 
     def on_run_start(self, *_a, **_k): pass
+    def on_model_start(self, *_a, **_k): pass
     def on_fold_start(self, *_a, **_k): pass
+    def on_fold_phase(self, *_a, **_k): pass
     def on_fold_done(self, *_a, **_k): pass
+    def on_model_done(self, *_a, **_k): pass
     def on_run_done(self, *_a, **_k): pass
     def log(self, message: str) -> None:
         log.info(message)
@@ -286,6 +491,32 @@ class ValidationRunner:
         self.data_dir = Path(data_dir)
         self.output_root = Path(output_root) if output_root else (self.data_dir / "validation_runs")
         self.corpus = SessionCorpus(self.data_dir)
+        # Lazily-constructed per-runner feature cache. Lives under
+        # <data_dir>/.feature_cache/ and survives across runs in the
+        # same process; suite-style use (thesis report) gets the
+        # biggest payoff because every fold of every preset shares
+        # the same per-session feature blobs.
+        self._feature_cache = None
+
+    def _get_or_make_cache(self):
+        """Return the lazily-constructed FeatureCache for this runner."""
+        if self._feature_cache is None:
+            # Local import keeps the package import-light when callers
+            # never touch _materialise_fold (e.g. report aggregation only).
+            from .feature_cache import FeatureCache
+            enabled = os.environ.get(
+                "PLAYAGAIN_FEATURE_CACHE", "1",
+            ).strip().lower() not in {"0", "off", "false", "no"}
+            self._feature_cache = FeatureCache(self.data_dir, enabled=enabled)
+            if enabled:
+                log.info(
+                    "Feature cache enabled at %s "
+                    "(set PLAYAGAIN_FEATURE_CACHE=0 to disable).",
+                    self._feature_cache.root,
+                )
+            else:
+                log.info("Feature cache disabled via env.")
+        return self._feature_cache
 
     # ------------------------------------------------------------------
 
@@ -328,7 +559,26 @@ class ValidationRunner:
         prog.on_run_start(n_folds, n_models, records)
 
         eval_idx = 0
-        for model_cfg in cfg.models:
+        # Track per-model timing so we can report a model-level summary
+        # at on_model_done — useful when one model (e.g. SVM with RBF
+        # on 100k+ samples) is many minutes per fold and the user
+        # otherwise sees no movement between fold-complete messages.
+        for model_idx, model_cfg in enumerate(cfg.models, start=1):
+            model_t0 = time.time()
+            model_folds_done = 0
+            model_type = str(model_cfg.type)
+            prog.on_model_start(model_idx, n_models, model_type, n_folds)
+            prog.log(
+                f"━━ model {model_idx}/{n_models}: {model_type} "
+                f"({n_folds} fold{'s' if n_folds != 1 else ''}) ━━"
+            )
+            # First-fold warning for models that are known to be slow on
+            # the first fit — gives the user something to read while the
+            # process appears frozen.
+            _hint = _first_fold_hint(model_type)
+            if _hint:
+                prog.log(f"  ℹ  {_hint}")
+
             for fold in folds:
                 if prog.should_cancel():
                     prog.log("Cancellation requested — stopping.")
@@ -337,23 +587,45 @@ class ValidationRunner:
 
                 eval_idx += 1
                 fold_id = str(fold.get("id", f"fold_{eval_idx}"))
-                prog.on_fold_start(eval_idx, total_evals, fold_id, model_cfg.type)
+                prog.on_fold_start(eval_idx, total_evals, fold_id, model_type)
 
-                fr = self._run_one_fold(cfg, model_cfg, fold, eval_idx)
+                fr = self._run_one_fold(cfg, model_cfg, fold, eval_idx,
+                                        progress=prog,
+                                        total_evals=total_evals)
                 if fr is not None:
                     result.folds.append(fr)
+                    model_folds_done += 1
                     prog.on_fold_done(eval_idx, total_evals, fr)
                     prog.log(
-                        f"  [{eval_idx}/{total_evals}] {model_cfg.type} · {fold_id} · "
+                        f"  [{eval_idx}/{total_evals}] {model_type} · {fold_id} · "
                         f"acc {fr.accuracy:.3f}  F1 {fr.macro_f1:.3f}  "
                         f"({fr.train_seconds:.1f}s)"
                     )
                 else:
-                    prog.log(f"  [{eval_idx}/{total_evals}] {model_cfg.type} · {fold_id} · SKIPPED")
+                    prog.log(f"  [{eval_idx}/{total_evals}] {model_type} · {fold_id} · SKIPPED")
+
+            model_secs = time.time() - model_t0
+            prog.on_model_done(model_idx, n_models, model_type,
+                               model_folds_done, model_secs)
+            prog.log(
+                f"━━ model {model_idx}/{n_models} {model_type} done · "
+                f"{model_folds_done}/{n_folds} folds · "
+                f"{_fmt_dur(model_secs)} total ━━"
+            )
             if result.cancelled:
                 break
 
         result.finished_at = _now_iso()
+        # Cache stats — quietly informative; useful when one user complains
+        # "the second run is suddenly fast" and another asks why their disk
+        # filled up. Always printed at INFO so it shows in suite logs.
+        if self._feature_cache is not None:
+            s = self._feature_cache.stats()
+            prog.log(
+                f"Feature cache: {s['hits']} hits / {s['misses']} misses, "
+                f"{s['writes']} new entries "
+                f"({s['bytes_written'] / 1_048_576:.1f} MiB written)."
+            )
         self._persist_results(result)
         prog.on_run_done(result)
         return result
@@ -383,41 +655,90 @@ class ValidationRunner:
         model_cfg,
         fold: Dict[str, Any],
         eval_idx: int,
+        progress: Optional[ProgressReporter] = None,
+        total_evals: int = 0,
     ) -> Optional[FoldResult]:
         # Deterministic per-fold seed.
         fold_idx = int(fold.get("idx", eval_idx))
         seed = _fold_seed(cfg.seed, fold_idx, model_cfg.type)
         _seed_everything(seed)
 
+        fold_id = str(fold.get("id", f"fold_{eval_idx}"))
+        model_type = str(model_cfg.type)
+        prog = progress or NoopProgress()
+
+        # Phase 1 — materialise data for this fold (cached for feature
+        # mode, full re-window for raw-window deep models). Long-ish
+        # for the very first fold of a new feature config; cheap after
+        # that. Reporting the start so a user staring at the screen
+        # during a 5-minute SVM fit sees that materialisation finished.
+        t_mat = time.time()
+        n_train_recs = len(fold.get("train") or [])
+        n_test_recs  = len(fold.get("test") or [])
+        prog.on_fold_phase(
+            eval_idx, total_evals, fold_id, model_type,
+            "materialise",
+            f"loading + windowing {n_train_recs} train + {n_test_recs} test session(s)",
+        )
         try:
             (X_train, y_train,
              X_val,   y_val,
              X_test,  y_test,
              label_names) = self._materialise_fold(
                 cfg, fold,
-                raw_windows=_model_wants_raw_windows(model_cfg.type),
+                raw_windows=_model_wants_raw_windows(model_type),
             )
         except Exception as e:  # noqa: BLE001
-            log.exception("Failed to materialise fold %s: %s", fold.get("id"), e)
+            log.exception("Failed to materialise fold %s: %s", fold_id, e)
             return None
+        mat_secs = time.time() - t_mat
 
         if len(X_train) == 0 or len(X_test) == 0:
-            log.warning("Fold %s has empty train/test set; skipping.", fold.get("id"))
+            log.warning("Fold %s has empty train/test set; skipping.", fold_id)
             return None
 
+        # Phase 2 — fit. We announce sample/feature shape so a user
+        # facing a long wait can sanity-check that it isn't surprising.
+        # 100 k samples × 224 features with an RBF SVM is genuinely
+        # slow and that's the most common "why is it stuck" scenario.
+        prog.on_fold_phase(
+            eval_idx, total_evals, fold_id, model_type,
+            "fit",
+            f"{len(X_train):,} train · {len(X_test):,} test · "
+            f"{_shape_brief(X_train)}",
+        )
         t0 = time.time()
+        # Heartbeat thread — sklearn's RBF SVM fit holds the GIL inside
+        # libsvm so we can't get fit-internal progress. What we *can*
+        # do is post an elapsed-time line every minute so the user
+        # sees the process is alive, and escalate to a "consider
+        # cancelling" hint once we cross a model-specific budget.
+        heartbeat = _FitHeartbeat(
+            prog, eval_idx, total_evals, fold_id, model_type,
+            budget_seconds=_fit_budget_seconds(model_type),
+        )
+        heartbeat.start()
         try:
-            model, train_meta = self._fit_model(
-                cfg, model_cfg, seed,
-                X_train, y_train,
-                X_val if len(X_val) > 0 else None,
-                y_val if len(X_val) > 0 else None,
-            )
-        except Exception as e:  # noqa: BLE001
-            log.exception("Model fit failed for fold %s: %s", fold.get("id"), e)
-            return None
+            try:
+                model, train_meta = self._fit_model(
+                    cfg, model_cfg, seed,
+                    X_train, y_train,
+                    X_val if len(X_val) > 0 else None,
+                    y_val if len(X_val) > 0 else None,
+                )
+            except Exception as e:  # noqa: BLE001
+                log.exception("Model fit failed for fold %s: %s", fold_id, e)
+                return None
+        finally:
+            heartbeat.stop()
         train_secs = time.time() - t0
 
+        # Phase 3 — eval. Usually cheap, but worth a marker so the
+        # GUI's stage display doesn't sit on "fitting" after fit ends.
+        prog.on_fold_phase(
+            eval_idx, total_evals, fold_id, model_type,
+            "evaluate", f"scoring {len(X_test):,} test windows",
+        )
         try:
             metrics = self._evaluate(model, X_test, y_test, label_names)
         except Exception as e:  # noqa: BLE001
@@ -495,6 +816,19 @@ class ValidationRunner:
         per-session-rotation / bad-channel / feature-extraction code
         path is identical to the one the GUI Train tab uses.
 
+        Feature cache
+        ─────────────
+        For non-raw (i.e. feature-extracted) folds, this method goes
+        through :class:`FeatureCache` instead of rebuilding the
+        feature view from scratch every fold. The cache keys on the
+        full set of inputs that affect the output (windowing, feature
+        config, bad-channel mode, per-session rotation flag, per-
+        session bad channels/rotation/mapping, plus the data.npy
+        mtime+size), so it self-invalidates when any of those change.
+        Raw-window folds (deep models) bypass the cache and use the
+        original code path — the same cache key would balloon to
+        gigabytes per session and those models aren't the bottleneck.
+
         Mixed-channel-count folds
         ─────────────────────────
         ``DataManager.create_dataset`` rejects sessions with different
@@ -506,7 +840,11 @@ class ValidationRunner:
         log.
         """
         from playagain_pipeline.core.data_manager import DataManager  # lazy
+        from .feature_cache import (                                  # lazy
+            FeatureCache, materialise_split_with_cache,
+        )
         dm = DataManager(self.data_dir)
+        cache = self._get_or_make_cache()
 
         feature_config = None if raw_windows else self._build_feature_config(cfg)
 
@@ -569,18 +907,26 @@ class ValidationRunner:
         )
 
         def _make_xy(records, name_suffix: str):
-            sessions = _load_sessions(_filter_by_channels(records))
-            if not sessions:
+            kept = _filter_by_channels(records)
+            if not kept:
                 return _empty()
-            ds = dm.create_dataset(
-                name=f"_validation_tmp_{safe_fold_id}_{view_tag}_{name_suffix}",
-                sessions=sessions,
-                window_size_ms=cfg.windowing.window_ms,
-                window_stride_ms=cfg.windowing.stride_ms,
+            # Feature-mode folds go through the cache; raw-window folds
+            # (CNN/TCN) fall back to the original session-batched path
+            # via materialise_split_with_cache's internal fallback.
+            X, y, names = materialise_split_with_cache(
+                kept,
+                cache=cache,
+                data_manager=dm,
+                window_ms=cfg.windowing.window_ms,
+                stride_ms=cfg.windowing.stride_ms,
                 feature_config=feature_config,
                 use_per_session_rotation=False,
+                bad_channel_mode="interpolate",
+                name_suffix=f"{safe_fold_id}_{view_tag}_{name_suffix}",
             )
-            return ds["X"], ds["y"], ds["metadata"].get("label_names", {})
+            if X.size == 0:
+                return _empty()
+            return X, y, names
 
         # ── Within-session (temporal tail) path ────────────────────────
         # This is deliberately a TEMPORAL split — the last `test_fraction`
@@ -625,15 +971,41 @@ class ValidationRunner:
     @staticmethod
     def _build_feature_config(cfg: ExperimentConfig) -> Optional[Dict[str, Any]]:
         """Translate ExperimentConfig.features into the dict that
-        DataManager.create_dataset expects (or None for raw windows)."""
+        DataManager.create_dataset expects (or None for raw windows).
+
+        Emits the bare-string ``custom`` form the extractor's custom
+        branch reads natively. The older dict form
+        (``{"name": ..., "params": ...}``) is still accepted post-fix
+        for any caller that depends on it, but strings are the
+        unambiguous shape — and the only one that correctly distinguishes
+        a single-feature ablation row from a multi-feature run, since
+        the previous output (``mode="features"``, dict entries) silently
+        fell through to the extractor's default branch and returned the
+        full six-feature stack regardless of ``cfg.features``.
+
+        Per-feature params (e.g. ZC threshold) are forwarded through a
+        parallel dict-form entry so the extractor's custom branch can
+        pick them up; absent params let the extractor use its built-in
+        defaults.
+        """
         if not cfg.features:
             return None
-        return {
-            "mode": "features",
-            "features": [
-                {"name": f.name, "params": f.params}
+        # Only emit a per-feature dict when at least one feature carries
+        # non-empty params — keeps the common case (all defaults) as a
+        # bare-string list that's trivially diff-friendly in config logs.
+        any_params = any(
+            bool(getattr(f, "params", None)) for f in cfg.features
+        )
+        if any_params:
+            entries: List[Any] = [
+                {"name": f.name, "params": dict(f.params or {})}
                 for f in cfg.features
-            ],
+            ]
+        else:
+            entries = [f.name for f in cfg.features]
+        return {
+            "mode": "custom",
+            "features": entries,
         }
 
     # ------------------------------------------------------------------
@@ -658,10 +1030,24 @@ class ValidationRunner:
         from playagain_pipeline.models.classifier import ModelManager  # lazy
 
         mm = ModelManager(self.data_dir / "models")
+
+        # Validation-only sensible defaults the user can override via
+        # ``model_cfg.params``. Right now this only matters for SVM:
+        # the deployed-model defaults (probability=True, no sample cap)
+        # turn a single LOSO fold into a multi-hour blocking operation
+        # for no reportable benefit — the runner never asks the SVM
+        # for predict_proba, and a stratified subsample is within
+        # ~1 percentage point of the full-fit macro-F1.
+        params = dict(model_cfg.params or {})
+        if str(model_cfg.type).lower() == "svm":
+            params.setdefault("probability", False)
+            params.setdefault("cache_size", 1024.0)
+            params.setdefault("max_train_samples", 20000)
+
         model = mm.create_model(
             model_cfg.type,
             name=f"_validation_{model_cfg.type}",
-            **(model_cfg.params or {}),
+            **params,
         )
 
         # Sampling rate lives on the session metadata; we assume every

@@ -347,7 +347,22 @@ class DataManager:
         # ── Helper: prepare one session's data (rotation, bad-ch, preproc) ──
         def _prepare_session_data(session: RecordingSession):
             """Return processed data array (as float32) for a single session."""
-            data = np.array(session.get_data(), dtype=np.float32, copy=True)
+            # ``session.get_data()`` already returns a freshly-vstacked
+            # array on this session's data chunks (one mmap chunk in the
+            # common load_session case). The previous code wrapped that
+            # in ``np.array(..., copy=True)``, which for huge sessions
+            # forces a *second* full-memory copy on top of the vstack
+            # — visible as a 2× RAM spike during fold materialisation.
+            # ``np.asarray`` reuses the existing buffer when possible
+            # and only copies when an explicit dtype conversion is
+            # required. Downstream code (bad-channel handling,
+            # preprocessing_fn) all return new arrays anyway, so we
+            # don't actually need a defensive copy here.
+            raw = session.get_data()
+            if raw.dtype != np.float32:
+                data = np.asarray(raw, dtype=np.float32)
+            else:
+                data = raw
 
             # Zero out bad channels for this session
             session_bad_chs: list = []

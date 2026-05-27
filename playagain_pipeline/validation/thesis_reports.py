@@ -166,12 +166,21 @@ def load_run_result(run_dir: Path) -> RunStub:
 # fold_id grammar produced by cv_strategies.py:
 #   "within__{subject}__{session}"
 #   "loso_session__{subject}__{session}"
+#   "intra_loso_session__{subject}__{session}"
 #   "loso_subject__{subject}"
 #   "crossdomain__{train_domain}_to_{test_domain}"
 #   "kfold_subjects__k{k}_seed{seed}__fold{fi}"
 #   "holdout__val{V}_test{T}__seed{S}__strat-{X}"
 
-_LOSO_SESS_RE = re.compile(r"^(?:within|loso_session)__(?P<subj>[^_].*?)__(?P<sess>.+)$")
+# The session-level regex accepts the pooled (``loso_session``),
+# domain-restricted (``within``) and per-participant
+# (``intra_loso_session``) variants — all three carry a
+# ``…__{subject}__{session}`` tail, so the same subject/session
+# extraction works for every one.
+_LOSO_SESS_RE = re.compile(
+    r"^(?:within|loso_session|intra_loso_session)__"
+    r"(?P<subj>[^_].*?)__(?P<sess>.+)$"
+)
 _LOSO_SUBJ_RE = re.compile(r"^loso_subject__(?P<subj>.+)$")
 
 

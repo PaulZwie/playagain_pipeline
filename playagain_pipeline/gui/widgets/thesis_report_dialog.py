@@ -56,8 +56,8 @@ from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDialog, QFileDialog, QFormLayout, QFrame,
     QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMessageBox, QProgressBar, QPushButton, QScrollArea, QSizePolicy,
-    QSplitter, QTableWidget, QTableWidgetItem, QTextEdit, QToolButton,
-    QVBoxLayout, QWidget,
+    QSplitter, QTableWidget, QTableWidgetItem, QTabWidget, QTextEdit,
+    QToolButton, QVBoxLayout, QWidget,
 )
 
 # ── Validation backend ────────────────────────────────────────────────────
@@ -138,6 +138,32 @@ _ROLE_PRIMARY    = "primary"        # §6.3 LOSO-session
 _ROLE_LOSO_SUBJ  = "loso_subj"      # §6.4 LOSO-subject
 # The ablation and cross-domain roles use one row per feature/direction.
 
+# CV strategies the user can pick for the §6.3 primary run. Each entry
+# is (strategy_id, UI label, tooltip). The strategy ids must match the
+# keys in playagain_pipeline.validation.cv_strategies.STRATEGIES so the
+# runner resolves them. ``k_fold_sessions`` carries a ``k`` kwarg that
+# the dialog supplies from a spin box.
+_CV_STRATEGIES: List[Tuple[str, str, str]] = [
+    ("loso_session", "LOSO-session  (pooled, every session held out)",
+     "Leave-One-Session-Out across the whole corpus: each session is "
+     "held out once, the model trains on every other session of every "
+     "subject. The thesis §6.3 default."),
+    ("intra_subject_loso_session",
+     "Intra-subject LOSO-session  (per participant)",
+     "Per-participant Leave-One-Session-Out: each session is held out "
+     "and the model trains only on that same subject's other sessions. "
+     "Measures within-subject generalisation; needs ≥2 sessions per "
+     "subject."),
+    ("loso_subject", "LOSO-subject  (whole subject held out)",
+     "Leave-One-Subject-Out: every subject is held out in turn, the "
+     "model never sees the test subject during training. The hardest, "
+     "most realistic split."),
+    ("k_fold_sessions", "K-fold over sessions",
+     "Sessions are partitioned into K folds; each fold is held out "
+     "once. Faster than full LOSO when there are many sessions."),
+]
+_DEFAULT_CV_STRATEGY = "loso_session"
+
 # Filename prefix the runner uses for output dirs:
 #   <YYYY-MM-DD__HH-MM-SS>__<safe_name>/
 # The dialog scans the validation_runs root for any directory containing
@@ -188,16 +214,29 @@ def _make_primary_cfg(
     stride_ms: int = _DEFAULT_STRIDE_MS,
     seed:      int = _DEFAULT_SEED,
     features:  Sequence[str] = ("mav", "rms", "wl", "zc", "ssc", "var", "iemg"),
+    cv_strategy: str = _DEFAULT_CV_STRATEGY,
+    k_folds:   int = 5,
 ) -> ExperimentConfig:
-    """§6.3 — Leave-One-Session-Out across all models with combined features."""
+    """
+    §6.3 — the primary cross-validation run across all chosen models.
+
+    ``cv_strategy`` selects how folds are formed; it must be one of the
+    ids in ``_CV_STRATEGIES`` (``loso_session`` is the thesis default).
+    ``k_folds`` is only consulted for ``k_fold_sessions``.
+    """
+    cv_kwargs: Dict[str, Any] = {}
+    if cv_strategy == "k_fold_sessions":
+        cv_kwargs = {"k": int(k_folds)}
+    # The run name encodes the strategy so two primary runs with
+    # different splits don't collide on disk or in the run picker.
     return ExperimentConfig(
-        name=f"thesis_loso_session_{_ts()}",
-        description="Chapter 6 §6.3 primary evaluation.",
+        name=f"thesis_{cv_strategy}_{_ts()}",
+        description=f"Chapter 6 §6.3 primary evaluation ({cv_strategy}).",
         seed=seed,
         windowing=WindowingConfig(window_ms=window_ms, stride_ms=stride_ms),
         features=_feature_cfgs(features),
         models=_model_cfgs(models),
-        cv=CVConfig(strategy="loso_session", kwargs={}),
+        cv=CVConfig(strategy=cv_strategy, kwargs=cv_kwargs),
     )
 
 
@@ -387,9 +426,41 @@ class _RunBridge(QObject):
     # We forward selected events into Qt signals; everything else is a
     # no-op. The runner's on_log_line is the high-volume one, so we
     # debounce it lightly to avoid spamming the GUI text area.
+    #
+    # IMPORTANT: this must implement *every* method the runner's
+    # ProgressReporter protocol defines, even the ones we don't surface
+    # in the UI — the runner calls them unconditionally, so a missing
+    # method is an AttributeError that aborts the whole run. The full
+    # protocol is: on_run_start, on_model_start, on_fold_start,
+    # on_fold_phase, on_fold_done, on_model_done, on_run_done.
     def on_run_start(self, total_folds, total_models, records): pass
     def on_run_done(self, result):                              pass
     def on_fold_start(self, *_a, **_kw):                        pass
+
+    def on_model_start(self, model_idx, total_models, model_type,
+                       total_folds):
+        # A new model in the run started. Surface a banner line so the
+        # log shows which model the upcoming folds belong to.
+        self.log_line.emit(
+            f"━━ model {model_idx}/{total_models}: {model_type} "
+            f"({total_folds} fold(s))"
+        )
+
+    def on_fold_phase(self, fold_idx, total_evals, fold_id, model_type,
+                      phase, detail=""):
+        # Fired between fold milestones (materialise → fit → evaluate).
+        # Only the heartbeat "still fitting" details are worth showing;
+        # the rest would just be noise, so we forward selectively.
+        if detail:
+            self.log_line.emit(f"   · {detail}")
+
+    def on_model_done(self, model_idx, total_models, model_type,
+                      n_folds_completed, total_seconds):
+        # A model finished all its folds.
+        self.log_line.emit(
+            f"━━ model {model_idx}/{total_models} {model_type} done "
+            f"· {n_folds_completed} fold(s) · {total_seconds:.1f}s"
+        )
 
     def on_fold_done(self, eval_idx, total_evals, fold_result):
         # eval_idx/total_evals are within a single run; we let the
@@ -497,6 +568,10 @@ class ReportBuildArgs:
     # When False, ``--skip-game`` is added so the game-recording report
     # (§6.8–6.9) is not generated.
     include_game:    bool = True
+    # When False, ``--skip-threshold-gameplay`` is added so the
+    # threshold-gameplay report (the Unity RMS-threshold game tables
+    # and figures) is not generated.
+    include_threshold_gameplay: bool = True
 
 
 class _ReportBuildWorker(QThread):
@@ -602,6 +677,8 @@ class _ReportBuildWorker(QThread):
         if a.groups:     argv += ["--groups", str(a.groups)]
         if not a.include_game:
             argv += ["--skip-game"]
+        if not a.include_threshold_gameplay:
+            argv += ["--skip-threshold-gameplay"]
         if a.verbose:    argv += ["--verbose"]
         return argv
 
@@ -663,6 +740,19 @@ class _RunPicker(QWidget):
 
     def selected_path(self) -> Optional[Path]:
         return self._current
+
+    def set_strategy_hint(self, strategy: Optional[str]) -> None:
+        """
+        Change which CV strategy gets the recommended ``→`` marker.
+
+        Used by the §6.3 picker so the arrow follows the strategy the
+        user picked in section 1 — a run is always selectable
+        regardless, the hint is purely a visual nudge.
+        """
+        if strategy == self._strategy_hint:
+            return
+        self._strategy_hint = strategy
+        self.refresh()
 
     def set_selected_path(self, path: Optional[Path]) -> None:
         self._current = path
@@ -823,32 +913,37 @@ class ThesisReportDialog(QDialog):
 
         outer.addWidget(self._build_header())
 
-        # The three sections are stacked vertically inside a scroll area.
-        # Previously a QSplitter shared a fixed window height between
-        # them, which crushed every section on smaller displays. With a
-        # scroll area each section keeps its natural height and the user
-        # scrolls if the window can't show them all at once.
-        body_scroll = QScrollArea()
-        body_scroll.setWidgetResizable(True)
-        body_scroll.setFrameShape(QFrame.Shape.NoFrame)
-        body_scroll.setHorizontalScrollBarPolicy(
-            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        # The three sections are *sequential workflow steps* — create
+        # runs, map them to thesis slots, generate outputs — not things
+        # the user looks at simultaneously. A QTabWidget fits that far
+        # better than the old single scrolling column, which forced the
+        # user to scroll past two unrelated sections to reach the third
+        # and crowded everything on smaller displays. Each tab now gets
+        # the dialog's full height; only genuinely long content inside a
+        # tab scrolls.
+        self._tabs = QTabWidget()
+        self._tabs.setDocumentMode(True)
+
+        self._tabs.addTab(
+            self._wrap_scrollable(self._build_section_create()),
+            "1 · Create runs",
         )
-
-        body_host = QWidget()
-        body_lay = QVBoxLayout(body_host)
-        body_lay.setContentsMargins(0, 0, 0, 0)
-        body_lay.setSpacing(12)
-        body_lay.addWidget(self._build_section_create())
-        body_lay.addWidget(self._build_section_map())
-        body_lay.addWidget(self._build_section_generate())
-        body_lay.addStretch(1)
-        body_scroll.setWidget(body_host)
-
-        # The scroll area gets the lion's share of the stretch; the log
-        # pane keeps a fixed, modest footprint so it never starves the
-        # sections above it (the old layout let it claim half the dialog).
-        outer.addWidget(body_scroll, 1)
+        self._tabs.addTab(
+            self._wrap_scrollable(self._build_section_map()),
+            "2 · Map to sections",
+        )
+        self._tabs.addTab(
+            self._wrap_scrollable(self._build_section_generate()),
+            "3 · Generate outputs",
+        )
+        self._tabs.setTabToolTip(0, "Queue the Chapter-6 validation runs.")
+        self._tabs.setTabToolTip(
+            1, "Tell the report generator which run fills each slot."
+        )
+        self._tabs.setTabToolTip(
+            2, "Cohort split, extra evaluations, and output generation."
+        )
+        outer.addWidget(self._tabs, 1)
 
         log_pane = self._build_log_pane()
         log_pane.setMinimumHeight(130)
@@ -861,6 +956,30 @@ class ThesisReportDialog(QDialog):
         close_btn.clicked.connect(self.close)
         bottom.addWidget(close_btn)
         outer.addLayout(bottom)
+
+    @staticmethod
+    def _wrap_scrollable(inner: QWidget) -> QScrollArea:
+        """
+        Put ``inner`` inside a frameless, width-resizable scroll area.
+
+        Each tab gets its own scroll area so that a tab whose content
+        is taller than the dialog (the generate tab, mostly) scrolls
+        on its own without dragging the other tabs' layouts around.
+        """
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.Shape.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(
+            Qt.ScrollBarPolicy.ScrollBarAsNeeded
+        )
+        host = QWidget()
+        host_lay = QVBoxLayout(host)
+        host_lay.setContentsMargins(2, 2, 2, 2)
+        host_lay.setSpacing(0)
+        host_lay.addWidget(inner)
+        host_lay.addStretch(1)
+        scroll.setWidget(host)
+        return scroll
 
     def _build_header(self) -> QWidget:
         header = QFrame()
@@ -888,7 +1007,7 @@ class ThesisReportDialog(QDialog):
     # ---- Section 1 ---------------------------------------------------
 
     def _build_section_create(self) -> QGroupBox:
-        box = QGroupBox("1. Create validation runs")
+        box = QGroupBox("Create validation runs")
         box.setStyleSheet(self._group_style())
         lay = QVBoxLayout(box); lay.setContentsMargins(14, 16, 14, 12)
         lay.setSpacing(10)
@@ -931,12 +1050,47 @@ class ThesisReportDialog(QDialog):
         opts.addRow(QLabel(""),
                     QLabel("(used for ablation, cross-domain, and figures)"))
 
+        # Cross-validation strategy for the §6.3 primary run. The
+        # different LOSO variants — pooled vs intra-subject — produce
+        # quite different numbers, so this is a real experimental
+        # choice the user needs to make rather than a hidden default.
+        self._cv_combo = QComboBox()
+        for strat_id, label, tip in _CV_STRATEGIES:
+            self._cv_combo.addItem(label, strat_id)
+            self._cv_combo.setItemData(
+                self._cv_combo.count() - 1, tip, Qt.ItemDataRole.ToolTipRole)
+        cv_idx = self._cv_combo.findData(_DEFAULT_CV_STRATEGY)
+        if cv_idx >= 0:
+            self._cv_combo.setCurrentIndex(cv_idx)
+        self._cv_combo.currentIndexChanged.connect(self._on_cv_strategy_changed)
+        opts.addRow(QLabel("Primary CV strategy:"), self._cv_combo)
+
+        # K-fold count — only relevant (and only visible) when the
+        # k-fold strategy is selected.
+        from PySide6.QtWidgets import QSpinBox
+        self._k_folds_spin = QSpinBox()
+        self._k_folds_spin.setRange(2, 50)
+        self._k_folds_spin.setValue(5)
+        self._k_folds_spin.valueChanged.connect(self._on_cv_strategy_changed)
+        self._k_folds_row_label = QLabel("Number of folds (k):")
+        opts.addRow(self._k_folds_row_label, self._k_folds_spin)
+
+        # Live one-line description of the chosen strategy so the user
+        # sees what the §6.3 run will actually do.
+        self._cv_hint = QLabel("")
+        self._cv_hint.setWordWrap(True)
+        self._cv_hint.setStyleSheet("color:#475569; font-size:10px;")
+        opts.addRow(QLabel(""), self._cv_hint)
+
         lay.addLayout(opts)
+
+        # Initialise the k-fold visibility + hint for the default choice.
+        self._on_cv_strategy_changed()
 
         # Preset buttons grid
         grid = QGridLayout(); grid.setHorizontalSpacing(8); grid.setVerticalSpacing(6)
         btn_loso_sess = self._primary_button(
-            "Create LOSO-session run", "Table 6.3, Figs 6.3–6.5, Table 6.7")
+            "Create primary CV run", "Table 6.3, Figs 6.3–6.5, Table 6.7")
         btn_loso_subj = self._primary_button(
             "Create LOSO-subject run", "Table 6.4")
         btn_abl       = self._primary_button(
@@ -980,7 +1134,7 @@ class ThesisReportDialog(QDialog):
     # ---- Section 2 ---------------------------------------------------
 
     def _build_section_map(self) -> QGroupBox:
-        box = QGroupBox("2. Map existing runs to thesis sections")
+        box = QGroupBox("Map existing runs to thesis sections")
         box.setStyleSheet(self._group_style())
         outer = QVBoxLayout(box); outer.setContentsMargins(14, 16, 14, 12)
         outer.setSpacing(10)
@@ -996,10 +1150,19 @@ class ThesisReportDialog(QDialog):
 
         form = QFormLayout(); form.setSpacing(6)
 
+        # The §6.3 picker's strategy hint follows whatever the user
+        # selected in section 1; seed it from the dropdown's current
+        # value so an early pick before section 2 was built is honoured.
+        _primary_strat = (self._cv_combo.currentData()
+                          if hasattr(self, "_cv_combo")
+                          else _DEFAULT_CV_STRATEGY)
         self._picker_primary = _RunPicker(
-            self._validation_runs_root, strategy_hint="loso_session"
+            self._validation_runs_root, strategy_hint=_primary_strat
         )
-        form.addRow(QLabel("§6.3 LOSO-session:"), self._picker_primary)
+        self._primary_slot_label = QLabel(
+            f"§6.3 primary ({_primary_strat}):"
+        )
+        form.addRow(self._primary_slot_label, self._picker_primary)
 
         self._picker_loso_subj = _RunPicker(
             self._validation_runs_root, strategy_hint="loso_subject"
@@ -1048,7 +1211,7 @@ class ThesisReportDialog(QDialog):
     # ---- Section 3 ---------------------------------------------------
 
     def _build_section_generate(self) -> QGroupBox:
-        box = QGroupBox("3. Generate thesis outputs")
+        box = QGroupBox("Generate thesis outputs")
         box.setStyleSheet(self._group_style())
         lay = QVBoxLayout(box); lay.setContentsMargins(14, 16, 14, 12)
         lay.setSpacing(8)
@@ -1063,46 +1226,12 @@ class ThesisReportDialog(QDialog):
         info.setStyleSheet("color:#475569; font-size:11px;")
         lay.addWidget(info)
 
-        # Output directory + browse
-        out_row = QHBoxLayout(); out_row.setSpacing(6)
-        out_row.addWidget(QLabel("Output:"))
-        self._out_edit = QLineEdit(str(self._default_out))
-        out_row.addWidget(self._out_edit, 1)
-        out_btn = QPushButton("Browse…")
-        out_btn.clicked.connect(self._on_browse_out)
-        out_row.addWidget(out_btn)
-        lay.addLayout(out_row)
-
-        # Tunables row
-        knobs = QFormLayout(); knobs.setSpacing(6)
-        from PySide6.QtWidgets import QDoubleSpinBox, QSpinBox
-
-        self._win_spin = QSpinBox(); self._win_spin.setRange(50, 2000)
-        self._win_spin.setSingleStep(10); self._win_spin.setValue(_DEFAULT_WINDOW_MS)
-        self._win_spin.setSuffix(" ms")
-        self._stride_spin = QSpinBox(); self._stride_spin.setRange(5, 500)
-        self._stride_spin.setSingleStep(5); self._stride_spin.setValue(_DEFAULT_STRIDE_MS)
-        self._stride_spin.setSuffix(" ms")
-        win_row = QWidget(); wh = QHBoxLayout(win_row); wh.setContentsMargins(0, 0, 0, 0)
-        wh.setSpacing(8); wh.addWidget(self._win_spin); wh.addWidget(QLabel("/"))
-        wh.addWidget(self._stride_spin); wh.addStretch(1)
-        knobs.addRow("Window / stride:", win_row)
-
-        self._flag_spin = QDoubleSpinBox(); self._flag_spin.setRange(0.0, 1.0)
-        self._flag_spin.setSingleStep(0.05); self._flag_spin.setValue(0.5)
-        self._flag_spin.setDecimals(2)
-        knobs.addRow("Calibration flag threshold:", self._flag_spin)
-
-        self._gate_spin = QDoubleSpinBox(); self._gate_spin.setRange(1.0, 5000.0)
-        self._gate_spin.setSingleStep(10.0); self._gate_spin.setValue(150.0)
-        self._gate_spin.setSuffix(" ms")
-        knobs.addRow("Latency gate (Table 6.7):", self._gate_spin)
-
-        self._drop_rest_cb = QCheckBox("Exclude rest windows from class-distribution counts")
-        knobs.addRow("", self._drop_rest_cb)
-        lay.addLayout(knobs)
-
-        # ── Healthy / impaired cohort split + game recordings ────────
+        # ── Healthy / impaired cohort split + extra-evaluation toggles ──
+        # This sub-section used to live further down between the
+        # tunables and the action row, where it was easy to miss when
+        # the dialog scrolled. Promoting it to the top of section 3 so
+        # the user sees the threshold-gameplay and game-recording
+        # checkboxes before they hit the "Generate" button.
         cohort_box = QGroupBox("Participant groups & extra evaluations")
         cohort_box.setStyleSheet(self._sub_group_style())
         cohort_lay = QVBoxLayout(cohort_box)
@@ -1111,9 +1240,8 @@ class ThesisReportDialog(QDialog):
 
         cohort_info = QLabel(
             "Splits Tables 6.3/6.4 and the per-session variability figure "
-            "by cohort, and adds the game-recording performance report "
-            "(§6.8–6.9). Both are optional — leave the registry blank to "
-            "fall back to metadata inference."
+            "by cohort, and chooses which extra evaluations to include. "
+            "Leave the registry blank to fall back to metadata inference."
         )
         cohort_info.setWordWrap(True)
         cohort_info.setStyleSheet("color:#475569; font-size:10px;")
@@ -1158,10 +1286,71 @@ class ThesisReportDialog(QDialog):
         )
         cohort_lay.addWidget(self._game_cb)
 
+        # Threshold-gameplay (original Unity RMS-threshold game). Scores
+        # the recordings that pre-date the gesture-recognition model
+        # three ways: as-recorded (what the user experienced), profile-
+        # threshold (re-derived from profile.json with timestamp-correct
+        # history lookup), and the F1-optimal threshold (post-hoc upper
+        # bound). Profile thresholds are checked for plausibility —
+        # sessions whose recorded threshold is above their max RMS are
+        # flagged but still included.
+        self._threshold_cb = QCheckBox(
+            "Include threshold-gameplay evaluation  (Unity RMS-threshold game)"
+        )
+        self._threshold_cb.setChecked(True)
+        self._threshold_cb.setToolTip(
+            "Walks data/unity_sessions (and the data root) for raw Unity "
+            "CSVs and scores them three ways: as-recorded, profile-"
+            "threshold, and F1-optimal. The gap between as-recorded and "
+            "optimal F1 is the headroom the gesture model fills in. "
+            "Equivalent to the --skip-threshold-gameplay flag when "
+            "unchecked."
+        )
+        cohort_lay.addWidget(self._threshold_cb)
+
         lay.addWidget(cohort_box)
 
         # Populate the status line for whatever path we start with.
         self._refresh_groups_status()
+
+        # Output directory + browse
+        out_row = QHBoxLayout(); out_row.setSpacing(6)
+        out_row.addWidget(QLabel("Output:"))
+        self._out_edit = QLineEdit(str(self._default_out))
+        out_row.addWidget(self._out_edit, 1)
+        out_btn = QPushButton("Browse…")
+        out_btn.clicked.connect(self._on_browse_out)
+        out_row.addWidget(out_btn)
+        lay.addLayout(out_row)
+
+        # Tunables row
+        knobs = QFormLayout(); knobs.setSpacing(6)
+        from PySide6.QtWidgets import QDoubleSpinBox, QSpinBox
+
+        self._win_spin = QSpinBox(); self._win_spin.setRange(50, 2000)
+        self._win_spin.setSingleStep(10); self._win_spin.setValue(_DEFAULT_WINDOW_MS)
+        self._win_spin.setSuffix(" ms")
+        self._stride_spin = QSpinBox(); self._stride_spin.setRange(5, 500)
+        self._stride_spin.setSingleStep(5); self._stride_spin.setValue(_DEFAULT_STRIDE_MS)
+        self._stride_spin.setSuffix(" ms")
+        win_row = QWidget(); wh = QHBoxLayout(win_row); wh.setContentsMargins(0, 0, 0, 0)
+        wh.setSpacing(8); wh.addWidget(self._win_spin); wh.addWidget(QLabel("/"))
+        wh.addWidget(self._stride_spin); wh.addStretch(1)
+        knobs.addRow("Window / stride:", win_row)
+
+        self._flag_spin = QDoubleSpinBox(); self._flag_spin.setRange(0.0, 1.0)
+        self._flag_spin.setSingleStep(0.05); self._flag_spin.setValue(0.5)
+        self._flag_spin.setDecimals(2)
+        knobs.addRow("Calibration flag threshold:", self._flag_spin)
+
+        self._gate_spin = QDoubleSpinBox(); self._gate_spin.setRange(1.0, 5000.0)
+        self._gate_spin.setSingleStep(10.0); self._gate_spin.setValue(150.0)
+        self._gate_spin.setSuffix(" ms")
+        knobs.addRow("Latency gate (Table 6.7):", self._gate_spin)
+
+        self._drop_rest_cb = QCheckBox("Exclude rest windows from class-distribution counts")
+        knobs.addRow("", self._drop_rest_cb)
+        lay.addLayout(knobs)
 
         # Action + progress
         action_row = QHBoxLayout(); action_row.setSpacing(8)
@@ -1258,8 +1447,46 @@ class ThesisReportDialog(QDialog):
             QMessageBox.information(self, "Pick at least one model",
                                     "Tick at least one model before queuing a run.")
             return
-        cfg = _make_primary_cfg(models)
-        self._launch_suite([("loso_session (primary)", cfg)])
+        strat, k = self._selected_cv_strategy()
+        cfg = _make_primary_cfg(models, cv_strategy=strat, k_folds=k)
+        self._launch_suite([(f"{strat} (primary)", cfg)])
+
+    # ------------------------------------------------------------------
+
+    @Slot()
+    def _on_cv_strategy_changed(self) -> None:
+        """Sync the k-fold spinner visibility and the hint label."""
+        strat = self._cv_combo.currentData()
+        is_kfold = (strat == "k_fold_sessions")
+        # The k spinner is only meaningful for k-fold — hide it otherwise
+        # rather than leaving a dead control on screen.
+        self._k_folds_spin.setVisible(is_kfold)
+        self._k_folds_row_label.setVisible(is_kfold)
+        # Echo the tooltip text of the chosen item as a visible hint.
+        tip = ""
+        for sid, _label, t in _CV_STRATEGIES:
+            if sid == strat:
+                tip = t
+                break
+        if is_kfold:
+            tip += (f"  Currently k = {self._k_folds_spin.value()} "
+                    "folds.")
+        self._cv_hint.setText(tip)
+
+        # Keep the §6.3 run-picker's recommended-run marker in sync with
+        # the chosen strategy. The picker lives in section 2, built after
+        # section 1, so guard for the first call during construction.
+        picker = getattr(self, "_picker_primary", None)
+        if picker is not None:
+            picker.set_strategy_hint(strat)
+        label = getattr(self, "_primary_slot_label", None)
+        if label is not None:
+            label.setText(f"§6.3 primary ({strat}):")
+
+    def _selected_cv_strategy(self) -> Tuple[str, int]:
+        """Return (strategy_id, k) for the §6.3 primary run."""
+        strat = self._cv_combo.currentData() or _DEFAULT_CV_STRATEGY
+        return str(strat), int(self._k_folds_spin.value())
 
     def _on_create_loso_subject(self) -> None:
         # Per the thesis text, the LOSO-subject table reports classical
@@ -1344,7 +1571,9 @@ class ThesisReportDialog(QDialog):
                                     "Tick at least one model before queuing.")
             return
         plans: List[Tuple[str, ExperimentConfig]] = []
-        plans.append(("loso_session (primary)", _make_primary_cfg(models)))
+        strat, k = self._selected_cv_strategy()
+        plans.append((f"{strat} (primary)",
+                      _make_primary_cfg(models, cv_strategy=strat, k_folds=k)))
         classical = [m for m in models
                      if m in {"lda", "svm", "random_forest", "catboost"}] or models
         plans.append(("loso_subject", _make_loso_subj_cfg(classical)))
@@ -1417,14 +1646,19 @@ class ThesisReportDialog(QDialog):
 
     @Slot(object)
     def _on_suite_finished(self, results) -> None:
+        n_ok = sum(1 for _, rr in results if rr is not None)
         self._append_log(
-            f"✓ Suite complete: {sum(1 for _,rr in results if rr is not None)} "
-            f"of {len(results)} runs succeeded."
+            f"✓ Suite complete: {n_ok} of {len(results)} runs succeeded."
         )
         self._suite_cancel.setEnabled(False)
         # New run dirs are on disk — refresh the section-2 pickers so
         # they're immediately mappable.
         self._refresh_run_pickers()
+        # Nudge the user to the next workflow step. Only auto-advance
+        # on at least one success — a fully-failed suite should leave
+        # the user on the runs tab to see what happened.
+        if n_ok and getattr(self, "_tabs", None) is not None:
+            self._tabs.setCurrentIndex(1)
 
     @Slot(str)
     def _on_suite_failed(self, traceback_text: str) -> None:
@@ -1585,6 +1819,7 @@ class ThesisReportDialog(QDialog):
             drop_rest=self._drop_rest_cb.isChecked(),
             groups=groups_arg,
             include_game=self._game_cb.isChecked(),
+            include_threshold_gameplay=self._threshold_cb.isChecked(),
             verbose=True,
         )
 
@@ -1608,6 +1843,10 @@ class ThesisReportDialog(QDialog):
         self._append_log(
             "   • game recordings: "
             + ("included" if self._game_cb.isChecked() else "skipped")
+        )
+        self._append_log(
+            "   • threshold gameplay: "
+            + ("included" if self._threshold_cb.isChecked() else "skipped")
         )
 
     @Slot()

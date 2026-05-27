@@ -1,0 +1,9 @@
+group,model,n_subjects,n_folds,accuracy_mean,accuracy_std,macro_f1_mean,macro_f1_std
+healthy,catboost,4,4,0.6163,0.0716,0.5154,0.1139
+healthy,random_forest,4,4,0.6163,0.0703,0.4997,0.1240
+healthy,svm,4,4,0.5671,0.1342,0.4672,0.1729
+healthy,lda,4,4,0.4598,0.1642,0.4060,0.1537
+impaired,random_forest,3,3,0.6046,0.0688,0.3717,0.1477
+impaired,catboost,3,3,0.5907,0.0342,0.3659,0.1363
+impaired,svm,3,3,0.5866,0.0853,0.3469,0.1468
+impaired,lda,3,3,0.5211,0.0822,0.3219,0.1194

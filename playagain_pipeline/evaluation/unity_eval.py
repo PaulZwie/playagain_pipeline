@@ -184,14 +184,33 @@ def _extract_rms_and_truth(
 
 
 def _from_raw_csv(csv_path: Path) -> Tuple[np.ndarray, np.ndarray, str]:
-    """Pull RMS and GroundTruthActive directly from a raw Unity CSV."""
+    """Pull RMS and ground truth directly from a raw Unity CSV.
+
+    Accepts both the newer ``GroundTruthActive`` and the original
+    ``GroundTruth`` column names — the two have the same semantics
+    (1 = game-imposed active cue) and only differ in the suffix.
+    ``InputSource``-tagged Marker rows are dropped — they are events,
+    not EMG measurements.
+    """
     import pandas as pd
     df = pd.read_csv(csv_path)
-    if "RMS" not in df.columns or "GroundTruthActive" not in df.columns:
-        raise ValueError(f"{csv_path.name} is not a Unity raw CSV (missing RMS / GroundTruthActive)")
+    if "RMS" not in df.columns:
+        raise ValueError(f"{csv_path.name} is not a Unity raw CSV (missing RMS)")
+    truth_col = None
+    for c in ("GroundTruthActive", "GroundTruth"):
+        if c in df.columns:
+            truth_col = c
+            break
+    if truth_col is None:
+        raise ValueError(
+            f"{csv_path.name} is not a Unity raw CSV "
+            "(missing GroundTruth / GroundTruthActive)"
+        )
+    if "InputSource" in df.columns:
+        df = df[df["InputSource"] == "EMG"].reset_index(drop=True)
     rms   = df["RMS"].to_numpy(dtype=np.float64)
-    truth = (df["GroundTruthActive"].to_numpy(dtype=np.int64) > 0).astype(np.int64)
-    return rms, truth, "logged RMS"
+    truth = (df[truth_col].to_numpy(dtype=np.float64) > 0.5).astype(np.int64)
+    return rms, truth, f"logged RMS (truth={truth_col})"
 
 
 def _from_converted_session(

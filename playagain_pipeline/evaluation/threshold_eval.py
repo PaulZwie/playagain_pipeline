@@ -40,15 +40,23 @@ Three perspectives per recording
 
 Why thresholds need extra care
 ──────────────────────────────
-Profiles in the wild misbehave in two specific ways:
+Profiles in the wild misbehave in several specific ways:
 
-  * **Wrong scale.** A profile may say ``currentThreshold = 0.05``
-    against a recording whose RMS never exceeds ``0.004``. The
-    as-recorded gameplay then has F1 = 0 — but the underlying
-    EMG has AUC ≈ 0.82. A naive "as-recorded only" table would
-    conclude the EMG is broken, which is the wrong conclusion.
-    ``suspect_threshold`` flags this when the active threshold is
-    above the session's max RMS times a safety ratio.
+  * **Unit mismatch (the big one).** The Unity profile editor stores
+    thresholds in **millivolts**, but the recorder logs the ``RMS``
+    column in **volts**. A profile value of ``0.34`` means 0.34 mV =
+    0.00034 V. Comparing the raw ``0.34`` against an RMS column whose
+    values top out near ``0.005`` makes every session look like a
+    catastrophic 0% failure when in fact the threshold was fine.
+    ``ThresholdEvalSettings.profile_threshold_units`` controls the
+    conversion; it defaults to ``"mV"`` to match the shipped Unity
+    format.
+
+  * **Wrong scale even after unit conversion.** Occasionally a
+    threshold is genuinely mis-set — too high to ever trigger on a
+    given session's RMS. ``suspect_threshold`` flags this when the
+    *converted* threshold is above the session's max RMS times a
+    safety ratio.
 
   * **Off-by-history.** ``currentThreshold`` reflects the most
     recent save — which may have happened *after* the recording.
@@ -100,10 +108,45 @@ class ThresholdEvalSettings:
     # the most common manifestation of a desynced profile.
     threshold_sanity_ratio: float = 1.5
 
+    # Unit of the thresholds stored in profile.json relative to the
+    # CSV's ``RMS`` column.
+    #
+    #   "mV" : profile thresholds are in millivolts, the RMS column
+    #          is in volts. This is the real-world case — the Unity
+    #          profile editor works in mV, the recorder logs RMS in
+    #          V — so a profile value of 0.34 must be divided by
+    #          1000 before it is comparable to an RMS of 0.005.
+    #   "V"  : profile thresholds are already in the same unit as
+    #          the RMS column; no conversion.
+    #
+    # Getting this wrong is silently catastrophic: an un-converted
+    # mV threshold is 1000× too large, never triggers, and every
+    # session looks like a 0% failure. Default is "mV" because that
+    # matches the shipped Unity profile format.
+    profile_threshold_units: str = "mV"
+
     # Optional global override for the profile threshold — ignored
     # when None. Useful for "what if every session had used this
     # one threshold?"
     fixed_profile_threshold: Optional[float] = None
+
+    # Recordings shorter than this are flagged as ``excluded`` with
+    # reason ``too_short``. A sub-second recording has no statistical
+    # weight and its metrics are noise. They are kept in the output
+    # table (for transparency) but marked so the pooled summary and
+    # the plots can drop them.
+    min_duration_s: float = 5.0
+
+    # A recording whose ground-truth column has only one class (all
+    # rest, or all active) cannot yield a meaningful binary metric or
+    # AUC — precision/recall/F1 collapse and AUC is undefined. These
+    # are flagged ``excluded`` with reason ``single_class_truth``.
+    # Calibration / MVC recordings are the usual culprit.
+    #
+    # This is always on; the setting only controls whether such
+    # recordings are additionally dropped from the *pooled* numbers
+    # (True, the honest default) or merely flagged (False).
+    drop_degenerate_from_pooled: bool = True
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -153,8 +196,33 @@ class ThresholdRow:
     # Signal-quality summary (threshold-free)
     auc: float
 
+    # Confusion-matrix counts per perspective. Frame counts, not rates
+    # — the plotting layer normalises as needed. These let the
+    # confusion-matrix figures be drawn straight from the table with
+    # no second pass over the CSVs.
+    asrec_tp:   int = 0
+    asrec_fp:   int = 0
+    asrec_fn:   int = 0
+    asrec_tn:   int = 0
+    profile_tp: int = 0
+    profile_fp: int = 0
+    profile_fn: int = 0
+    profile_tn: int = 0
+    opt_tp:     int = 0
+    opt_fp:     int = 0
+    opt_fn:     int = 0
+    opt_tn:     int = 0
+
     # Flags
     suspect_threshold: bool = False
+    # ``excluded`` marks a recording whose metrics are not statistically
+    # meaningful — too short, or a ground-truth column with only one
+    # class (calibration / MVC takes). Excluded rows stay in the
+    # per-recording table for transparency but are dropped from the
+    # pooled summary and the plots. ``exclude_reason`` is one of
+    # ``""`` (kept), ``"too_short"``, ``"single_class_truth"``.
+    excluded:          bool = False
+    exclude_reason:    str  = ""
     notes:             str  = ""
 
     def to_dict(self) -> Dict[str, Any]:
@@ -167,6 +235,11 @@ class ThresholdReport:
     sweep:    List[Dict[str, float]] = field(default_factory=list)
     pooled:   Dict[str, Dict[str, float]] = field(default_factory=dict)
     settings: Dict[str, Any] = field(default_factory=dict)
+
+    @property
+    def valid_rows(self) -> List[ThresholdRow]:
+        """Rows that survived the exclusion filter."""
+        return [r for r in self.rows if not r.excluded]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -351,10 +424,18 @@ def _recording_started_at(csv_path: Path) -> Optional[datetime]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _binary_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-    """Accuracy / precision / recall / F1 for binary {0,1} arrays."""
+    """
+    Accuracy / precision / recall / F1 for binary {0,1} arrays, plus
+    the raw confusion-matrix counts (``tp``/``fp``/``fn``/``tn``).
+
+    The counts are what the per-recording and per-subject confusion-
+    matrix plots are built from; carrying them here means the plotting
+    code never has to re-read the CSVs.
+    """
     if y_true.size == 0:
         return {"accuracy": float("nan"), "precision": float("nan"),
-                "recall":   float("nan"), "f1":        float("nan")}
+                "recall":   float("nan"), "f1":        float("nan"),
+                "tp": 0, "fp": 0, "fn": 0, "tn": 0}
     tp = int(np.sum((y_pred == 1) & (y_true == 1)))
     fp = int(np.sum((y_pred == 1) & (y_true == 0)))
     fn = int(np.sum((y_pred == 0) & (y_true == 1)))
@@ -363,7 +444,8 @@ def _binary_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
     prec = tp / (tp + fp) if (tp + fp) else 0.0
     rec  = tp / (tp + fn) if (tp + fn) else 0.0
     f1   = (2 * prec * rec / (prec + rec)) if (prec + rec) else 0.0
-    return {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1}
+    return {"accuracy": acc, "precision": prec, "recall": rec, "f1": f1,
+            "tp": tp, "fp": fp, "fn": fn, "tn": tn}
 
 
 def _auc_from_score(score: np.ndarray, truth: np.ndarray) -> float:
@@ -517,13 +599,30 @@ def evaluate_threshold_gameplay(
         else:
             thr_profile, thr_src = float("nan"), "no profile"
 
+        # Unit conversion. The Unity profile editor stores thresholds
+        # in millivolts; the recorder logs the ``RMS`` column in volts.
+        # Everything downstream — the suspect check, the profile-
+        # threshold metrics, the reported ``profile_threshold`` value —
+        # must work in the RMS column's unit (volts), so convert here,
+        # exactly once, immediately after the threshold is resolved.
+        # ``fixed_profile_threshold`` is assumed to already be in volts
+        # (the caller set it explicitly) and is left alone.
+        thr_units = str(s.profile_threshold_units or "mV").strip().lower()
+        if (np.isfinite(thr_profile)
+                and s.fixed_profile_threshold is None
+                and thr_units in ("mv", "millivolt", "millivolts")):
+            thr_profile_raw = thr_profile
+            thr_profile = thr_profile / 1000.0
+            thr_src = f"{thr_src} [{thr_profile_raw:g} mV → {thr_profile:g} V]"
+
         # As-recorded metrics
         if (asrec >= 0).all():
             asrec_m = _binary_metrics(truth, asrec)
             asrec_pos_rate = float(asrec.mean())
         else:
             asrec_m = {"accuracy": float("nan"), "precision": float("nan"),
-                       "recall":   float("nan"), "f1":        float("nan")}
+                       "recall":   float("nan"), "f1":        float("nan"),
+                       "tp": 0, "fp": 0, "fn": 0, "tn": 0}
             asrec_pos_rate = float("nan")
 
         # Profile-threshold metrics
@@ -532,7 +631,8 @@ def evaluate_threshold_gameplay(
             profile_m = _binary_metrics(truth, pred_p)
         else:
             profile_m = {"accuracy": float("nan"), "precision": float("nan"),
-                         "recall":   float("nan"), "f1":        float("nan")}
+                         "recall":   float("nan"), "f1":        float("nan"),
+                         "tp": 0, "fp": 0, "fn": 0, "tn": 0}
 
         # Optimal threshold via sweep
         sweep = _threshold_sweep(rms, truth, n_points=s.n_thresholds)
@@ -542,6 +642,12 @@ def evaluate_threshold_gameplay(
                  "precision": best.get("precision", float("nan")),
                  "recall":    best.get("recall", float("nan")),
                  "f1":        best.get("f1", float("nan"))}
+        # Re-apply the chosen optimal threshold to recover the raw
+        # confusion counts — the sweep rows only carry rates.
+        if np.isfinite(thr_opt):
+            opt_cm = _binary_metrics(truth, (rms > thr_opt).astype(np.int64))
+        else:
+            opt_cm = {"tp": 0, "fp": 0, "fn": 0, "tn": 0}
 
         # Plausibility check on the profile threshold
         rms_max = float(rms.max())
@@ -557,6 +663,37 @@ def evaluate_threshold_gameplay(
                 f"⚠ profile threshold {thr_profile:.6g} > {rms_max:.6g} "
                 f"(RMS max); session never triggered as recorded"
             )
+
+        # Exclusion check. A recording is excluded from the pooled
+        # numbers and the plots when its metrics carry no statistical
+        # weight:
+        #   • too_short          — below ``min_duration_s``
+        #   • single_class_truth — the ground-truth column has only
+        #                          one class, so precision/recall/F1
+        #                          collapse and AUC is undefined.
+        #                          Calibration / MVC takes look like
+        #                          this.
+        # Excluded rows stay in the per-recording table (transparency)
+        # but are tagged so downstream code can drop them.
+        n_truth_pos = int(truth.sum())
+        single_class = (n_truth_pos == 0 or n_truth_pos == truth.size)
+        too_short = (np.isfinite(duration) and duration < s.min_duration_s)
+        excluded = bool(single_class or too_short)
+        if single_class:
+            exclude_reason = "single_class_truth"
+            note_bits.append(
+                "⚠ excluded: ground truth is single-class "
+                f"({'all rest' if n_truth_pos == 0 else 'all active'}) "
+                "— likely a calibration/MVC take"
+            )
+        elif too_short:
+            exclude_reason = "too_short"
+            note_bits.append(
+                f"⚠ excluded: {duration:.2f}s < {s.min_duration_s:g}s "
+                "minimum"
+            )
+        else:
+            exclude_reason = ""
         notes = "; ".join(note_bits)
 
         subject_id = _infer_subject_id(csv)
@@ -588,11 +725,21 @@ def evaluate_threshold_gameplay(
             opt_recall=float(opt_m["recall"]),
             opt_f1=float(opt_m["f1"]),
             auc=_auc_from_score(rms, truth),
+            asrec_tp=int(asrec_m["tp"]), asrec_fp=int(asrec_m["fp"]),
+            asrec_fn=int(asrec_m["fn"]), asrec_tn=int(asrec_m["tn"]),
+            profile_tp=int(profile_m["tp"]), profile_fp=int(profile_m["fp"]),
+            profile_fn=int(profile_m["fn"]), profile_tn=int(profile_m["tn"]),
+            opt_tp=int(opt_cm["tp"]), opt_fp=int(opt_cm["fp"]),
+            opt_fn=int(opt_cm["fn"]), opt_tn=int(opt_cm["tn"]),
             suspect_threshold=bool(suspect),
+            excluded=excluded,
+            exclude_reason=exclude_reason,
             notes=notes,
         ))
-        pooled_rms.append(rms)
-        pooled_truth.append(truth)
+        # Only valid recordings feed the pooled sweep / pooled metrics.
+        if not excluded:
+            pooled_rms.append(rms)
+            pooled_truth.append(truth)
 
     # Pooled sweep + summary
     pooled: Dict[str, Dict[str, float]] = {}
@@ -606,10 +753,15 @@ def evaluate_threshold_gameplay(
         # We do this rather than re-concatenate prediction streams
         # because each "perspective" uses a different prediction
         # stream (asrec / profile / optimal) and re-deriving them
-        # is redundant disk work.
+        # is redundant disk work. Excluded recordings (degenerate or
+        # too-short) are skipped — they already never reached
+        # ``pooled_rms`` for the sweep, and including them here would
+        # reintroduce the noise the exclusion was meant to remove.
+        valid_rows = [r for r in rows if not r.excluded]
+
         def _pooled_mean(field_name: str) -> float:
             num = den = 0.0
-            for r in rows:
+            for r in valid_rows:
                 v = getattr(r, field_name)
                 if v is not None and np.isfinite(v):
                     num += float(v) * r.n_frames
@@ -626,6 +778,14 @@ def evaluate_threshold_gameplay(
                 "f1":        _pooled_mean(f"{prefix}_f1"),
             }
         pooled["auc_pooled"] = {"value": _auc_from_score(rms_all, truth_all)}
+        # Expose how many recordings were used vs excluded so the
+        # written report can be honest about the denominator.
+        n_excluded = sum(1 for r in rows if r.excluded)
+        pooled["counts"] = {
+            "n_total":    float(len(rows)),
+            "n_valid":    float(len(valid_rows)),
+            "n_excluded": float(n_excluded),
+        }
 
     return ThresholdReport(
         rows=rows,
@@ -636,6 +796,9 @@ def evaluate_threshold_gameplay(
             "objective":               s.objective,
             "threshold_sanity_ratio":  s.threshold_sanity_ratio,
             "fixed_profile_threshold": s.fixed_profile_threshold,
+            "profile_threshold_units": s.profile_threshold_units,
+            "min_duration_s":          s.min_duration_s,
+            "drop_degenerate_from_pooled": s.drop_degenerate_from_pooled,
         },
     )
 
@@ -644,19 +807,57 @@ def _infer_subject_id(csv_path: Path) -> str:
     """
     Best-effort subject extraction from a Unity recording path.
 
-    Unity layout: ``.../<subject>/RecordedData/<session>.csv``. Walk
-    parents looking for a ``VP_``-prefix or ``SUBJECT*``; fall back
-    to the immediate parent name. Skip well-known intermediate dirs.
+    Unity's on-disk layout is::
+
+        .../Users/<subject>/RecordedData/<...>/<session>.csv
+
+    so the most reliable signal is "the directory immediately below a
+    ``Users`` folder". We try that first. Failing that, we look for a
+    ``VP_``/``SUBJECT`` style name anywhere in the path. Only if both
+    fail do we fall back to the immediate parent directory — and even
+    then we skip generic data-folder names like ``emg`` /
+    ``RecordedData`` that are never subject ids.
+
+    The ``Users``-child rule matters: paths like
+    ``.../Users/02_test_emg/RecordedData/emg/emg_2026-…csv`` would
+    otherwise resolve to the literal ``emg`` folder, collapsing every
+    such recording onto one bogus "emg" subject.
     """
-    intermediate = {"RecordedData", "recorded_data", "recordings",
-                    "Users", "users"}
-    for part in reversed(csv_path.parts[:-1]):
-        if part in intermediate:
-            continue
+    parts = csv_path.parts
+
+    # 1. An explicit VP_/SUBJECT-style name anywhere in the path. This
+    #    is the strongest signal — when the study uses ``VP_01`` etc.
+    #    it is unambiguous, and it must win over the ``Users``-child
+    #    heuristic below (a path can contain the OS ``/Users/<account>``
+    #    folder, whose child is an account name, not a subject).
+    for part in reversed(parts[:-1]):
         if part.startswith("VP_") or part.upper().startswith("SUBJECT"):
             return part
-    parent = csv_path.parent.name
-    return parent or "unknown"
+
+    # 2. Child of a ``Users`` directory — the canonical Unity layout
+    #    for studies that don't use the VP_ naming. Scan right-to-left
+    #    so the Unity ``Users`` folder (deeper) wins over a macOS
+    #    home-directory ``/Users``.
+    for i in range(len(parts) - 2, -1, -1):
+        if parts[i].lower() == "users":
+            cand = parts[i + 1]
+            if cand and cand.lower() not in _NON_SUBJECT_DIRS:
+                return cand
+            break
+    for part in reversed(parts[:-1]):
+        if part.lower() not in _NON_SUBJECT_DIRS:
+            return part
+
+    return "unknown"
+
+
+# Directory names that are part of the Unity folder scaffolding and
+# must never be mistaken for a subject id.
+_NON_SUBJECT_DIRS = {
+    "users", "recordeddata", "recorded_data", "recordings",
+    "emg", "data", "unity", "unity_sessions", "sessions",
+    "csv", "raw", "exports", "export",
+}
 
 
 # ═══════════════════════════════════════════════════════════════════════════

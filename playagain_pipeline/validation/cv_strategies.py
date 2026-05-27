@@ -62,9 +62,10 @@ def within_session(
     """
     if not 0 < test_fraction < 1:
         raise ValueError("test_fraction must be in (0, 1)")
-    for rec in records:
+    for i, rec in enumerate(records):
         yield {
             "id": f"within__{rec.subject_id}__{rec.session_id}",
+            "idx": i,          # stable fold index for per-fold seeding
             "train": [rec],
             "test": [rec],
             "test_fraction": test_fraction,   # consumed by the runner
@@ -78,10 +79,15 @@ def within_session(
 
 def leave_one_session_out(records: List[SessionRecord]) -> Iterator[Fold]:
     """
+    Pooled-subject LOSO-session.
+
     For each session, hold it out as the test set and train on the
-    union of all *other* sessions. This reports how well a model
-    generalises across recording sessions of the same subject as well
-    as across subjects.
+    union of *all* other sessions, including sessions from other
+    subjects. This reports cross-subject + cross-session generalisation
+    in a single number, but it does *not* match the most common
+    deployment story (use a participant's earlier sessions to fit a
+    model that runs on their next session). Use
+    :func:`intra_subject_loso_session` for that.
     """
     for i, held_out in enumerate(records):
         train = [r for j, r in enumerate(records) if j != i]
@@ -89,10 +95,67 @@ def leave_one_session_out(records: List[SessionRecord]) -> Iterator[Fold]:
             continue
         yield {
             "id": f"loso_session__{held_out.subject_id}__{held_out.session_id}",
+            "idx": i,          # stable fold index for per-fold seeding
             "train": train,
             "test": [held_out],
             "split_kind": "loso_session",
         }
+
+
+def intra_subject_loso_session(
+    records: List[SessionRecord],
+) -> Iterator[Fold]:
+    """
+    Per-participant LOSO-session — the everyday deployment scenario.
+
+    For each subject with two or more sessions, hold each of that
+    subject's sessions out in turn and train on the *remaining
+    sessions of the same subject only*. No other subject's data is
+    used. This answers the question the deployed system actually
+    cares about: "given that I have N earlier recordings from this
+    participant, how well does a model fit on those generalise to
+    their next recording session?"
+
+    Subjects with a single session are silently skipped (there's
+    nothing to leave out for them). The fold-id grammar is the same
+    as ``leave_one_session_out`` so the thesis aggregators (Table 6.3,
+    per-session variability figure) light up unchanged; the
+    ``split_kind`` differs so consumers that care can branch on it.
+
+    Empirically this is the cheapest of the LOSO variants too: each
+    fold's train set is one subject's sessions rather than the whole
+    pooled corpus, so per-fold matrices are ~N_subjects× smaller in
+    RAM than pooled LOSO and SVM/RF/CatBoost fits proportionally
+    faster.
+    """
+    by_subject: Dict[str, List[SessionRecord]] = {}
+    for r in records:
+        by_subject.setdefault(r.subject_id, []).append(r)
+
+    # Global fold counter so idx is unique across all subjects, which
+    # keeps the per-fold seed stable regardless of how many models are
+    # in the experiment config (the runner falls back to eval_idx when
+    # "idx" is absent, making seeds model-order-dependent without this).
+    global_idx = 0
+    for subject in sorted(by_subject):
+        subj_records = by_subject[subject]
+        if len(subj_records) < 2:
+            continue
+        for i, held_out in enumerate(subj_records):
+            train = [r for j, r in enumerate(subj_records) if j != i]
+            if not train:
+                continue
+            yield {
+                "id": (
+                    f"intra_loso_session__{held_out.subject_id}"
+                    f"__{held_out.session_id}"
+                ),
+                "idx": global_idx,   # stable; independent of model count
+                "train": train,
+                "test": [held_out],
+                "split_kind": "intra_subject_loso_session",
+            }
+            global_idx += 1
 
 
 # ---------------------------------------------------------------------------
@@ -109,13 +172,14 @@ def leave_one_subject_out(records: List[SessionRecord]) -> Iterator[Fold]:
     subjects = sorted({r.subject_id for r in records})
     if len(subjects) < 2:
         return
-    for held_subject in subjects:
+    for i, held_subject in enumerate(subjects):
         train = [r for r in records if r.subject_id != held_subject]
         test  = [r for r in records if r.subject_id == held_subject]
         if not train or not test:
             continue
         yield {
             "id": f"loso_subject__{held_subject}",
+            "idx": i,          # stable fold index for per-fold seeding
             "train": train,
             "test": test,
             "split_kind": "loso_subject",
@@ -160,6 +224,73 @@ def cross_domain(
         "test": test,
         "split_kind": "cross_domain",
     }
+
+
+# ---------------------------------------------------------------------------
+# K-fold over subjects (for larger studies)
+# ---------------------------------------------------------------------------
+
+def k_fold_sessions(
+    records: List[SessionRecord],
+    *,
+    k: int = 10,
+    seed: int = 42,
+) -> Iterator[Fold]:
+    """
+    K-fold cross-validation where the *unit* of splitting is a session,
+    not a window or a subject. Each session lives entirely in one
+    fold's test set; train is the union of all other folds.
+
+    This is the standard substitute for ``leave_one_session_out`` when
+    LOSO is impractical. With ~100 sessions, LOSO produces 100 folds
+    (one retrain each); K=10 produces 10 folds with ten sessions held
+    out per fold. Total compute drops ~10× while still preserving the
+    session-boundary guarantee that no two windows from the same
+    recording end up in both train and test.
+
+    Subject balance is *not* enforced — a fold may contain multiple
+    sessions from the same subject, which is the right behaviour when
+    the goal is to estimate per-session generalisation. Use
+    ``k_fold_subjects`` instead when the goal is cross-subject
+    generalisation.
+
+    Falls back to ``leave_one_session_out`` when ``k >= len(records)``
+    so a misconfigured K never silently degrades to "train on
+    everything".
+    """
+    if k < 2:
+        raise ValueError(f"k must be >= 2 (got {k})")
+    if len(records) < k:
+        # Honestly: there aren't enough sessions for K-fold to mean
+        # anything different from LOSO. Yield LOSO instead.
+        yield from leave_one_session_out(records)
+        return
+
+    rng = random.Random(seed)
+    shuffled = list(records)
+    rng.shuffle(shuffled)
+
+    folds: List[List[SessionRecord]] = [[] for _ in range(k)]
+    for i, rec in enumerate(shuffled):
+        folds[i % k].append(rec)
+
+    for fi, test_records in enumerate(folds):
+        test_ids = {(r.subject_id, r.session_id) for r in test_records}
+        train = [r for r in shuffled
+                 if (r.subject_id, r.session_id) not in test_ids]
+        if not train or not test_records:
+            continue
+        yield {
+            "id": f"kfold_sessions__k{k}_seed{seed}__fold{fi}",
+            "idx": fi,
+            "train": train,
+            "test": test_records,
+            "split_kind": "k_fold_sessions",
+            # Subjects represented in this fold's test set — useful for
+            # per-subject aggregation tables that still want a "which
+            # subjects fell here" column.
+            "test_subjects": sorted({r.subject_id for r in test_records}),
+        }
 
 
 # ---------------------------------------------------------------------------
@@ -311,12 +442,14 @@ def holdout_split(
 # ---------------------------------------------------------------------------
 
 STRATEGIES = {
-    "within_session":         within_session,
-    "loso_session":           leave_one_session_out,
-    "loso_subject":           leave_one_subject_out,
-    "cross_domain":           cross_domain,
-    "k_fold_subjects":        k_fold_subjects,
-    "holdout_split":          holdout_split,
+    "within_session":              within_session,
+    "loso_session":                leave_one_session_out,
+    "intra_subject_loso_session":  intra_subject_loso_session,
+    "loso_subject":                leave_one_subject_out,
+    "cross_domain":                cross_domain,
+    "k_fold_sessions":             k_fold_sessions,
+    "k_fold_subjects":             k_fold_subjects,
+    "holdout_split":               holdout_split,
 }
 
 

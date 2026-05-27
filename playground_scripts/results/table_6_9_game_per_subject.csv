@@ -1,0 +1,9 @@
+subject_id,group,n_recordings,n_frames,accuracy,macro_f1,model_names
+KinderUni,healthy,1,142542,0.2276,0.0927,random_forest_2026-03-30_13-42-05_3rep_134333
+VP_01,healthy,19,1372266,0.1768,0.0794,attention_net_2026-03-20_11-10-16_3rep_111259;attention_net_2026-03-25_10-21-07_5rep_102950;attention_net_2026-03-25_13-55-45_3rep_135829;attention_net_2026-03-26_12-38-48_3rep_124117;attention_net_2026-03-30_09-41-33_3rep_094402;random_forest_2026-03-20_12-54-45_10rep_111500;random_forest_2026-03-23_14-58-17_3rep_150633;random_forest_2026-03-24_08-57-34_3rep_085909;random_forest_2026-03-25_10-21-07_5rep_102642;random_forest_2026-03-25_13-36-55_3rep_133832;random_forest_VP_01_2026-03-20_12-54-45_10rep_133342;random_forest_VP_01_2026-05-04_09-43-34_3rep_094610
+VP_02,healthy,3,276300,0.1545,0.0669,random_forest_VP_02_2026-05-06_10-43-57_3rep_104529;random_forest_VP_02_2026-05-06_11-02-58_3rep_110432;random_forest_VP_02_6_sessions_111153
+VP_12,healthy,2,168984,0.1203,0.0537,random_forest_VP_12_143514;random_forest_VP_12_2026-05-04_14-51-35_3rep_145304
+VP_13,healthy,5,524412,0.1330,0.0587,attention_net_VP_13_2026-05-06_12-43-14_3rep_124616;random_forest_VP_13_130906;random_forest_VP_13_2026-05-06_12-30-00_3rep_123149;random_forest_VP_13_2026-05-06_12-51-44_3rep_2026-05-06_12-50-29_3rep_125314;random_forest_VP_13_2026-05-06_12-56-17_3rep_2026-05-06_12-57-31_3rep_125849
+VP_04,impaired,1,253314,0.1003,0.0456,attention_net_2026-03-25_14-44-10_5rep_144924
+VP_06,impaired,5,0,nan,nan,attention_net_VP_06_2026-05-04_11-21-18_3rep_112502;attention_net_VP_06_5_sessions_120409;random_forest_VP_06_2026-05-04_11-36-55_3rep_113844
+VP_14,impaired,1,157662,0.3821,0.1382,attention_net_VP_14_2026-05-13_15-57-37_5rep_160501
