@@ -497,6 +497,10 @@ class ValidationRunner:
         # biggest payoff because every fold of every preset shares
         # the same per-session feature blobs.
         self._feature_cache = None
+        # Lazily-discovered game-recording corpus used by the
+        # session_to_game CV strategy. Populated on first call to
+        # _materialise_game_test_split.
+        self._game_test_recordings: Optional[List[Any]] = None
 
     def _get_or_make_cache(self):
         """Return the lazily-constructed FeatureCache for this runner."""
@@ -680,6 +684,7 @@ class ValidationRunner:
             "materialise",
             f"loading + windowing {n_train_recs} train + {n_test_recs} test session(s)",
         )
+        is_session_to_game = str(fold.get("split_kind", "")) == "session_to_game"
         try:
             (X_train, y_train,
              X_val,   y_val,
@@ -693,8 +698,11 @@ class ValidationRunner:
             return None
         mat_secs = time.time() - t_mat
 
-        if len(X_train) == 0 or len(X_test) == 0:
-            log.warning("Fold %s has empty train/test set; skipping.", fold_id)
+        if len(X_train) == 0:
+            log.warning("Fold %s has empty train set; skipping.", fold_id)
+            return None
+        if len(X_test) == 0 and not is_session_to_game:
+            log.warning("Fold %s has empty test set; skipping.", fold_id)
             return None
 
         # Phase 2 — fit. We announce sample/feature shape so a user
@@ -733,6 +741,24 @@ class ValidationRunner:
             heartbeat.stop()
         train_secs = time.time() - t0
 
+        # session_to_game: test data is in data/game_recordings/, not
+        # SessionCorpus. Window them now using the trained model's
+        # feature path, deriving y from the CSV's ground-truth column.
+        if is_session_to_game:
+            try:
+                X_test, y_test, label_names = self._materialise_game_test_split(
+                    cfg, label_names,
+                    raw_windows=_model_wants_raw_windows(model_type),
+                )
+            except Exception as e:  # noqa: BLE001
+                log.exception("Failed to materialise game test split for "
+                              "fold %s: %s", fold_id, e)
+                return None
+            if len(X_test) == 0:
+                log.warning("Fold %s: no usable windows in game_recordings.",
+                            fold_id)
+                return None
+
         # Phase 3 — eval. Usually cheap, but worth a marker so the
         # GUI's stage display doesn't sit on "fitting" after fit ends.
         prog.on_fold_phase(
@@ -756,8 +782,14 @@ class ValidationRunner:
                 log.warning("Val evaluation failed for fold %s: %s", fold.get("id"), e)
 
         test_records = fold.get("test", []) or []
-        test_subjects = sorted({r.subject_id for r in test_records})
-        test_sessions = [(r.subject_id, r.session_id) for r in test_records]
+        if is_session_to_game:
+            game_test = list(self._game_test_recordings or [])
+            test_subjects = sorted({str(r.subject_id) for r in game_test})
+            test_sessions = [(str(r.subject_id), str(r.session_id))
+                             for r in game_test]
+        else:
+            test_subjects = sorted({r.subject_id for r in test_records})
+            test_sessions = [(r.subject_id, r.session_id) for r in test_records]
         split_kind = str(fold.get("split_kind", ""))
 
         return FoldResult(
@@ -967,6 +999,136 @@ class ValidationRunner:
 
         label_names = {**names_tr, **names_va, **names_te}
         return X_tr, y_tr, X_va, y_va, X_te, y_te, label_names
+
+    # ------------------------------------------------------------------
+    # Game-recordings test split (session_to_game strategy)
+    # ------------------------------------------------------------------
+
+    def _materialise_game_test_split(
+        self,
+        cfg: ExperimentConfig,
+        train_label_names: Dict[int, str],
+        raw_windows: bool = False,
+    ) -> Tuple[np.ndarray, np.ndarray, Dict[int, str]]:
+        """
+        Build (X_test, y_test, label_names) from ``data/game_recordings/``.
+
+        Game CSVs already carry per-sample ground truth (``RawGroundTruth``
+        is the numeric class id of the requested gesture, or -1 when no
+        gesture is requested). We window each CSV with the same
+        window/stride as training, align labels at window centres, and
+        keep only frames where a gesture is actively requested.
+
+        The trained model's class ids define the canonical label space —
+        we re-map game-side class ids to that space by gesture name.
+        """
+        from playagain_pipeline.evaluation.loaders import (
+            discover_game_recordings, load_game_csv,
+        )
+        from playagain_pipeline.models.classifier import EMGFeatureExtractor
+
+        if self._game_test_recordings is None:
+            self._game_test_recordings = discover_game_recordings(self.data_dir)
+        recs = self._game_test_recordings or []
+        if not recs:
+            log.warning("No game recordings found under %s/game_recordings",
+                        self.data_dir)
+            return np.empty((0,)), np.empty((0,), dtype=np.int64), train_label_names
+
+        feature_config = None if raw_windows else self._build_feature_config(cfg)
+        extractor = EMGFeatureExtractor(feature_config) if (
+            feature_config and feature_config.get("mode") not in (None, "raw")
+        ) else None
+
+        # Canonical name → training class id. The model was trained with
+        # train_label_names so this is the only label space the model
+        # predicts in.
+        name_to_train_id = {
+            str(name).strip().lower(): int(idx)
+            for idx, name in train_label_names.items()
+        }
+
+        win_ms    = int(cfg.windowing.window_ms)
+        stride_ms = int(cfg.windowing.stride_ms)
+
+        pooled_X: List[np.ndarray] = []
+        pooled_y: List[np.ndarray] = []
+        n_kept_recs = 0
+
+        for rec in recs:
+            try:
+                game = load_game_csv(rec)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Skipped game recording %s: %s", rec.label, exc)
+                continue
+            emg = game.emg_matrix()
+            if emg.size == 0:
+                continue
+            fs = int(game.sampling_rate or self._sampling_rate_for_fold(cfg))
+            win    = max(1, int(round(win_ms    * fs / 1000.0)))
+            stride = max(1, int(round(stride_ms * fs / 1000.0)))
+            if emg.shape[0] < win:
+                continue
+
+            starts = np.arange(0, emg.shape[0] - win + 1, stride, dtype=np.int64)
+            if starts.size == 0:
+                continue
+            centres = starts + win // 2
+
+            # Build ground truth aligned to window centres. Prefer
+            # RawGroundTruth (multi-class numeric class id, -1 when no
+            # gesture is requested) and re-map to the training label
+            # space by gesture name via game.class_names.
+            df = game.df
+            keep = np.ones(centres.size, dtype=bool)
+            if "RawGroundTruth" in df.columns:
+                raw = df["RawGroundTruth"].to_numpy(dtype=np.int64)[centres]
+                # Map game-side class id → gesture name → training id.
+                game_cn = list(game.class_names or [])
+                mapped = np.full(raw.size, -1, dtype=np.int64)
+                for i, cid in enumerate(raw):
+                    if cid < 0 or cid >= len(game_cn):
+                        continue
+                    name = str(game_cn[cid]).strip().lower()
+                    tid = name_to_train_id.get(name, -1)
+                    if tid >= 0:
+                        mapped[i] = tid
+                keep &= (mapped >= 0)
+                y = mapped
+            elif "RequestedGesture" in df.columns:
+                req = (df["RequestedGesture"].astype(str).str.strip()
+                       .str.lower().to_numpy())[centres]
+                y = np.array(
+                    [name_to_train_id.get(str(n), -1) for n in req],
+                    dtype=np.int64,
+                )
+                keep &= (y >= 0)
+            else:
+                continue
+
+            if keep.sum() == 0:
+                continue
+
+            X = np.stack([emg[s:s + win] for s in starts]).astype(np.float32)
+            X = X[keep]
+            y = y[keep]
+
+            if extractor is not None:
+                X = extractor.extract_features(X)
+
+            pooled_X.append(X)
+            pooled_y.append(y)
+            n_kept_recs += 1
+
+        if not pooled_X:
+            return np.empty((0,)), np.empty((0,), dtype=np.int64), train_label_names
+
+        log.info("game_recordings: %d/%d recording(s) yielded %d window(s)",
+                 n_kept_recs, len(recs),
+                 sum(len(x) for x in pooled_X))
+        X_out = np.concatenate(pooled_X, axis=0)
+        y_out = np.concatenate(pooled_y, axis=0)
+        return X_out, y_out, train_label_names
 
     @staticmethod
     def _build_feature_config(cfg: ExperimentConfig) -> Optional[Dict[str, Any]]:

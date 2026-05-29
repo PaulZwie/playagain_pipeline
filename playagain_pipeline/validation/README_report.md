@@ -31,20 +31,23 @@ Chapter 8 reuses numbers from the chapter-6 tables — no separate artefact.
 
 ## File layout
 
-Place these alongside the existing `validation/` modules:
+The reporting modules now live alongside `runner.py`:
 
 ```
 playagain_pipeline/validation/
-├── corpus.py                        (existing)
-├── runner.py                        (existing — see "Runner patch")
-├── cv_strategies.py                 (existing)
+├── corpus.py                        SessionRecord + SessionCorpus
+├── runner.py                        ValidationRunner
+├── cv_strategies.py                 fold generators
 │
-├── corpus_report.py                 (new)
-├── calibration_report.py            (new)
-├── thesis_reports.py                (new)
-├── plots_thesis.py                  (new)
-├── generate_thesis_outputs.py       (new)
-└── _runner_patch.py                 (new — doc-only)
+├── corpus_report.py                 §6.1 corpus + participant tables
+├── calibration_report.py            §6.2 calibration confidence + flags
+├── thesis_reports.py                LOSO aggregation, latency, x-domain tables
+├── plots_thesis.py                  matplotlib helpers for figures 6.1–7.4
+├── threshold_report.py / threshold_plots.py
+│                                    threshold-sweep summaries (table 6.7 etc.)
+├── game_report.py                   game-recording evaluation
+├── recompute_calibration_metrics.py CLI: rewrite calibration stats in place
+└── generate_thesis_outputs.py       one-shot orchestrator
 ```
 
 ## How to use it
@@ -89,15 +92,14 @@ for row in latency_table(run, gate_ms=150.0):
     print(row.model_type, row.inference_ms_mean, "gate:", row.passes_gate)
 ```
 
-## Runner patch (optional but recommended)
+## Fold-id parsing
 
 The reporting modules infer the held-out subject(s) from `fold_id` for
-LOSO strategies, which already encode the info. To make the join robust
-for **every** strategy (including `k_fold_subjects` and `holdout_split`),
-add three lines to `runner.py` as described in `_runner_patch.py`. The
-change is backwards-compatible — old saved runs continue to load, just
-without explicit `test_subjects` / `test_sessions` (the parsers fall
-back to the fold-id heuristic).
+LOSO strategies, which already encode the info. For strategies that don't
+(e.g. `k_fold_subjects`, `holdout_split`), the parsers fall back to the
+fold-id heuristic — older saved runs continue to load. If you need an
+exact join, have `ValidationRunner` write `test_subjects` /
+`test_sessions` into each fold record alongside the metrics.
 
 ## Session metadata expectations
 

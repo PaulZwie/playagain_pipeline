@@ -520,20 +520,18 @@ class CrossDomainCell:
 
 
 def cross_domain_comparison(
-    within_pipeline: Optional[RunStub],
-    within_unity:    Optional[RunStub],
-    pipeline_to_unity: Optional[RunStub],
-    unity_to_pipeline: Optional[RunStub],
+    pipeline_to_game: Optional[RunStub] = None,
     *,
     model: str,
 ) -> List[CrossDomainCell]:
     """
-    Pivot four RunStubs into one comparison table.
+    Pivot the pipeline → game_recordings RunStub into a comparison
+    table row.
 
-    Any of the four arguments may be ``None`` if that condition wasn't
-    run; the returned list simply omits missing rows. The model name
-    must match one of the model_types present in the runs (typically
-    the best classical model from §6.3).
+    ``pipeline_to_game`` may be ``None`` if the run hasn't been
+    produced yet; the returned list is empty in that case. The model
+    name must match one of the model_types present in the run
+    (typically the best classical model from §6.3).
     """
     out: List[CrossDomainCell] = []
 
@@ -551,10 +549,7 @@ def cross_domain_comparison(
             macro_f1_std=s.macro_f1_std,
         ))
 
-    _add(within_pipeline,   "pipeline", "pipeline")
-    _add(within_unity,      "unity",    "unity")
-    _add(pipeline_to_unity, "pipeline", "unity")
-    _add(unity_to_pipeline, "unity",    "pipeline")
+    _add(pipeline_to_game, "pipeline", "game_recordings")
     return out
 
 

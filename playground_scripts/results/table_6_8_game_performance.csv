@@ -1,3 +1,0 @@
-group,n_subjects,n_recordings,n_frames,accuracy,macro_f1,weighted_f1,balanced_accuracy,cohen_kappa,mcc,expected_calibration_error
-healthy,5,30,2484504,0.1642,0.0727,0.2783,0.0857,-0.0222,-0.0754,0.5538
-impaired,3,7,0,nan,nan,nan,nan,nan,nan,

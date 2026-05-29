@@ -12,7 +12,7 @@ Typical invocation
         --primary    runs/2026-04-12__loso_session__catboost_lda_rf_svm \\
         --loso-subj  runs/2026-04-13__loso_subject__catboost_lda_rf_svm \\
         --ablation   "rms=runs/abl_rms,mav=runs/abl_mav,...,combined=runs/abl_all" \\
-        --xdomain    "within_pipe=runs/wp,within_unity=runs/wu,p2u=runs/p2u,u2p=runs/u2p" \\
+        --xdomain    "pipeline_to_game=runs/p2g" \\
         --groups     data/participant_groups.json \\
         --primary-model catboost \\
         --out        thesis_outputs/
@@ -106,15 +106,16 @@ from .participant_groups import (
 from .thesis_reports import (
     annotate_per_session_groups, calibration_f1_correlation,
     cross_domain_comparison, feature_ablation, group_model_rows,
-    load_run_result, per_session_variability, summarise_run,
-    write_cross_domain, write_feature_ablation, write_group_summary,
-    write_run_report,
+    load_run_result, parse_fold_subjects, per_session_variability,
+    summarise_run, write_cross_domain, write_feature_ablation,
+    write_group_summary, write_run_report,
 )
 from .plots_thesis import (
         plot_calibration_confidence, plot_calibration_honest,
         plot_calibration_vs_f1, plot_calibration_vs_f1_per_model,
         plot_confusion_matrices, plot_feature_ablation,
         plot_per_class_f1, plot_per_session_variability,
+        plot_per_subject_by_group_box,
     )
 
 
@@ -161,8 +162,9 @@ def build_parser() -> argparse.ArgumentParser:
                    help=("Feature-ablation runs as 'name=path,name=path,...'. "
                          "One run per feature condition plus 'combined'."))
     p.add_argument("--xdomain", type=str,
-                   help=("Cross-domain runs as 'within_pipe=path,within_unity=path,"
-                         "p2u=path,u2p=path' (any subset)."))
+                   help=("Cross-domain run as 'pipeline_to_game=path' "
+                         "(train on pipeline sessions, test on "
+                         "data/game_recordings/)."))
 
     p.add_argument("--primary-model", default="catboost",
                    help=("Model name to use for per-session, ablation and "
@@ -320,7 +322,9 @@ def run(args: argparse.Namespace) -> Dict[str, List[Path]]:
 
         # Fig 6.5 box-plot data, annotated with each subject's cohort so
         # the per-session variability plot can be faceted healthy/impaired.
-        ps_rows = per_session_variability(run_stub, model=args.primary_model)
+        # All models in the run go into the CSV — the per-subject-by-group
+        # boxplot grid below faces one model per panel.
+        ps_rows = per_session_variability(run_stub, model=None)
         ps_grouped = annotate_per_session_groups(
             ps_rows, groups, fallback=group_fallback,
         )
@@ -334,6 +338,10 @@ def run(args: argparse.Namespace) -> Dict[str, List[Path]]:
                     w.writerow([row["subject_id"], row["group_label"],
                                 row["model_type"], fid, f"{v:.4f}"])
         produced["fig_6_5_by_group"] = [ps_grp_csv]
+        produced["fig_6_5b"] = plot_per_subject_by_group_box(
+            ps_grp_csv,
+            out_dir / "fig_6_5b_per_subject_by_group_box",
+        )
 
         produced["fig_6_3"] = plot_per_class_f1(
             primary_paths["per_class_csv"],
@@ -407,6 +415,40 @@ def run(args: argparse.Namespace) -> Dict[str, List[Path]]:
         )
         produced["table_6_4b"] = [group_csv]
 
+        # §6.4 per-subject by-group boxplot. LOSO-subject has one fold
+        # per (subject, model), so there's no spread to box over folds —
+        # we use the per-class F1 values within each fold as the
+        # distribution instead (K points per box, K = number of classes).
+        # Same plot shape as fig 6.5b; the y-axis means per-class F1
+        # rather than macro F1.
+        fig_6_4c_csv = out_dir / "fig_6_4c_per_subject_by_group_data.csv"
+        with fig_6_4c_csv.open("w", newline="", encoding="utf-8") as f:
+            import csv as _csv
+            w = _csv.writer(f)
+            w.writerow(["subject_id", "group", "model", "fold_id", "macro_f1"])
+            for fold in ls.folds:
+                subjects = list(getattr(fold, "test_subjects", []) or [])
+                if not subjects:
+                    subjects = parse_fold_subjects(fold)
+                if not subjects:
+                    continue
+                per_class = fold.per_class_f1 or {}
+                if not per_class:
+                    continue
+                for subj in subjects:
+                    grp_label = (
+                        groups.label_of(subj, fallback=group_fallback)
+                        if groups is not None else "?"
+                    )
+                    for cls, v in per_class.items():
+                        w.writerow([subj, grp_label, fold.model_type,
+                                    f"{fold.fold_id}__{cls}", f"{float(v):.4f}"])
+        produced["fig_6_4c_data"] = [fig_6_4c_csv]
+        produced["fig_6_4c"] = plot_per_subject_by_group_box(
+            fig_6_4c_csv,
+            out_dir / "fig_6_4c_per_subject_by_group_box",
+        )
+
     # 5) Feature ablation — Table 6.5 + Fig 6.6
     ablation_specs = _parse_kv_runs(args.ablation)
     if ablation_specs:
@@ -422,19 +464,13 @@ def run(args: argparse.Namespace) -> Dict[str, List[Path]]:
             target, out_dir / "fig_6_6_feature_ablation",
         )
 
-    # 6) Cross-domain — Table 6.6
+    # 6) Cross-domain — Table 6.6 (pipeline sessions → game_recordings)
     xdomain_specs = dict(_parse_kv_runs(args.xdomain))
     if xdomain_specs:
-        log.info("Aggregating cross-domain runs…")
+        log.info("Aggregating cross-domain run…")
+        p2g_path = xdomain_specs.get("pipeline_to_game")
         rows = cross_domain_comparison(
-            within_pipeline   = load_run_result(xdomain_specs["within_pipe"])
-                                if "within_pipe" in xdomain_specs else None,
-            within_unity      = load_run_result(xdomain_specs["within_unity"])
-                                if "within_unity" in xdomain_specs else None,
-            pipeline_to_unity = load_run_result(xdomain_specs["p2u"])
-                                if "p2u" in xdomain_specs else None,
-            unity_to_pipeline = load_run_result(xdomain_specs["u2p"])
-                                if "u2p" in xdomain_specs else None,
+            pipeline_to_game=load_run_result(p2g_path) if p2g_path else None,
             model=args.primary_model,
         )
         xd_csv = write_cross_domain(rows, out_dir)

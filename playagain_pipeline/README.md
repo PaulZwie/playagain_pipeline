@@ -56,11 +56,12 @@ pip install -e ./playagain_pipeline
 
 ```bash
 cd /Users/paul/Coding_Projects/Master/Dataprocessing
-python -m playagain_pipeline.run_gui
+python run_gui.py
 ```
 
-`run_gui.py` delegates to `playagain_pipeline.gui.main_window.main()`, which in
-turn instantiates `MainWindowV2` (the current top-level window).
+`run_gui.py` (at the repo root) delegates to
+`playagain_pipeline.gui.main_window.main()`, which instantiates `MainWindowV2`
+(the current top-level window).
 
 ### Headless prediction server
 
@@ -107,7 +108,6 @@ Primary flows:
 ```text
 playagain_pipeline/
 ├── __init__.py
-├── run_gui.py
 ├── prediction_server.py
 ├── game_recorder.py
 ├── training_game_coordinator.py
@@ -132,25 +132,39 @@ playagain_pipeline/
 ├── devices/
 │   ├── __init__.py
 │   └── emg_device.py
+├── evaluation/
+│   ├── __init__.py
+│   ├── core.py
+│   ├── game_eval.py
+│   ├── loaders.py
+│   ├── metrics.py
+│   ├── session_eval.py
+│   ├── threshold_eval.py
+│   └── unity_eval.py
 ├── gui/
 │   ├── __init__.py
 │   ├── gui_style.py
 │   ├── main_window.py
 │   └── widgets/
 │       ├── main_window_v2.py
+│       ├── home_tab.py
 │       ├── workflow_stepper.py
+│       ├── status_strip.py
+│       ├── emg_plot.py
 │       ├── emg_plot_panel.py
 │       ├── evaluation_tab.py
+│       ├── thesis_report_dialog.py
 │       ├── protocol_popup.py
+│       ├── protocol_widget.py
 │       ├── game_protocol_popup.py
 │       ├── bracelet_graphic.py
 │       ├── busy_overlay.py
 │       ├── calibration_dialog.py
 │       ├── config_dialog.py
 │       ├── feature_selection.py
-│       ├── protocol_widget.py
+│       ├── participant_groups_dialog.py
+│       ├── quickstart_wizard.py
 │       ├── quattrocento_loader.py
-│       ├── quattrocento_loading_dialog.py
 │       ├── quattrocento_training_dialog.py
 │       └── training_dialog.py
 ├── models/
@@ -158,10 +172,12 @@ playagain_pipeline/
 │   ├── classifier.py
 │   └── feature_pipeline.py
 ├── performance_assessment/
+│   ├── __init__.py
 │   ├── _generate_plots.py
 │   ├── model_comparison.py
 │   ├── performance_assessment.ipynb
-│   └── session_picker_ui.py
+│   ├── session_picker_ui.py
+│   └── results/
 ├── protocols/
 │   ├── __init__.py
 │   └── protocol.py
@@ -175,22 +191,39 @@ playagain_pipeline/
 │   ├── __main__.py
 │   ├── config.py
 │   ├── corpus.py
-│   ├── cv_strategies_holdout.py
+│   ├── corpus_report.py
 │   ├── cv_strategies.py
-│   ├── README.md
+│   ├── feature_cache.py
+│   ├── game_corpus.py
+│   ├── game_report.py
+│   ├── calibration_report.py
+│   ├── generate_thesis_outputs.py
+│   ├── participant_groups.py
+│   ├── plots_thesis.py
+│   ├── recompute_calibration_metrics.py
 │   ├── runner.py
-│   └── configurations/
+│   ├── thesis_reports.py
+│   ├── threshold_plots.py
+│   ├── threshold_report.py
+│   ├── configurations/
+│   │   └── experiments_example.yaml
+│   ├── README.md
+│   └── README_report.md
 └── data/
     ├── Participant_Info/
     ├── calibrations/
     ├── datasets/
     ├── game_recordings/
     ├── models/
-    ├── quattrocento/
-    ├── scripts/
     ├── sessions/
+    ├── unity/
+    ├── thesis_outputs/
     └── validation_runs/
 ```
+
+The GUI entry point `run_gui.py` lives one level up
+(`/Users/paul/Coding_Projects/Master/Dataprocessing/run_gui.py`) and just
+calls `playagain_pipeline.gui.main_window.main()`.
 
 ## Core Concepts
 
@@ -293,7 +326,7 @@ Main dataclasses:
 
 ### Devices (`devices/emg_device.py`)
 
-- `DeviceType` includes `SYNTHETIC`, `MUOVI`, and `MUOVI_PLUS`.
+- `DeviceType` includes `SYNTHETIC`, `MUOVI`, `MUOVI_PLUS`, `QUATTROCENTO`, and `CUSTOM`.
 - Muovi device wrapper integrates with `device_interfaces`.
 - Synthetic backend supports hardware-free testing and pipeline validation.
 - Quattrocento replay support is integrated through GUI workflows in
@@ -580,8 +613,9 @@ allows for rigorous evaluation of features and models, supporting:
   `pipeline` and Unity C# `game` recorders, allowing cross-domain experiments
   (e.g., train on pipeline, test on Unity).
 - **Honest Cross-Validation (CV):** Validates models using rigorous boundaries
-  (`loso_session`, `loso_subject`, `k_fold_subjects`, `cross_domain`,
-  `holdout_split`) to prevent train/test data leakage.
+  (`within_session`, `loso_session`, `intra_subject_loso_session`,
+  `loso_subject`, `k_fold_sessions`, `k_fold_subjects`, `cross_domain`,
+  `session_to_game`, `holdout_split`) to prevent train/test data leakage.
 - **Reproducibility:** Every run outputs timestamped artifacts including the
   config, git SHA, and results. Rerunning with the same git commit and data
   produces bit-identical numbers.
@@ -591,9 +625,12 @@ allows for rigorous evaluation of features and models, supporting:
 ### Utility modules (`utils/`)
 
 - `platform_utils.py` — OS detection, default data/config directories
-  (`~/Documents/PlayAgain/data` cross-platform; per-OS app config dir), and
-  automatic resolution of the sibling `device_interfaces` and
-  `gui_custom_elements` packages so no hard-coded paths are required.
+  (`get_default_data_dir()` returns `~/Documents/PlayAgain/data` on macOS/Linux
+  and `%USERPROFILE%/Documents/PlayAgain/data` on Windows), and automatic
+  resolution of the sibling `device_interfaces` and `gui_custom_elements`
+  packages so no hard-coded paths are required. Note the GUI and standalone
+  prediction server default to the in-repo `playagain_pipeline/data` unless
+  `config.json` or the UI overrides the data directory.
 - `rest_gap_filler.py` — fills implicit-rest gaps between trials with
   synthetic rest trials, used to reconcile Unity-recorded sessions with the
   pipeline's expected label coverage.
@@ -618,7 +655,7 @@ sessions with children):**
 
 1. On the Record tab, click **Locate Unity…** and pick the PlayAgain build
    (one-time setup, persisted via `QSettings`).
-2. Set easy-mode sensitivity (default 1.8× resting RMS baseline) and reps
+2. Set easy-mode sensitivity (default 1.3× resting RMS baseline) and reps
    per gesture (default 3).
 3. Click **▶ Launch Training Game**. The pipeline starts a
    `PredictionServer`, launches Unity, builds a balanced trial schedule, and
@@ -737,10 +774,16 @@ including:
 
 ## Utility and Analysis Scripts
 
-- `data/scripts/` contains conversion/import/plotting helpers for dataset
-  work.
-- `performance_assessment/` contains comparison tooling and notebook-based
-  analysis.
+- `performance_assessment/` contains comparison tooling
+  (`model_comparison.py`, `session_picker_ui.py`, `_generate_plots.py`) and
+  the `performance_assessment.ipynb` notebook for post-hoc analyses.
+- `validation/generate_thesis_outputs.py` and
+  `validation/recompute_calibration_metrics.py` are user-invokable
+  `python -m …` tools that build thesis-shaped artefacts from existing
+  validation runs and recompute calibration metrics on disk respectively.
+- `utils/migrate_requested_gesture.py` rewrites the `RequestedGesture`
+  column in old game recordings from `"none"` to `"rest"`; runnable as
+  `python -m playagain_pipeline.utils.migrate_requested_gesture <data_dir>`.
 
 ## Extension Points
 

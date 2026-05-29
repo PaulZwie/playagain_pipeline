@@ -48,24 +48,34 @@ log = logging.getLogger(__name__)
 # FAU palette — with a graceful fallback for environments without the pkg
 # ---------------------------------------------------------------------------
 
+# Five-shade tech palette (light → dark) and the parallel tech_dark
+# palette. We pull both from fau_colors.cmaps when available so the
+# values stay in sync with the institutional spec, and fall back to
+# hard-coded shades when the package is missing.
 try:
-    from fau_colors import colors as _FAU, colors_dark as _FAU_D
+    from fau_colors import colors as _FAU, colors_dark as _FAU_D, cmaps as _CMAPS
+    _TECH_SHADES: List[str] = list(_CMAPS.tech)           # 5 shades
+    _TECH_DARK_SHADES: List[str] = list(_CMAPS.tech_dark) # 5 shades
     _PALETTE = {
-        "fau":       _FAU.fau,        # deep blue       #04316A
-        "tech":      _FAU.tech,       # grey-blue       #8C9FB1
-        "phil":      _FAU.phil,       # gold            #FDB735
-        "med":       _FAU.med,        # light blue      #18B4F1
-        "nat":       _FAU.nat,        # green           #7BB725
-        "wiso":      _FAU.wiso,       # red             #C50F3C
-        "fau_d":     _FAU_D.fau,      # deep navy       #041E42
-        "tech_d":    _FAU_D.tech,     # slate           #2F586E
-        "phil_d":    _FAU_D.phil,     # burnt orange    #E87722
-        "med_d":     _FAU_D.med,      # deep blue       #005287
-        "nat_d":     _FAU_D.nat,      # forest green    #266141
-        "wiso_d":    _FAU_D.wiso,     # deep red        #971B2F
+        # Keep the broad-faculty names available for any future use,
+        # but every plot in this module now draws from the tech family.
+        "fau":       _FAU.fau,
+        "tech":      _FAU.tech,
+        "phil":      _FAU.phil,
+        "med":       _FAU.med,
+        "nat":       _FAU.nat,
+        "wiso":      _FAU.wiso,
+        "fau_d":     _FAU_D.fau,
+        "tech_d":    _FAU_D.tech,
+        "phil_d":    _FAU_D.phil,
+        "med_d":     _FAU_D.med,
+        "nat_d":     _FAU_D.nat,
+        "wiso_d":    _FAU_D.wiso,
     }
     HAS_FAU = True
 except Exception:                       # noqa: BLE001
+    _TECH_SHADES      = ["#8C9FB1", "#B6C2CE", "#D3DAE1", "#E2E7EB", "#EBF5F7"]
+    _TECH_DARK_SHADES = ["#2F586E", "#7C96A3", "#B0BFC8", "#CBD5DB", "#E4E9EC"]
     _PALETTE = {
         "fau":    "#04316A", "tech":   "#8C9FB1", "phil":   "#FDB735",
         "med":    "#18B4F1", "nat":    "#7BB725", "wiso":   "#C50F3C",
@@ -74,29 +84,40 @@ except Exception:                       # noqa: BLE001
     }
     HAS_FAU = False
 
+# Group colours — Healthy is the lightest tech shade, Impaired is the
+# darkest tech_dark shade. These are the headline two colours for any
+# cohort-split figure.
+GROUP_COLORS: Dict[str, str] = {
+    "healthy":  _TECH_SHADES[1],       # #B6C2CE
+    "impaired": _TECH_DARK_SHADES[0],  # #2F586E
+}
+# Title-accent colour used on panels for deep models so a reader can
+# tell at a glance which panels are classical vs deep.
+DEEP_MODEL_ACCENT = _PALETTE["wiso"]    # FAU red
+CLASSIC_MODEL_ACCENT = _PALETTE["fau"]  # FAU blue
+DEEP_MODEL_TYPES = frozenset({"mlp", "cnn", "attention_net", "mstnet"})
 
-# Deliberate model → colour mapping. Roughly groups model families:
-# classical/linear in the blue family, trees in green/gold, neural in
-# warm hues. Falls back to grey for unknown names.
+
+# Model → colour mapping in the tech family. We interleave the two
+# tech ramps so adjacent models in the legend stay distinguishable
+# while every fill is still inside the institutional palette.
+_TECH_RAMP = _TECH_DARK_SHADES + _TECH_SHADES[:3]
 MODEL_COLORS: Dict[str, str] = {
-    "lda":           _PALETTE["tech"],     # linear classical → slate
-    "svm":           _PALETTE["med"],      # kernel → light blue
-    "random_forest": _PALETTE["nat"],      # tree → green
-    "catboost":      _PALETTE["nat_d"],    # tree → forest green
-    "mlp":           _PALETTE["wiso"],     # neural → red
-    "cnn":           _PALETTE["phil"],     # neural → gold
-    "mstnet":        _PALETTE["phil_d"],   # neural → orange
-    "attention_net": _PALETTE["fau"],      # neural → deep blue
+    "lda":           _TECH_DARK_SHADES[0],   # darkest slate
+    "svm":           _TECH_DARK_SHADES[1],
+    "random_forest": _TECH_DARK_SHADES[2],
+    "catboost":      _TECH_DARK_SHADES[3],
+    "mlp":           _TECH_SHADES[0],
+    "cnn":           _TECH_SHADES[1],
+    "mstnet":        _TECH_SHADES[2],
+    "attention_net": _TECH_SHADES[3],
 }
 
-# Subjects cycle through distinct FAU hues. Up to 12 distinct subjects
-# get unique colours; beyond that the cycle wraps.
-_SUBJECT_CYCLE: List[str] = [
-    _PALETTE["fau"],     _PALETTE["wiso"],   _PALETTE["nat"],
-    _PALETTE["phil_d"],  _PALETTE["med"],    _PALETTE["fau_d"],
-    _PALETTE["nat_d"],   _PALETTE["med_d"],  _PALETTE["wiso_d"],
-    _PALETTE["tech_d"],  _PALETTE["phil"],   _PALETTE["tech"],
-]
+# Subjects cycle through the tech ramp so adjacent subjects in any
+# sorted view get visually distinct shades.
+_SUBJECT_CYCLE: List[str] = (
+    _TECH_DARK_SHADES + _TECH_SHADES
+)
 
 NEUTRAL_TEXT  = "#1f2937"
 NEUTRAL_MUTED = "#6b7280"
@@ -249,12 +270,12 @@ def plot_calibration_confidence(
     x_hi = max(max(confs), threshold, 0.4) + 0.05
     edges = np.linspace(0.0, x_hi, bins + 1)
     ax_h.hist(confs, bins=edges,
-              color=_PALETTE["med"], edgecolor=_PALETTE["fau"],
-              linewidth=1.1, alpha=0.55)
+              color=_TECH_SHADES[1], edgecolor=_TECH_DARK_SHADES[0],
+              linewidth=1.1, alpha=0.85)
     ax_h.axvline(threshold, color=NEUTRAL_MUTED, linestyle="--",
                  linewidth=1.0, label=f"flag threshold = {threshold:.2f}")
     if math.isfinite(data.get("median", float("nan"))):
-        ax_h.axvline(data["median"], color=_PALETTE["wiso"], linestyle=":",
+        ax_h.axvline(data["median"], color=DEEP_MODEL_ACCENT, linestyle=":",
                      linewidth=1.4, label=f"median = {data['median']:.2f}")
     ax_h.set_ylabel("Number of sessions")
     title = ("Rotation calibration stability across sessions"
@@ -628,9 +649,10 @@ def plot_confusion_matrices(
                             width_ratios=[1] * ncols + [0.06],
                             wspace=0.32, hspace=0.55)
 
-    # FAU-blue colormap for the matrix
+    # Tech-palette colormap for the matrix (lightest → darkest tech)
     cmap = LinearSegmentedColormap.from_list(
-        "thesis_fau", ["#f4f8fc", _PALETTE["med"], _PALETTE["fau"]]
+        "thesis_tech",
+        ["#FFFFFF", _TECH_SHADES[3], _TECH_SHADES[1], _TECH_DARK_SHADES[0]],
     )
 
     im = None
@@ -723,12 +745,14 @@ def plot_per_session_variability(
     ax.boxplot(
         data, positions=range(len(subjects)),
         widths=0.5, patch_artist=True,
-        medianprops=dict(color=NEUTRAL_TEXT, linewidth=1.6),
-        boxprops=dict(facecolor=BOX_FACE, edgecolor=_PALETTE["fau"],
-                      linewidth=1.0),
-        whiskerprops=dict(color=_PALETTE["fau"], linewidth=1.0),
-        capprops=dict(color=_PALETTE["fau"], linewidth=1.0),
-        flierprops=dict(marker=""),
+        medianprops=dict(color=_TECH_DARK_SHADES[0], linewidth=1.6),
+        boxprops=dict(facecolor=_TECH_SHADES[2],
+                      edgecolor=_TECH_DARK_SHADES[0], linewidth=1.0),
+        whiskerprops=dict(color=_TECH_DARK_SHADES[0], linewidth=1.0),
+        capprops=dict(color=_TECH_DARK_SHADES[0], linewidth=1.0),
+        flierprops=dict(marker="d", markersize=4,
+                        markerfacecolor=_TECH_DARK_SHADES[0],
+                        markeredgecolor=_TECH_DARK_SHADES[0]),
     )
 
     rng = np.random.default_rng(0)
@@ -739,7 +763,7 @@ def plot_per_session_variability(
                    edgecolor="white", linewidth=0.7, zorder=4)
         m = float(np.mean(vals))
         ax.hlines(m, i - 0.24, i + 0.24,
-                  colors=_PALETTE["wiso"], linewidth=2.0, zorder=5,
+                  colors=DEEP_MODEL_ACCENT, linewidth=2.0, zorder=5,
                   label="subject mean" if i == 0 else None)
 
     ax.set_xticks(range(len(subjects)))
@@ -752,6 +776,189 @@ def plot_per_session_variability(
     ax.set_axisbelow(True)
     ax.legend(loc="lower right")
     return _save(fig, out_path)
+
+
+# ---------------------------------------------------------------------------
+# Per-subject boxplot grid, faceted by model, coloured by cohort.
+# Consumes the by_group CSV that generate_thesis_outputs already writes.
+# Matches the institutional "Healthy = light tech, Impaired = slate" look.
+# ---------------------------------------------------------------------------
+
+def plot_per_subject_by_group_box(
+    by_group_csv: Path,
+    out_path: Path,
+    *,
+    models: Optional[Sequence[str]] = None,
+    ncols: int = 4,
+) -> List[Path]:
+    """
+    One panel per model — for each held-out subject, a box-and-whisker
+    of the per-fold macro-F1 values for that subject, coloured by cohort
+    (Healthy vs Impaired).
+
+    The CSV is the same one ``generate_thesis_outputs`` writes for
+    ``fig_6_5_per_session_variability_by_group.csv`` /
+    ``fig_6_4b_loso_subject_by_group.csv``. It must have columns
+    ``subject_id``, ``group``, ``model``, ``macro_f1``.
+
+    Subjects appear on the x-axis in cohort order (healthy first then
+    impaired), each subject keeps the same x-position across panels so a
+    reader can compare model-to-model. Impaired-subject labels are bold.
+    """
+    _setup_mpl()
+    rows: List[Dict[str, Any]] = []
+    with Path(by_group_csv).open("r", encoding="utf-8") as f:
+        for r in csv.DictReader(f):
+            try:
+                val = float(r["macro_f1"])
+            except (TypeError, ValueError):
+                continue
+            rows.append({
+                "subject":  str(r.get("subject_id", "")),
+                "group":    str(r.get("group", "?")).strip().lower(),
+                "model":    str(r.get("model", "")),
+                "f1":       val,
+            })
+    if not rows:
+        log.warning("No usable rows in %s", by_group_csv)
+        return []
+
+    if models:
+        wanted = list(models)
+    else:
+        # Preserve first-seen order so the layout is deterministic.
+        seen: List[str] = []
+        for r in rows:
+            if r["model"] not in seen:
+                seen.append(r["model"])
+        wanted = seen
+    if not wanted:
+        return []
+
+    # Subject ordering: healthy first then impaired then unknown,
+    # alphabetical within each cohort. Same across all panels.
+    subj_group: Dict[str, str] = {}
+    for r in rows:
+        subj_group.setdefault(r["subject"], r["group"])
+    group_rank = {"healthy": 0, "impaired": 1}
+    subjects = sorted(
+        subj_group,
+        key=lambda s: (group_rank.get(subj_group.get(s, "?"), 9), s),
+    )
+    if not subjects:
+        return []
+
+    # Pivot: {model: {subject: [f1...]}}
+    cube: Dict[str, Dict[str, List[float]]] = {m: {s: [] for s in subjects}
+                                               for m in wanted}
+    for r in rows:
+        if r["model"] in cube and r["subject"] in cube[r["model"]]:
+            cube[r["model"]][r["subject"]].append(r["f1"])
+
+    n_models = len(wanted)
+    ncols    = max(1, min(int(ncols), n_models))
+    nrows    = int(math.ceil(n_models / ncols))
+    fig_w    = max(4.6, 0.9 * len(subjects) + 1.4) * ncols
+    fig_h    = 4.2 * nrows
+    fig, axes = plt.subplots(nrows, ncols, figsize=(fig_w, fig_h),
+                             sharey=True, squeeze=False)
+
+    for k, model in enumerate(wanted):
+        r_idx, c_idx = divmod(k, ncols)
+        ax = axes[r_idx][c_idx]
+
+        # Build per-cohort box data + positions side-by-side per subject.
+        positions:  List[float] = []
+        box_data:   List[List[float]] = []
+        face_colors: List[str] = []
+        edge_colors: List[str] = []
+        offsets = {"healthy": -0.22, "impaired": +0.22}
+        width   = 0.36
+
+        for i, subj in enumerate(subjects):
+            vals = cube[model].get(subj, [])
+            grp  = subj_group.get(subj, "?")
+            if not vals:
+                continue
+            positions.append(i + offsets.get(grp, 0.0))
+            box_data.append(vals)
+            face_colors.append(GROUP_COLORS.get(grp, _TECH_SHADES[3]))
+            edge_colors.append(_TECH_DARK_SHADES[0]
+                               if grp == "healthy"
+                               else "#0F2A3A")
+
+        if box_data:
+            bp = ax.boxplot(
+                box_data, positions=positions, widths=width,
+                patch_artist=True,
+                medianprops=dict(color=_TECH_DARK_SHADES[0], linewidth=1.6),
+                whiskerprops=dict(color=_TECH_DARK_SHADES[0], linewidth=1.0),
+                capprops=dict(color=_TECH_DARK_SHADES[0], linewidth=1.0),
+                flierprops=dict(marker="d", markersize=4.5,
+                                markerfacecolor=_TECH_DARK_SHADES[0],
+                                markeredgecolor=_TECH_DARK_SHADES[0]),
+            )
+            for patch, fc, ec in zip(bp["boxes"], face_colors, edge_colors):
+                patch.set_facecolor(fc)
+                patch.set_edgecolor(ec)
+                patch.set_linewidth(1.0)
+
+            # Mean marker — open circle on the box. Matches the reference.
+            for pos, vals in zip(positions, box_data):
+                ax.scatter([pos], [float(np.mean(vals))], s=42,
+                           marker="o", facecolor="white",
+                           edgecolor=_TECH_DARK_SHADES[0],
+                           linewidth=1.2, zorder=5)
+
+        ax.set_xticks(range(len(subjects)))
+        ax.set_xticklabels(subjects, rotation=25, ha="right")
+        for tick_label, subj in zip(ax.get_xticklabels(), subjects):
+            grp = subj_group.get(subj, "?")
+            if grp == "impaired":
+                tick_label.set_fontweight("bold")
+                tick_label.set_color(_TECH_DARK_SHADES[0])
+        ax.set_xlim(-0.6, len(subjects) - 0.4)
+        ax.set_ylim(0.0, 1.0)
+        if c_idx == 0:
+            ax.set_ylabel("Macro F1")
+        ax.set_xlabel("Held-out subject")
+
+        is_deep = str(model).lower() in DEEP_MODEL_TYPES
+        title_color = DEEP_MODEL_ACCENT if is_deep else CLASSIC_MODEL_ACCENT
+        ax.set_title(_pretty_model(model), color=title_color, fontweight="bold")
+        ax.grid(axis="y", linestyle=":", color=NEUTRAL_GRID)
+        ax.set_axisbelow(True)
+
+    # Hide any trailing empty axes (when n_models % ncols != 0).
+    for k in range(n_models, nrows * ncols):
+        r_idx, c_idx = divmod(k, ncols)
+        axes[r_idx][c_idx].set_visible(False)
+
+    # Single shared legend at the bottom — matches the reference style.
+    from matplotlib.patches import Patch
+    legend_handles = [
+        Patch(facecolor=GROUP_COLORS["healthy"],
+              edgecolor=_TECH_DARK_SHADES[0], label="Healthy"),
+        Patch(facecolor=GROUP_COLORS["impaired"],
+              edgecolor="#0F2A3A", label="Impaired"),
+    ]
+    fig.legend(handles=legend_handles, loc="lower center", ncol=2,
+               frameon=False, bbox_to_anchor=(0.5, -0.01))
+    fig.tight_layout(rect=(0, 0.04, 1, 1))
+    return _save(fig, out_path)
+
+
+def _pretty_model(name: str) -> str:
+    return {
+        "lda": "LDA",
+        "svm": "SVM",
+        "random_forest": "Random Forest",
+        "catboost": "CatBoost",
+        "mlp": "MLP",
+        "cnn": "CNN",
+        "attention_net": "Attention-Net",
+        "mstnet": "MSTNet",
+    }.get(str(name).lower(), str(name))
 
 
 # ---------------------------------------------------------------------------
@@ -787,7 +994,7 @@ def plot_feature_ablation(
     stds   = np.asarray([r["std"]  for r in ordered], dtype=float)
     lower  = np.minimum(stds, means)
     upper  = np.minimum(stds, 1.0 - means)
-    colors = [_PALETTE["nat_d"] if r in combined else _PALETTE["med"]
+    colors = [_TECH_DARK_SHADES[0] if r in combined else _TECH_SHADES[1]
               for r in ordered]
 
     fig, ax = plt.subplots(figsize=(6.6, 0.45 * len(ordered) + 1.6))

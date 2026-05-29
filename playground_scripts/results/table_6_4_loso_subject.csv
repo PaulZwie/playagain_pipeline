@@ -1,5 +1,0 @@
-model,n_folds,macro_f1_mean,macro_f1_std,accuracy_mean,accuracy_std
-catboost,7,0.4513,0.1444,0.6054,0.0599
-random_forest,7,0.4449,0.1488,0.6113,0.0699
-svm,7,0.4156,0.1728,0.5755,0.1162
-lda,7,0.3700,0.1461,0.4861,0.1386

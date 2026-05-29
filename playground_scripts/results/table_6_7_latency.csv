@@ -1,9 +1,0 @@
-model,train_seconds_mean,inference_ms_mean,inference_ms_max,passes_gate_150ms
-lda,0.24,0.00,0.01,Yes
-catboost,19.27,0.00,0.00,Yes
-mlp,298.17,0.01,0.02,Yes
-random_forest,4.36,0.01,0.02,Yes
-attention_net,368.61,0.08,0.55,Yes
-cnn,294.76,0.17,1.19,Yes
-svm,19.38,0.48,2.71,Yes
-mstnet,1099.10,0.48,1.98,Yes

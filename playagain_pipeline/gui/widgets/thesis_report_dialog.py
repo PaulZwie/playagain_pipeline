@@ -248,7 +248,7 @@ def _make_loso_subj_cfg(
     seed:      int = _DEFAULT_SEED,
     features:  Sequence[str] = ("mav", "rms", "wl", "zc", "ssc", "var", "iemg"),
 ) -> ExperimentConfig:
-    """§6.4 — Leave-One-Subject-Out (classical models only per thesis text)."""
+    """§6.4 — Leave-One-Subject-Out across subjects, all checked models."""
     return ExperimentConfig(
         name=f"thesis_loso_subject_{_ts()}",
         description="Chapter 6 §6.4 secondary evaluation.",
@@ -306,40 +306,21 @@ def _make_xdomain_cfgs(
     features:  Sequence[str] = ("mav", "rms", "wl", "zc", "ssc", "var", "iemg"),
 ) -> List[Tuple[str, ExperimentConfig]]:
     """
-    §6.6 — Four runs: within-pipeline, within-unity, pipeline→unity,
-    unity→pipeline. ``within_*`` uses LOSO-session restricted to the
-    corresponding domain; cross-direction uses the ``cross_domain``
-    strategy.
+    §6.6 — One run: train on pipeline sessions, test on
+    ``data/game_recordings/``. The runner resolves the test side via
+    the ``session_to_game`` CV strategy.
     """
-    def _cfg(name: str, kwargs: Dict[str, Any], data: DataSelection,
-            strategy: str) -> ExperimentConfig:
-        return ExperimentConfig(
-            name=f"thesis_xdomain_{name}_{_ts()}",
-            description=f"Chapter 6 §6.6 cross-domain — {name}.",
-            seed=seed,
-            data=data,
-            windowing=WindowingConfig(window_ms=window_ms, stride_ms=stride_ms),
-            features=_feature_cfgs(features),
-            models=_model_cfgs([primary_model]),
-            cv=CVConfig(strategy=strategy, kwargs=kwargs),
-        )
-
-    return [
-        ("within_pipe",   _cfg("within_pipeline",
-                               {}, DataSelection(domains=["pipeline"]),
-                               "loso_session")),
-        ("within_unity",  _cfg("within_unity",
-                               {}, DataSelection(domains=["unity"]),
-                               "loso_session")),
-        ("p2u",           _cfg("pipeline_to_unity",
-                               {"train_domain": "pipeline", "test_domain": "unity"},
-                               DataSelection(),
-                               "cross_domain")),
-        ("u2p",           _cfg("unity_to_pipeline",
-                               {"train_domain": "unity", "test_domain": "pipeline"},
-                               DataSelection(),
-                               "cross_domain")),
-    ]
+    cfg = ExperimentConfig(
+        name=f"thesis_xdomain_pipeline_to_game_{_ts()}",
+        description="Chapter 6 §6.6 cross-domain — pipeline sessions → game_recordings.",
+        seed=seed,
+        data=DataSelection(domains=["pipeline"]),
+        windowing=WindowingConfig(window_ms=window_ms, stride_ms=stride_ms),
+        features=_feature_cfgs(features),
+        models=_model_cfgs([primary_model]),
+        cv=CVConfig(strategy="session_to_game", kwargs={}),
+    )
+    return [("pipeline_to_game", cfg)]
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1187,13 +1168,13 @@ class ThesisReportDialog(QDialog):
         abl_lay.addWidget(abl_scroll)
         outer.addWidget(abl_box)
 
-        # Cross-domain: 4 directions
-        xd_box = QGroupBox("§6.6 Cross-domain")
+        # Cross-domain: pipeline sessions → game_recordings
+        xd_box = QGroupBox("§6.6 Cross-domain (sessions → game_recordings)")
         xd_box.setStyleSheet(self._sub_group_style())
         xd_lay = QVBoxLayout(xd_box); xd_lay.setContentsMargins(8, 8, 8, 8)
         xd_lay.setSpacing(4)
         self._xdomain_table = _RoleMappingTable(
-            slots=["within_pipe", "within_unity", "p2u", "u2p"],
+            slots=["pipeline_to_game"],
             validation_runs_root=self._validation_runs_root,
         )
         xd_lay.addWidget(self._xdomain_table)
@@ -1489,26 +1470,14 @@ class ThesisReportDialog(QDialog):
         return str(strat), int(self._k_folds_spin.value())
 
     def _on_create_loso_subject(self) -> None:
-        # Per the thesis text, the LOSO-subject table reports classical
-        # models only — deep models often don't have enough subjects.
-        # Drop them quietly here unless the user has explicitly checked
-        # them; the small log line below explains what happened.
-        all_checked = self._checked_models()
-        classical = [m for m in all_checked
-                     if m in {"lda", "svm", "random_forest", "catboost"}]
-        if not classical:
+        models = self._checked_models()
+        if not models:
             QMessageBox.information(
-                self, "Pick at least one classical model",
-                "LOSO-subject (Table 6.4) reports classical models. Tick "
-                "LDA, SVM, Random Forest or CatBoost.",
+                self, "Pick at least one model",
+                "Tick at least one model before queuing the LOSO-subject run.",
             )
             return
-        if len(classical) != len(all_checked):
-            self._append_log(
-                "LOSO-subject: dropped deep models — "
-                "Table 6.4 reports classical models only."
-            )
-        cfg = _make_loso_subj_cfg(classical)
+        cfg = _make_loso_subj_cfg(models)
         self._launch_suite([("loso_subject", cfg)])
 
     def _on_create_ablation(self) -> None:
@@ -1549,20 +1518,29 @@ class ThesisReportDialog(QDialog):
         return usable
 
     def _on_create_xdomain(self) -> None:
-        # Need at least one session of each domain — otherwise the runs
-        # will produce empty folds. Quick sanity check before we queue.
+        # Need pipeline sessions to train and game_recordings to test.
         corpus = SessionCorpus(self._data_dir); corpus.discover()
         n_pipe = sum(1 for r in corpus.all() if r.source_domain == "pipeline")
-        n_unity = sum(1 for r in corpus.all() if r.source_domain == "unity")
-        if not n_pipe or not n_unity:
+        n_games = self._count_game_recordings()
+        if not n_pipe or not n_games:
             QMessageBox.warning(
-                self, "Need both domains",
-                f"Cross-domain needs sessions in both domains "
-                f"(found pipeline={n_pipe}, unity={n_unity}).",
+                self, "Need pipeline sessions and game recordings",
+                f"Cross-domain trains on pipeline sessions and tests on "
+                f"data/game_recordings/ (found pipeline={n_pipe}, "
+                f"game_recordings={n_games}).",
             )
             return
         plans = _make_xdomain_cfgs(self._primary_model())
         self._launch_suite(plans)
+
+    def _count_game_recordings(self) -> int:
+        try:
+            from playagain_pipeline.evaluation.loaders import (
+                discover_game_recordings,
+            )
+            return len(discover_game_recordings(self._data_dir))
+        except Exception:  # noqa: BLE001
+            return 0
 
     def _on_create_all(self) -> None:
         models = self._checked_models()
@@ -1574,20 +1552,22 @@ class ThesisReportDialog(QDialog):
         strat, k = self._selected_cv_strategy()
         plans.append((f"{strat} (primary)",
                       _make_primary_cfg(models, cv_strategy=strat, k_folds=k)))
-        classical = [m for m in models
-                     if m in {"lda", "svm", "random_forest", "catboost"}] or models
-        plans.append(("loso_subject", _make_loso_subj_cfg(classical)))
+        plans.append(("loso_subject", _make_loso_subj_cfg(models)))
         features = self._features_available_or_warn()
         if features:
             plans.extend(_make_ablation_cfgs(self._primary_model(), features))
-        # Cross-domain only if both domains are present.
+        # Cross-domain: pipeline sessions → game_recordings. Skip if
+        # either side is missing.
         corpus = SessionCorpus(self._data_dir); corpus.discover()
-        if any(r.source_domain == "pipeline" for r in corpus.all()) \
-           and any(r.source_domain == "unity" for r in corpus.all()):
+        has_pipe = any(r.source_domain == "pipeline" for r in corpus.all())
+        n_games = self._count_game_recordings()
+        if has_pipe and n_games:
             plans.extend(_make_xdomain_cfgs(self._primary_model()))
         else:
             self._append_log(
-                "Skipping cross-domain suite — need sessions in both domains."
+                "Skipping cross-domain — need pipeline sessions and "
+                "data/game_recordings/ (found pipeline=%s, games=%d)."
+                % ("yes" if has_pipe else "no", n_games)
             )
         self._launch_suite(plans)
 

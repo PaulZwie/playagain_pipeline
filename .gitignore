@@ -11,6 +11,7 @@ playagain_pipeline/data/thesis_outputs
 playagain_pipeline/data/unity
 playagain_pipeline/data/validation_runs
 playagain_pipeline/data/sessions
+playagain_pipeline/performance_assessment/results
 storage/
 
 # Build and cache

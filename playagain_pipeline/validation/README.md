@@ -31,15 +31,32 @@ thesis or paper. This package fixes three problems:
 
 ```
 validation/
-├── __init__.py            re-exports the public API
-├── __main__.py            `python -m playagain_pipeline.validation ...`
-├── corpus.py              SessionRecord + SessionCorpus
-├── cv_strategies.py       within-session, LOSO-session, LOSO-subject,
-│                          k-fold-subjects, cross-domain (pipeline ↔ unity)
-├── config.py              ExperimentConfig dataclass + YAML/JSON loader
-├── runner.py              ValidationRunner — the orchestrator
-├── experiments_example.yaml
-└── README.md              (this file)
+├── __init__.py                       re-exports the public API
+├── __main__.py                       `python -m playagain_pipeline.validation ...`
+├── corpus.py                         SessionRecord + SessionCorpus
+├── game_corpus.py                    GameRecording discovery (Unity / game CSVs)
+├── participant_groups.py             Healthy / clinical group lookup
+├── cv_strategies.py                  within-session, LOSO-session, intra-subject LOSO-session,
+│                                     LOSO-subject, k-fold-sessions, k-fold-subjects,
+│                                     cross-domain, session-to-game, holdout_split
+├── config.py                         ExperimentConfig dataclass + YAML/JSON loader
+├── feature_cache.py                  On-disk cache of pre-computed features
+├── runner.py                         ValidationRunner — the orchestrator
+│
+├── corpus_report.py                  Chapter 6.1: participant + corpus tables
+├── calibration_report.py             Chapter 6.2: calibration confidence tables/plots
+├── thesis_reports.py                 Aggregators that build chapter-6 LOSO tables
+├── plots_thesis.py                   matplotlib helpers for thesis figures
+├── threshold_report.py               Threshold-sweep summary tables
+├── threshold_plots.py                Threshold-sweep plots
+├── game_report.py                    Game-recording evaluation tables
+├── recompute_calibration_metrics.py  CLI: recompute calibration stats in-place
+├── generate_thesis_outputs.py        CLI orchestrator: one-shot thesis artefacts
+│
+├── configurations/
+│   └── experiments_example.yaml
+├── README.md                         (this file)
+└── README_report.md                  Companion docs for the thesis-report modules
 ```
 
 ## The five-minute tour
@@ -58,7 +75,7 @@ python -m playagain_pipeline.validation list
 
 # 3. Run the LOSO baseline experiment
 python -m playagain_pipeline.validation run \
-    playagain_pipeline/validation/experiments_example.yaml
+    playagain_pipeline/validation/configurations/experiments_example.yaml
 
 #   …
 #   Wrote: data/validation_runs/2026-04-14_113022__loso_baseline/
@@ -75,7 +92,8 @@ data/validation_runs/2026-04-14_113022__loso_baseline/
 ├── environment.json      ← git SHA, python, numpy/sklearn/torch versions
 ├── session_index.json    ← every session path used (subject, domain, sr)
 ├── results.json          ← per-fold + aggregate metrics, machine-readable
-└── results.csv           ← per-fold flat table, pandas/Excel-friendly
+├── results.csv           ← per-fold flat table, pandas/Excel-friendly
+└── per_class_f1.csv       ← per-class F1 per fold
 ```
 
 The combination of `experiment.json` + `environment.json` +
@@ -85,14 +103,17 @@ will get bit-identical numbers.
 
 ## CV strategies
 
-| Strategy           | Train / test split unit   | When to use                                                                  |
-|--------------------|---------------------------|------------------------------------------------------------------------------|
-| `within_session`   | temporal tail of session  | Optimistic upper bound. Use only as a sanity check, never as a headline.     |
-| `loso_session`     | one session held out      | Generalisation across recording sessions of the same (and other) subjects.  |
-| `loso_subject`     | all sessions of one subj  | The honest single number. Default headline metric for a paper.              |
-| `k_fold_subjects`  | k subject groups          | Use when LOSO is too expensive (>20 subjects).                              |
-| `cross_domain`     | by `source_domain`        | "Does a model trained on pipeline data still work in the Unity game?"       |
-| `holdout_split`    | configurable ratios       | Train / Val / Test holdout (deep-model tuning, early stopping). Stratified by subject by default. |
+| Strategy                    | Train / test split unit   | When to use                                                                  |
+|----------------------------|---------------------------|------------------------------------------------------------------------------|
+| `within_session`           | temporal tail of session  | Optimistic upper bound. Use only as a sanity check, never as a headline.     |
+| `loso_session`             | one session held out      | Generalisation across recording sessions of the same (and other) subjects.  |
+| `intra_subject_loso_session` | one session held out    | Same-subject generalisation; closer to real deployment.                      |
+| `loso_subject`             | all sessions of one subj  | The honest single number. Default headline metric for a paper.              |
+| `k_fold_sessions`          | k session groups          | Faster pooled-session baselines.                                             |
+| `k_fold_subjects`          | k subject groups          | Use when LOSO is too expensive (>20 subjects).                              |
+| `cross_domain`             | by `source_domain`        | "Does a model trained on pipeline data still work in the Unity game?"       |
+| `session_to_game`          | sessions → game CSVs      | Train on sessions, test on game recordings.                                  |
+| `holdout_split`            | configurable ratios       | Train / Val / Test holdout (deep-model tuning, early stopping). Stratified by subject by default. |
 
 The Unity ↔ pipeline cross-domain experiment is the one the C# recorder
 was built for. It directly answers whether the GUI training results
@@ -122,7 +143,7 @@ validation harness picks it up automatically — that's the point.
 
 ## Adding a new experiment
 
-1. Copy `experiments_example.yaml` to e.g. `experiments/my_run.yaml`.
+1. Copy `configurations/experiments_example.yaml` to e.g. `experiments/my_run.yaml`.
 2. Edit the `data`, `features`, `models`, and `cv` sections.
 3. Commit the YAML alongside any code changes that produced its
    numbers — the `environment.json` will record the SHA.
@@ -147,12 +168,10 @@ fields. Both are tiny.
 
 ## Caveats
 
-* `_materialise_fold` calls `DataManager.extract_windows_from_signal`,
-  which is the natural place for that helper to live in the existing
-  codebase. If your `DataManager` does not yet expose a function with
-  that name, factor the windowing logic out of
-  `DataManager.create_dataset` into a reusable method — it's a 30-line
-  refactor and pays back immediately.
+* Validation folds are materialised through `DataManager.create_dataset` and
+  `FeatureCache`, so windowing and feature extraction match the GUI's train
+  path exactly. There is no separate `extract_windows_from_signal` helper to
+  keep in sync.
 * The Unity recorder writes per-sample labels in slightly different
   ways depending on the game version. `SessionRecord.load_labels`
   tries both `labels.npy` and a `label`/`gesture_id`/`ground_truth`

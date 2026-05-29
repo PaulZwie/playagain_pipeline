@@ -1,5 +1,0 @@
-train_domain,test_domain,model,n_folds,macro_f1_mean,macro_f1_std
-pipeline,pipeline,random_forest,74,0.7331,0.2269
-unity,unity,random_forest,27,0.6528,0.1148
-pipeline,unity,random_forest,1,0.3620,0.0000
-unity,pipeline,random_forest,1,0.1864,0.0000

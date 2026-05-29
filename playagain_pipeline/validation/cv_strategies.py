@@ -227,6 +227,35 @@ def cross_domain(
 
 
 # ---------------------------------------------------------------------------
+# Cross-domain: pipeline sessions → game_recordings
+# ---------------------------------------------------------------------------
+
+def session_to_game(
+    records: List[SessionRecord],
+    *,
+    train_domain: str = "pipeline",
+) -> Iterator[Fold]:
+    """
+    Train on regular pipeline sessions; test on `data/game_recordings/`.
+
+    Game recordings have a different on-disk shape (CSVs with
+    per-sample EMG + ground-truth columns), so the runner resolves the
+    test side itself when it sees ``split_kind == "session_to_game"``.
+    The test list is left empty here — it's filled in by the runner via
+    :class:`game_corpus.GameCorpus`.
+    """
+    train = [r for r in records if r.source_domain == train_domain]
+    if not train:
+        return
+    yield {
+        "id": f"crossdomain__{train_domain}_to_game",
+        "train": train,
+        "test": [],
+        "split_kind": "session_to_game",
+    }
+
+
+# ---------------------------------------------------------------------------
 # K-fold over subjects (for larger studies)
 # ---------------------------------------------------------------------------
 
@@ -447,6 +476,7 @@ STRATEGIES = {
     "intra_subject_loso_session":  intra_subject_loso_session,
     "loso_subject":                leave_one_subject_out,
     "cross_domain":                cross_domain,
+    "session_to_game":             session_to_game,
     "k_fold_sessions":             k_fold_sessions,
     "k_fold_subjects":             k_fold_subjects,
     "holdout_split":               holdout_split,

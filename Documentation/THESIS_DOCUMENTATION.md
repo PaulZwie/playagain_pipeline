@@ -120,9 +120,12 @@ Threading model:
   receive loop on another, and a prediction worker on a third; the GUI polls
   results via signals.
 
-Code lives under `playagain_pipeline/`; on-disk data lives under
-`playagain_pipeline/data/` by default. The default `data_dir` is
-configurable, and none of the code assumes its location.
+Code lives under `playagain_pipeline/`. By default the GUI and standalone
+prediction server use the in-repo `playagain_pipeline/data/` folder, while the
+validation CLI auto-detects a `data/` folder near the package (or falls back to
+`cwd/data`). `platform_utils.get_default_data_dir()` still returns the
+cross-platform `~/Documents/PlayAgain/data` location for external tooling or
+future overrides.
 
 ---
 
@@ -141,8 +144,9 @@ data/sessions/<subject_id>/<session_id>/
     gesture_set.json     # labels + display metadata
 ```
 
-`session_id` is derived from the recording timestamp plus the protocol name,
-e.g. `2026-03-20_12:54:45_10rep`.
+`session_id` is derived from the recording timestamp plus a suffix that encodes
+the repetition count or recording mode (e.g. `2026-03-20_12-54-45_10rep` or
+`2026-03-20_12-54-45_manual`).
 
 `metadata.json` has two top-level keys: `metadata` (describing the whole
 session) and `trials` (an ordered list of per-trial annotations).
@@ -270,8 +274,8 @@ changes, all timestamped from a single clock so alignment is trivial.
 
 ### 4.1 Device abstraction
 
-`devices/emg_device.py` exposes `DeviceType` (currently `SYNTHETIC`,
-`MUOVI`, `MUOVI_PLUS`) and a `DeviceManager`-like interface. Concrete
+`devices/emg_device.py` exposes `DeviceType` (`SYNTHETIC`, `MUOVI`,
+`MUOVI_PLUS`, `QUATTROCENTO`, `CUSTOM`) and a `DeviceManager`-like interface. Concrete
 backends are chosen by `device_type` in `DeviceConfig`. All devices emit
 EMG samples as a numpy array shaped `(n_samples, n_channels)` and typed
 `float32`.
@@ -358,11 +362,17 @@ offset = argmax_{k ∈ [0, N)} Σ_i P[(i + k) mod N] · R[i]
 and the confidence is the peak of this cross-correlation, normalised by the
 total energy.
 
-The channel mapping is then `mapping[i] = (i + offset) mod N`; applying
-`signal_aligned[:, i] = signal_raw[:, mapping[i]]` yields a stream whose
-electrodes match the orientation the reference was recorded at. The Muovi
-bracelet has two rows (outer/inner) that don't rotate independently, so a
-single scalar offset is sufficient.
+Applying `signal_aligned[:, i] = signal_raw[:, mapping[i]]` yields a stream
+whose electrodes match the orientation the reference was recorded at. For the
+32-channel Muovi bracelet, `calibrator.create_channel_mapping` builds the
+mapping on the physical 2×16 (inner/outer ring) topology rather than as a flat
+circular shift: the scalar offset is split into a column shift (`offset mod 16`)
+and a row shift (`offset // 16`), and each electrode `(row, col)` is remapped to
+`((row + offset // 16) mod 2, (col + offset mod 16) mod 16)`. For an in-plane
+rotation around the wrist the offset stays in `[0, 16)`, so only columns shift;
+the row term lets a larger offset swap the two rings. Devices with other
+channel counts fall back to a plain circular shift
+`mapping[i] = (i + offset) mod N`.
 
 ### 5.3 Reference incompatibility flags
 
@@ -394,7 +404,7 @@ visual prompts shown to the participant during a session. Phases:
 - `FEEDBACK` — optional per-trial feedback.
 - `COMPLETE` — end-of-protocol marker.
 
-A `ProtocolConfig` carries the timings (cue, hold, release, rest, feedback)
+A `ProtocolConfig` carries the timings (preparation, cue, hold, release, rest)
 and the number of repetitions per gesture. The protocol enumerates all
 steps up front so the total duration is known before recording starts —
 handy for displaying an ETA in the GUI.
@@ -509,8 +519,8 @@ model.save(path); model.load(path)
 ```
 
 The `**kwargs` channel forwards hyperparameters set on the constructor plus
-runtime configuration (sampling rate, window size, class weights, and since
-the audit-patch round, a `random_state` seed).
+runtime configuration (sampling rate, window size, class weights, and a
+`random_state` seed when relevant).
 
 ### 9.1 Classical models
 
@@ -536,15 +546,12 @@ persisted with the model.
 | `mstnet`        | `MSTNetClassifier`         | Multi-scale temporal CNN; subclasses `CNNClassifier`    |
 
 Deep models use PyTorch. Device selection honours Apple MPS, CUDA, and CPU
-via `utils.platform_utils.resolve_device`.
+via `models.classifier.resolve_device`.
 
 The MLP accepts either 2-D features or 3-D raw windows (it flattens). The
 CNN family requires 3-D raw windows — a 2-D feature tensor is coerced to
-`(N, 1, F)` at training time. **Historically, `CNNClassifier.predict` did
-not have a matching coercion, which caused a runtime `ValueError` when a
-CNN trained on features was asked to predict on features. Patch 4 of the
-audit fixes this asymmetry by sharing a `_coerce_to_3d` helper between
-`train`, `predict`, and `predict_proba`.**
+`(N, 1, F)` at training time, and the same coercion is applied during
+`predict()` and `predict_proba()` so CNN-on-features models remain usable.
 
 ### 9.3 Shared infrastructure
 
@@ -572,9 +579,8 @@ The Train tab does four things in order:
    config — via `DataManager.create_dataset`.
 2. Splits the dataset into train/val with
    `sklearn.model_selection.train_test_split(test_size=0.2,
-   stratify=y, random_state=cfg.seed)`. Before the audit patch this was
-   hardcoded to `random_state=42`; after the patch it honours the seed
-   from `PipelineConfig`.
+   stratify=y, random_state=seed)`. The GUI uses `seed` when present in the
+   loaded config object, otherwise defaults to `42` for reproducible splits.
 3. Launches a `TrainingWorker(QThread)` that calls `model.train` with a
    progress callback for per-epoch reporting. Deep models emit
    `iteration_update` signals; classical models emit simulated progress.
@@ -597,9 +603,8 @@ It shares `TrainingWorker` with the standard dialog.
 This dialog targets the 64-channel Quattrocento hardware and its
 `.pkl`/`.otb+` file formats. It supports k-fold within-subject CV and a
 LOSO variant for cross-subject generalisation. Channel reduction via
-variance ranking or PCA is available; PCA was hardcoded to
-`random_state=42` before the audit patch and now honours the worker's
-seed (`self._seed`).
+variance ranking or PCA is available; PCA uses the dialog seed (default 42)
+for reproducibility.
 
 Cross-validation here is **within-subject k-fold by default**, which gives
 an optimistic accuracy estimate. The dialog surfaces this in its own
@@ -627,17 +632,20 @@ is intentionally lazy: it doesn't load the signal or labels until asked.
 
 ### 11.2 CV strategies
 
-Five cross-validation strategies are registered in
+Nine cross-validation strategies are registered in
 `cv_strategies.STRATEGIES` and selectable from YAML:
 
-| Strategy           | Unit of split                | Typical use                                                               |
-|--------------------|------------------------------|---------------------------------------------------------------------------|
-| `within_session`   | Temporal tail of each session | Optimistic ceiling; don't use as a headline metric.                       |
-| `loso_session`     | One session                  | Session-to-session generalisation within and across subjects.             |
-| `loso_subject`     | All sessions of one subject  | **The honest single number.** Canonical headline for a paper.             |
-| `k_fold_subjects`  | k subject groups             | Use when LOSO is too expensive (>20 subjects).                            |
-| `cross_domain`     | `source_domain`              | Does a model trained on pipeline data still work when played in Unity?    |
-| `holdout_split`    | User-specified train/val/test| Explicit ratios; best for deep-model tuning with real early-stopping val. |
+| Strategy                    | Unit of split                | Typical use                                                               |
+|-----------------------------|------------------------------|---------------------------------------------------------------------------|
+| `within_session`            | Temporal tail of each session | Optimistic ceiling; don't use as a headline metric.                       |
+| `loso_session`              | One session                  | Session-to-session generalisation within and across subjects.             |
+| `intra_subject_loso_session`| One session (within subject) | Same-subject generalisation; closer to real deployment.                   |
+| `loso_subject`              | All sessions of one subject  | **The honest single number.** Canonical headline for a paper.             |
+| `k_fold_sessions`           | k session groups             | Faster pooled-session baselines.                                          |
+| `k_fold_subjects`           | k subject groups             | Use when LOSO is too expensive (>20 subjects).                            |
+| `cross_domain`              | `source_domain`              | Does a model trained on pipeline data still work when played in Unity?    |
+| `session_to_game`           | pipeline → game recordings   | Train on sessions, test on game-recorded CSVs.                            |
+| `holdout_split`             | User-specified train/val/test| Explicit ratios; best for deep-model tuning with real early-stopping val. |
 
 Every strategy operates at **session granularity**. Windows from the same
 recording cannot end up in both train and test. This is the single most
@@ -715,9 +723,10 @@ the numbers will not match.
 
 A ring buffer collects incoming EMG samples. Once the buffer holds at least
 `window_size_ms * sampling_rate / 1000` samples, the server extracts the
-latest window, applies the model's feature pipeline (if configured), and
-calls `model.predict_proba(X)`. The window stride is the same as at
-training time, so the inference rate is `sampling_rate / stride_samples`.
+latest window, applies the model's feature pipeline (if configured), and calls
+`model.predict_proba(X)`. The prediction cadence is driven by incoming EMG
+chunks, so the inference rate depends on the device frame size rather than a
+fixed training-time stride.
 
 ### 12.2 Smoothing
 
@@ -752,8 +761,9 @@ Newline-delimited JSON over TCP. Default `127.0.0.1:5555`.
 
 Handshake on connect:
 ```json
-{"type": "handshake", "model_name": "...", "class_names": {"0": "rest", ...},
- "sampling_rate": 2000, "num_channels": 32}
+{"type": "handshake", "model_name": "...", "model_type": "...",
+ "class_names": {"0": "rest", ...}, "num_classes": 4,
+ "smoothing_enabled": true, "timestamp": 1712234567.123}
 ```
 
 Per-prediction update:
@@ -780,10 +790,11 @@ forwards everything to the registered callback unchanged.
 - `on_emg_data(data: np.ndarray)` from the device.
 - `on_prediction(gesture, gesture_id, confidence, probabilities)` from the
   server.
-- `on_game_state(state: dict)` from Unity.
+- `on_game_state(ground_truth_active: bool, requested_gesture: str,
+  camera_blocking: bool)` from Unity.
 
-A background writer thread (deque + `threading.Event`) flushes rows to
-`recording.csv` at its own pace so the live pipeline isn't blocked by disk
+A background writer thread draining a bounded `queue.Queue(maxsize=256)` flushes
+rows to `recording.csv` at its own pace so the live pipeline isn't blocked by disk
 I/O. Each row carries a monotonic `time_s` relative to the start of the
 recording, plus the most recent prediction and game state at that sample
 index. The recorder also writes a `config.json` snapshot (model name,
@@ -804,9 +815,9 @@ without external context.
 - `ModelConfig` — default hyperparameters per model type, plus
   `bad_channel_mode`.
 
-The top-level `PipelineConfig` aggregates these, adds a `seed` field, and
-provides `to_json` / `from_json` round-tripping. `config.json` lives at
-the package root by default and is loaded at startup. The GUI surfaces a
+The top-level `PipelineConfig` aggregates these and provides
+`to_dict` / `from_dict` plus `save` / `load` (JSON) round-tripping. `config.json`
+lives at the package root by default and is loaded at startup. The GUI surfaces a
 "Preferences" dialog (`config_dialog.py`) that edits the same dataclass.
 
 The validation harness has its own `ExperimentConfig` (in
@@ -822,13 +833,9 @@ including personal defaults.
 Reproducibility in this codebase is a matter of four things being
 deterministic together:
 
-1. **Seed discipline.** Every randomised operation takes a seed. After
-   the audit patches, the seed flows from `ExperimentConfig.seed` or
-   `PipelineConfig.seed` all the way down to numpy, stdlib `random`,
-   torch, `sklearn.train_test_split`, `StratifiedKFold`, and PCA. The
-   previous hardcoded `random_state=42` cases in `classifier.py`,
-   `training_dialog.py`, and `quattrocento_training_dialog.py` are
-   identified and patched in `AUDIT_PATCHES.md`.
+1. **Seed discipline.** Validation runs seed numpy, stdlib `random`, and torch
+   from `ExperimentConfig.seed`. GUI training uses a fixed split seed of 42
+   unless a custom `seed` is injected into the loaded config object.
 2. **Per-fold seeding in the runner.** Each `(fold, model)` pair gets a
    SHA-1-hashed seed of `(cfg.seed, fold_idx, model_type)` so fold order
    and model order don't alter the results.
@@ -908,10 +915,9 @@ discover features via `get_registered_features`.
   Train tab does not yet.
 - **MPS is the supported GPU.** CUDA works but is less tested. Deep-model
   reproducibility is best on CPU or MPS.
-- **CNN trained on 2-D features.** Before Patch 4 of the audit this
-  combination trained successfully but crashed at prediction time. Now
-  fixed; historical CNN-on-features models remain loadable but the
-  prediction path is only correct after the patch is applied.
+- **CNN trained on 2-D features.** CNN-family models coerce 2-D feature
+  tensors to a single-channel 3-D shape for both training and inference.
+
 - **Bracelet rotation on 16-channel bipolar.** The calibrator's circular
   shift assumes all channels rotate together. Bipolar recordings halve
   the channel count but the same assumption holds — just with half the
@@ -954,7 +960,6 @@ discover features via `get_registered_features`.
 | EMA alpha                    | 0.3     | `PredictionSmoother`              |
 | Min stable time              | 150 ms  | `PredictionSmoother`              |
 | Train/val split (non-val CV) | 80/20   | `ModelManager.train_model`        |
-| Default seed                 | 42      | `PipelineConfig.seed`             |
 | Default CV strategy          | LOSO-subject | `validation_tab` combo       |
 | TCP host                     | 127.0.0.1 | `prediction_server.main`        |
 | TCP port                     | 5555    | `prediction_server.main`          |
@@ -963,7 +968,7 @@ discover features via `get_registered_features`.
 
 ```bash
 # Launch the GUI
-python -m playagain_pipeline.run_gui
+python run_gui.py
 
 # Inspect the corpus
 python -m playagain_pipeline.validation summary

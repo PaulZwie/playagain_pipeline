@@ -41,7 +41,7 @@ from typing import Optional, Dict, List, Callable, Tuple
 import numpy as np
 
 from playagain_pipeline.config.config import get_default_config
-from playagain_pipeline.devices.emg_device import DeviceManager, DeviceType, SyntheticEMGDevice
+from playagain_pipeline.devices.emg_device import DeviceManager, DeviceType
 from playagain_pipeline.models.classifier import ModelManager, BaseClassifier
 
 
@@ -972,52 +972,58 @@ def run_standalone(model_name: str, host: str = "127.0.0.1", port: int = 5555,
     print(f"[Standalone] Model loaded: {model.name} ({model.metadata.model_type})")
     print(f"[Standalone] Classes: {model.metadata.class_names}")
 
+    # A Qt event loop is required: the synthetic device generates data on a
+    # QTimer, which only fires while an event loop is running.
+    import signal
+    from PySide6.QtCore import QCoreApplication, QTimer
+
+    app = QCoreApplication.instance() or QCoreApplication([])
+
     # Initialize device
     device_mgr = DeviceManager()
-
     if device_type == "synthetic":
-        device = SyntheticEMGDevice(
+        device_mgr.create_device(
+            DeviceType.SYNTHETIC,
             num_channels=model.metadata.num_channels,
-            sampling_rate=model.metadata.sampling_rate
+            sampling_rate=model.metadata.sampling_rate,
         )
-        device_mgr.set_device(device)
     else:
         dt = DeviceType.MUOVI_PLUS if device_type == "muovi_plus" else DeviceType.MUOVI
         device_mgr.create_device(dt)
+
+    if device_mgr.device is None:
+        print("[Standalone] ERROR: No device available")
+        return
 
     # Start prediction server
     server = PredictionServer(host=host, port=port)
     server.set_model(model)
     server.start()
 
-    # Connect device data to server
-    def on_data(data: np.ndarray):
-        server.on_emg_data(data)
-
-    device = device_mgr.device
-    if device is None:
-        print("[Standalone] ERROR: No device available")
-        server.stop()
-        return
-
-    device.data_callback = on_data
+    # Forward device samples to the server.
+    device_mgr.set_data_callback(lambda data: server.on_emg_data(data))
 
     # Connect and start streaming
     print(f"[Standalone] Connecting to {device_type} device...")
-    device.connect()
-    device.start_streaming()
+    if not device_mgr.connect_and_start():
+        print("[Standalone] ERROR: Failed to connect/start device")
+        server.stop()
+        return
     print(f"[Standalone] Device streaming. Server ready on {host}:{port}")
-    print(f"[Standalone] Press Ctrl+C to stop")
+    print("[Standalone] Press Ctrl+C to stop")
 
-    # Wait for interrupt
+    # Let Ctrl+C break the Qt event loop so the cleanup below runs. The kicker
+    # timer periodically returns control to the interpreter so the signal is seen.
+    signal.signal(signal.SIGINT, lambda *_: app.quit())
+    kicker = QTimer()
+    kicker.timeout.connect(lambda: None)
+    kicker.start(200)
+
     try:
-        while True:
-            time.sleep(0.1)
-    except KeyboardInterrupt:
-        print("\n[Standalone] Shutting down...")
+        app.exec()
     finally:
-        device.stop_streaming()
-        device.disconnect()
+        print("\n[Standalone] Shutting down...")
+        device_mgr.stop_and_disconnect()
         server.stop()
 
 
