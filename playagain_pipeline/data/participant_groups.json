@@ -1,4 +1,4 @@
 {
   "healthy":  ["Calibration", "KinderUni", "VP_01", "VP_02", "VP_12", "VP_13"],
-  "affected": ["VP_03", "VP_04", "VP_06", "VP_09", "VP_11", "VP_14"]
+  "affected": ["VP_03", "VP_06", "VP_09", "VP_11", "VP_14"]
 }

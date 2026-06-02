@@ -30,6 +30,8 @@ Outputs (under ``--out``)
     table_6_3b_loso_session_by_group.csv      (healthy vs impaired split)
     fig_6_3_per_class_f1.{pdf,png}
     fig_6_4_confusion_matrices.{pdf,png}
+    fig_6_4d_confusion_healthy.{pdf,png}      (LOSO-session, healthy cohort)
+    fig_6_4d_confusion_impaired.{pdf,png}     (LOSO-session, impaired cohort)
     fig_6_5_per_session_variability.{pdf,png}
     fig_6_5_per_session_variability_by_group.csv
     table_6_4_loso_subject.csv
@@ -101,14 +103,16 @@ from .game_corpus import GameCorpus
 from .game_report import build_game_report, write_game_report
 from .threshold_report import build_threshold_report, write_threshold_report
 from .participant_groups import (
-    ParticipantGroups, default_groups_path, metadata_group_resolver,
+    GROUP_HEALTHY, GROUP_IMPAIRED, ParticipantGroups,
+    default_groups_path, group_label, metadata_group_resolver,
 )
 from .thesis_reports import (
-    annotate_per_session_groups, calibration_f1_correlation,
-    cross_domain_comparison, feature_ablation, group_model_rows,
-    load_run_result, parse_fold_subjects, per_session_variability,
-    summarise_run, write_cross_domain, write_feature_ablation,
-    write_group_summary, write_run_report,
+    aggregate_confusion_by_group, annotate_per_session_groups,
+    calibration_f1_correlation, cross_domain_comparison, feature_ablation,
+    group_model_rows, load_run_result, parse_fold_subjects,
+    per_session_variability, summarise_run, summarise_run_by_group,
+    write_cross_domain, write_feature_ablation, write_group_summary,
+    write_run_report,
 )
 from .plots_thesis import (
         plot_calibration_confidence, plot_calibration_honest,
@@ -355,6 +359,44 @@ def run(args: argparse.Namespace) -> Dict[str, List[Path]]:
             out_dir / "fig_6_4_confusion_matrices",
             summary_csv=primary_paths["model_summary_csv"],
         )
+
+        # §6.3.3 cohort-split confusion matrices — one figure per cohort
+        # (healthy vs impaired). Same per-model grid as Fig 6.4, but each
+        # matrix is pooled only over that cohort's held-out folds, and the
+        # panel titles carry the cohort's own macro-F1 (not the pooled
+        # number) so the healthy/impaired gap reads straight off the
+        # figure. Folds spanning both cohorts are dropped, matching the
+        # by-group tables above. A cohort with no usable folds is logged
+        # and skipped rather than emitting an empty figure.
+        conf_by_group = aggregate_confusion_by_group(
+            run_stub, groups, fallback=group_fallback,
+        )
+        f1_by_group = summarise_run_by_group(
+            run_stub, groups, fallback=group_fallback,
+        )
+        for code in (GROUP_HEALTHY, GROUP_IMPAIRED):
+            label = group_label(code)                 # "healthy" / "impaired"
+            confs_g = conf_by_group.get(code, {})
+            if not confs_g:
+                log.info("No %s folds with confusion data — skipping "
+                         "cohort confusion matrix.", label)
+                continue
+            cf_json_g = out_dir / f"fig_6_4d_confusion_{label}_data.json"
+            with cf_json_g.open("w", encoding="utf-8") as f:
+                json.dump({m: c.to_dict() for m, c in confs_g.items()},
+                          f, indent=2)
+            produced[f"fig_6_4d_{label}_data"] = [cf_json_g]
+            macro_f1_g = {
+                m: s.macro_f1_mean
+                for m, s in f1_by_group.get(code, {}).items()
+            }
+            produced[f"fig_6_4d_{label}"] = plot_confusion_matrices(
+                cf_json_g,
+                out_dir / f"fig_6_4d_confusion_{label}",
+                macro_f1=macro_f1_g,
+                title=("Normalised confusion matrices  "
+                       f"(LOSO-session, {label})"),
+            )
 
         produced["fig_6_5"] = plot_per_session_variability(
             primary_paths["per_session_csv"],

@@ -690,6 +690,41 @@ def summarise_run_by_group(
     return out
 
 
+def aggregate_confusion_by_group(
+    run: RunStub,
+    groups: ParticipantGroups,
+    *,
+    fallback: Optional[Any] = None,
+    include_mixed: bool = False,
+) -> Dict[str, Dict[str, NormalisedConfusion]]:
+    """
+    Per-cohort version of :func:`aggregate_confusion`.
+
+    Buckets the run's folds by the cohort of their held-out subject(s)
+    (see :func:`split_folds_by_group`), then pools and row-normalises the
+    confusion matrices *within* each cohort. Returns
+    ``{group_code: {model_type: NormalisedConfusion}}``; the healthy and
+    impaired buckets are always present (with an empty inner dict when a
+    cohort contributed no folds carrying confusion data).
+
+    Folds spanning both cohorts are dropped unless ``include_mixed`` is
+    set, matching :func:`split_folds_by_group` and the by-group tables.
+
+    Reuses :func:`aggregate_confusion` on a throwaway per-cohort RunStub
+    so the summing + normalisation logic lives in exactly one place — the
+    same pattern as :func:`summarise_run_by_group`.
+    """
+    out: Dict[str, Dict[str, NormalisedConfusion]] = {}
+    for code, folds in split_folds_by_group(
+        run, groups, fallback=fallback, include_mixed=include_mixed,
+    ).items():
+        sub = RunStub(name=f"{run.name}::{code}", folds=folds,
+                      records=run.records, experiment=run.experiment,
+                      output_dir=run.output_dir)
+        out[code] = aggregate_confusion(sub)
+    return out
+
+
 @dataclass
 class GroupModelRow:
     """One row of a cohort-split model-summary table."""

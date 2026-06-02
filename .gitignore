@@ -12,6 +12,7 @@ playagain_pipeline/data/unity
 playagain_pipeline/data/validation_runs
 playagain_pipeline/data/sessions
 playagain_pipeline/performance_assessment/results
+pipeline_visualization
 storage/
 
 # Build and cache

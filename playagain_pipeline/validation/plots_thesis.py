@@ -622,6 +622,8 @@ def plot_confusion_matrices(
     models: Optional[List[str]] = None,
     ncols: int = 4,
     summary_csv: Optional[Path] = None,
+    macro_f1: Optional[Dict[str, float]] = None,
+    title: Optional[str] = None,
 ) -> List[Path]:
     _setup_mpl()
     with Path(confusion_json).open("r", encoding="utf-8") as f:
@@ -632,12 +634,18 @@ def plot_confusion_matrices(
     if models:
         confs = {m: confs[m] for m in models if m in confs}
 
-    macro_f1: Dict[str, float] = {}
-    if summary_csv is not None and Path(summary_csv).exists():
+    # Macro-F1 per model drives both the panel ordering and the per-panel
+    # title annotation. Callers can pass it directly (``macro_f1=``) — the
+    # per-cohort figures use this so each panel shows the cohort's own F1
+    # rather than the pooled number — or point at the run summary CSV as
+    # before. A passed dict takes precedence over the CSV.
+    macro_f1 = dict(macro_f1) if macro_f1 else {}
+    if not macro_f1 and summary_csv is not None and Path(summary_csv).exists():
         with Path(summary_csv).open("r", encoding="utf-8") as f:
             for r in csv.DictReader(f):
                 if r["model"] in confs:
                     macro_f1[r["model"]] = float(r["macro_f1_mean"])
+    if macro_f1:
         keys = [m for m in sorted(confs, key=lambda m: -macro_f1.get(m, 0.0))]
     else:
         keys = list(confs)
@@ -699,7 +707,7 @@ def plot_confusion_matrices(
         cb.outline.set_visible(False)
         cb.ax.tick_params(length=0)
 
-    fig.suptitle("Normalised confusion matrices  (LOSO-session, pooled)",
+    fig.suptitle(title or "Normalised confusion matrices  (LOSO-session, pooled)",
                  fontsize=12.5, fontweight="semibold",
                  x=0.02, ha="left", y=0.995)
     return _save(fig, out_path)
