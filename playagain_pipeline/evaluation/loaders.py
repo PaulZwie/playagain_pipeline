@@ -437,10 +437,13 @@ class GameRecording:
     * ``Prob_<ClassName>``    (one column per class)
     * ``GroundTruthActive``   (binary, set by the game when the user
                                is actively performing the requested gesture)
-    * ``RawGroundTruth``      (numeric class id of the requested gesture
-                               while it's active, otherwise 0/-1 — the
-                               authoritative multi-class label)
-    * ``RequestedGesture``    (string, what the game asked for)
+    * ``RawGroundTruth``      (BINARY active/rest flag, values {0, 1} only — it
+                               is NOT a 4-class id. Do NOT use it as the gesture
+                               label; using it collapses any cross-domain test
+                               set to a single class. Verified empirically across
+                               all game recordings: RawGroundTruth in {0, 1}.)
+    * ``RequestedGesture``    (string "rest"/"fist"/"pinch"/"tripod" — the
+                               AUTHORITATIVE 4-class ground-truth label.)
     * ``EMG_Ch0..ChN``        (raw EMG matrix)
     """
 
