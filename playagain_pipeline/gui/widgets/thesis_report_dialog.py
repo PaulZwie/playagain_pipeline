@@ -264,15 +264,20 @@ def _make_ablation_cfgs(
     primary_model: str,
     features: Sequence[str],
     *,
+    cv_strategy: str = "intra_subject_loso_session",
     window_ms: int = _DEFAULT_WINDOW_MS,
     stride_ms: int = _DEFAULT_STRIDE_MS,
     seed:      int = _DEFAULT_SEED,
 ) -> List[Tuple[str, ExperimentConfig]]:
     """
-    §6.5 — One run per single feature + one "combined" run, all under
-    LOSO-session, all with the user's chosen primary model. Returns a
-    list of ``(condition_name, cfg)`` pairs — the same shape the
-    chapter-6 ``feature_ablation`` aggregator consumes.
+    §6.5 — One run per single feature + one "combined" run, all under the
+    same CV strategy as the primary headline table (``cv_strategy``), all
+    with the user's chosen primary model. Defaults to the within-subject
+    ``intra_subject_loso_session`` so the ablation's "combined" condition
+    is directly comparable to the primary result; pass the primary's
+    selected strategy to keep the two in lock-step. Returns a list of
+    ``(condition_name, cfg)`` pairs — the same shape the chapter-6
+    ``feature_ablation`` aggregator consumes.
     """
     out: List[Tuple[str, ExperimentConfig]] = []
     for feat in features:
@@ -283,7 +288,7 @@ def _make_ablation_cfgs(
             windowing=WindowingConfig(window_ms=window_ms, stride_ms=stride_ms),
             features=_feature_cfgs([feat]),
             models=_model_cfgs([primary_model]),
-            cv=CVConfig(strategy="loso_session", kwargs={}),
+            cv=CVConfig(strategy=cv_strategy, kwargs={}),
         )))
     out.append(("combined", ExperimentConfig(
         name=f"thesis_ablation_combined_{_ts()}",
@@ -292,7 +297,7 @@ def _make_ablation_cfgs(
         windowing=WindowingConfig(window_ms=window_ms, stride_ms=stride_ms),
         features=_feature_cfgs(features),
         models=_model_cfgs([primary_model]),
-        cv=CVConfig(strategy="loso_session", kwargs={}),
+        cv=CVConfig(strategy=cv_strategy, kwargs={}),
     )))
     return out
 
@@ -1485,7 +1490,8 @@ class ThesisReportDialog(QDialog):
         features_to_use = self._features_available_or_warn()
         if not features_to_use:
             return
-        plans = _make_ablation_cfgs(pm, features_to_use)
+        strat, _k = self._selected_cv_strategy()
+        plans = _make_ablation_cfgs(pm, features_to_use, cv_strategy=strat)
         self._launch_suite(plans)
 
     def _features_available_or_warn(self) -> List[str]:
@@ -1555,7 +1561,8 @@ class ThesisReportDialog(QDialog):
         plans.append(("loso_subject", _make_loso_subj_cfg(models)))
         features = self._features_available_or_warn()
         if features:
-            plans.extend(_make_ablation_cfgs(self._primary_model(), features))
+            plans.extend(_make_ablation_cfgs(self._primary_model(), features,
+                                             cv_strategy=strat))
         # Cross-domain: pipeline sessions → game_recordings. Skip if
         # either side is missing.
         corpus = SessionCorpus(self._data_dir); corpus.discover()

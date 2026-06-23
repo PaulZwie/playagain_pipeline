@@ -1014,7 +1014,7 @@ def plot_feature_ablation(
     ax.set_yticklabels(labels)
     ax.set_xlim(0.0, 1.0)
     ax.set_xlabel("Macro F1  (mean ± SD across folds)")
-    ax.set_title("Feature ablation under LOSO-session", loc="left")
+    ax.set_title("Feature ablation under intra-subject LOSO-session", loc="left")
     ax.grid(axis="x", linestyle=":", color=NEUTRAL_GRID)
     ax.set_axisbelow(True)
     return _save(fig, out_path)
