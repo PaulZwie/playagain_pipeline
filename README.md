@@ -1,32 +1,5 @@
 # The PlayAgain EMG Gesture Pipeline
 
-> Consolidated documentation for the `playagain_pipeline` package — the Python
-> EMG-gesture pipeline used to collect surface-EMG data, train models, run
-> real-time gesture inference, and integrate predictions with the Unity
-> PlayAgain game over TCP. This single document merges the package overview, the
-> deep technical reference, the validation-harness docs and the data-directory
-> layout into one coherent reference suitable for the master-thesis code
-> submission.
-
-> **Submission note.** This is the cleaned source submission of the
-> `playagain_pipeline` package. It contains all Python source, configuration
-> (`pyproject.toml`, `uv.lock`, `config.json`) and documentation needed to
-> install and run the pipeline, but **not** the regenerable Python environment
-> or the recorded study data (everything under `data/`). The recorded EMG
-> datasets, trained models and derived artifacts are study *data* rather than
-> code and are archived separately — restore them under
-> `playagain_pipeline/data/` (see [Data model and on-disk schema](#3-data-model-and-on-disk-schema))
-> to reproduce the runs described here. Recreate the environment with `uv sync`
-> (see [Setup](#setup-and-running)).
-
-> **Path convention.** Unless stated otherwise, source paths below are relative
-> to the `playagain_pipeline/` package (e.g. `gui/widgets/evaluation_tab.py`,
-> `validation/runner.py`, `core/data_manager.py`). The GUI entry point
-> `run_gui.py` lives one level up, at the repository root. Shell `cd` commands
-> use absolute paths.
-
----
-
 ## Start here
 
 From a clean checkout to a validated model in five steps (each links to the full
