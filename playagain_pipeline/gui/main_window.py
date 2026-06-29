@@ -804,11 +804,11 @@ class MainWindow(QMainWindow):
         self.game_easy_ratio = QDoubleSpinBox()
         self.game_easy_ratio.setRange(1.1, 4.0)
         self.game_easy_ratio.setSingleStep(0.1)
-        self.game_easy_ratio.setValue(1.8)
+        self.game_easy_ratio.setValue(1.3)
         self.game_easy_ratio.setToolTip(
             "How many times above the resting RMS baseline counts as 'the "
             "child tried'. Lower = more forgiving (feeds the animal on "
-            "weaker contractions). 1.8 is a gentle default for first "
+            "weaker contractions). 1.3 is a gentle default for first "
             "sessions; raise toward 2.5 once the child is comfortable."
         )
         game_layout.addRow("Easy-mode sensitivity:", self.game_easy_ratio)
